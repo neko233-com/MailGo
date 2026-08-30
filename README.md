@@ -54,6 +54,15 @@ npm run native:run
 ```
 
 The native shell loads `dist/` through the framework-owned `rdesktop://` protocol. Run `npm run build` before compiling Rust.
+
+Create a self-contained portable Windows package with the release shell and renderer assets:
+
+```powershell
+npm run package:windows
+# artifacts\MailGo-0.1.0-windows-x64.zip
+```
+
+Extract the archive and launch `MailGo.exe`. The package expects a compatible WebView2 runtime on Windows. The installed rdesktop 0.1.8 CLI currently emits a small NSIS placeholder from `rdesktop bundle`; do not distribute that generated file as an installer. Generate the portable archive on a release build host where the Windows application-control policy permits Cargo Release build scripts; this repository intentionally does not ship an unsigned or placeholder installer.
 The Windows npm scripts place Cargo's target directory under `%LOCALAPPDATA%\MailGo\cargo-target` so application-control policies do not block dependency build scripts in the repository checkout.
 
 ## Publishing

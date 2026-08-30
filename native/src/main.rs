@@ -201,6 +201,30 @@ fn webview_data_dir() -> PathBuf {
     app_data_dir().join("WebView2")
 }
 
+fn dist_root() -> Result<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(configured) = std::env::var_os("MAILGO_DIST_DIR") {
+        candidates.push(PathBuf::from(configured));
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            candidates.push(parent.join("dist"));
+        }
+    }
+    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../dist"));
+
+    for candidate in candidates {
+        if candidate.join("index.html").is_file() {
+            return candidate
+                .canonicalize()
+                .context("canonicalize MailGo renderer assets");
+        }
+    }
+    Err(anyhow!(
+        "MailGo renderer assets are missing; run npm run build or place dist next to the executable"
+    ))
+}
+
 fn cache_dir() -> PathBuf {
     app_data_dir().join("cache")
 }
@@ -1369,10 +1393,7 @@ fn main() -> Result<()> {
     };
 
     let mut renderer = WebViewRenderer::new(&config)?;
-    let dist_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../dist")
-        .canonicalize()
-        .context("MailGo dist directory is missing; run npm run build first")?;
+    let dist_root = dist_root()?;
     renderer.set_asset_root(dist_root)?;
     renderer.set_data_directory(webview_data_dir())?;
     renderer.init()?;
