@@ -8,6 +8,7 @@ import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachme
 type ToastTone = 'info' | 'success' | 'error'
 type Toast = { id: number; message: string; tone: ToastTone }
 type DeviceFlowState = { sessionId: string; userCode: string; verificationUri: string; message?: string; retryAfter: number; status: 'pending' | 'complete' | 'error' }
+type ActionMenu = 'bulk' | 'message'
 
 const smartCategories: { id: SmartCategory; label: string; icon: IconName; color: string }[] = [
   { id: 'apple-connect', label: 'Apple Connect', icon: 'shieldCheck', color: '#9ca6ba' },
@@ -169,9 +170,9 @@ function BrandMark() {
   )
 }
 
-function TooltipButton({ label, onClick, children, active = false, className = '' }: { label: string; onClick?: () => void; children: React.ReactNode; active?: boolean; className?: string }) {
+function TooltipButton({ label, onClick, children, active = false, className = '', ariaExpanded }: { label: string; onClick?: () => void; children: React.ReactNode; active?: boolean; className?: string; ariaExpanded?: boolean }) {
   return (
-    <button className={`icon-button ${active ? 'is-active' : ''} ${className}`} onClick={onClick} aria-label={label} title={label} type="button">
+    <button className={`icon-button ${active ? 'is-active' : ''} ${className}`} onClick={onClick} aria-label={label} aria-expanded={ariaExpanded} title={label} type="button">
       {children}
     </button>
   )
@@ -197,6 +198,8 @@ function App() {
   const [isAccountModalOpen, setAccountModalOpen] = useState(false)
   const [isAuthPanelOpen, setAuthPanelOpen] = useState(true)
   const [isSettingsOpen, setSettingsOpen] = useState(false)
+  const [openMenu, setOpenMenu] = useState<ActionMenu | null>(null)
+  const [isHelpOpen, setHelpOpen] = useState(false)
   const [isSyncing, setSyncing] = useState(false)
   const [isLoadingEarlier, setLoadingEarlier] = useState(false)
   const [mailboxMeta, setMailboxMeta] = useState<Record<string, { oldestUid?: number; hasMore?: boolean }>>({})
@@ -328,6 +331,14 @@ function App() {
   }, [remoteImagesEnabled])
 
   useEffect(() => {
+    const closeMenus = (event: MouseEvent) => {
+      if (!(event.target as Element | null)?.closest('.menu-anchor')) setOpenMenu(null)
+    }
+    document.addEventListener('mousedown', closeMenus)
+    return () => document.removeEventListener('mousedown', closeMenus)
+  }, [])
+
+  useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault()
@@ -336,6 +347,9 @@ function App() {
       if (event.key === 'Escape') {
         setComposeOpen(false)
         setAccountModalOpen(false)
+        setSettingsOpen(false)
+        setOpenMenu(null)
+        setHelpOpen(false)
       }
     }
     window.addEventListener('keydown', handleShortcut)
@@ -435,6 +449,74 @@ function App() {
     })
   }
 
+  const setMailReadState = async (mail: MailMessage, unread: boolean) => {
+    if (mail.id === 'empty-mail' || mail.unread === unread) return
+    setMails((current) => current.map((item) => item.id === mail.id ? { ...item, unread } : item))
+    setAccounts((current) => current.map((account) => account.id === mail.accountId
+      ? { ...account, unread: Math.max(0, account.unread + (unread ? 1 : -1)) }
+      : account))
+    if (isNativeRuntime && mail.nativeUid) {
+      await invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: unread })
+    }
+  }
+
+  const setSelectedReadState = async (unread: boolean) => {
+    if (!selectedVisibleMails.length) {
+      pushToast('请先选择邮件', 'info')
+      return
+    }
+    const selected = selectedVisibleMails.filter((mail) => mail.unread !== unread)
+    setMails((current) => current.map((mail) => selected.some((item) => item.id === mail.id) ? { ...mail, unread } : mail))
+    setAccounts((current) => current.map((account) => {
+      const count = selected.filter((mail) => mail.accountId === account.id).length
+      return count ? { ...account, unread: Math.max(0, account.unread + (unread ? count : -count)) } : account
+    }))
+    let failed = 0
+    if (isNativeRuntime) {
+      const results = await Promise.all(selected.map(async (mail) => {
+        if (!mail.nativeUid) return true
+        try {
+          await invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: unread })
+          return true
+        } catch {
+          return false
+        }
+      }))
+      failed = results.filter((result) => !result).length
+    }
+    setSelectedMailIds([])
+    setOpenMenu(null)
+    const action = unread ? '标为未读' : '标为已读'
+    if (failed) pushToast(`${selected.length - failed} 封已${unread ? '标未读' : '读'}，${failed} 封同步失败`, 'error')
+    else pushToast(selected.length ? `已将 ${selected.length} 封邮件${action}` : `所选邮件已经${unread ? '是未读' : '是已读'}状态`, 'success')
+  }
+
+  const setSelectedStarred = async (starred: boolean) => {
+    if (!selectedVisibleMails.length) {
+      pushToast('请先选择邮件', 'info')
+      return
+    }
+    const selected = selectedVisibleMails.filter((mail) => mail.starred !== starred)
+    setMails((current) => current.map((mail) => selected.some((item) => item.id === mail.id) ? { ...mail, starred } : mail))
+    let failed = 0
+    if (isNativeRuntime) {
+      const results = await Promise.all(selected.map(async (mail) => {
+        if (!mail.nativeUid) return true
+        try {
+          await invoke('mail.star', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: starred })
+          return true
+        } catch {
+          return false
+        }
+      }))
+      failed = results.filter((result) => !result).length
+    }
+    setSelectedMailIds([])
+    setOpenMenu(null)
+    if (failed) pushToast(`${selected.length - failed} 封已处理，${failed} 封星标同步失败`, 'error')
+    else pushToast(selected.length ? `已${starred ? '添加' : '移除'} ${selected.length} 封邮件的星标` : `所选邮件已经${starred ? '全部加星' : '全部取消星标'}`, 'success')
+  }
+
   const moveMail = async (mail: MailMessage, operation: 'archive' | 'delete') => {
     if (mail.id === 'empty-mail') return false
     const account = accounts.find((item) => item.id === mail.accountId)
@@ -500,33 +582,28 @@ function App() {
     else pushToast(`${operation === 'archive' ? `已归档 ${count} 封邮件` : `已将 ${count} 封邮件移入回收站`}${queued ? `，${queued} 封将在联网后同步` : ''}`, 'success')
   }
 
-  const markSelectedRead = async () => {
-    if (!selectedVisibleMails.length) {
-      pushToast('请先选择邮件', 'info')
-      return
+  const markSelectedRead = () => { void setSelectedReadState(false) }
+
+  const markSelectedUnread = () => { void setSelectedReadState(true) }
+
+  const markSelectedMessageUnread = async () => {
+    try {
+      await setMailReadState(selectedMail, true)
+      setOpenMenu(null)
+      pushToast('邮件已标为未读', 'success')
+    } catch {
+      pushToast('标记未读失败，请稍后重试', 'error')
     }
-    const selected = selectedVisibleMails.filter((mail) => mail.unread)
-    setMails((current) => current.map((mail) => selected.some((item) => item.id === mail.id) ? { ...mail, unread: false } : mail))
-    setAccounts((current) => current.map((account) => {
-      const decrement = selected.filter((mail) => mail.accountId === account.id).length
-      return decrement ? { ...account, unread: Math.max(0, account.unread - decrement) } : account
-    }))
-    let failed = 0
-    if (isNativeRuntime) {
-      const results = await Promise.all(selected.map(async (mail) => {
-        if (!mail.nativeUid) return true
-        try {
-          await invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: false })
-          return true
-        } catch {
-          return false
-        }
-      }))
-      failed = results.filter((result) => !result).length
+  }
+
+  const copySelectedMessage = async () => {
+    try {
+      await navigator.clipboard.writeText(`${selectedMail.subject}\n\n${selectedMail.body.join('\n\n')}`)
+      setOpenMenu(null)
+      pushToast('邮件正文已复制', 'success')
+    } catch {
+      pushToast('当前环境不允许访问剪贴板', 'error')
     }
-    setSelectedMailIds([])
-    if (failed) pushToast(`${selected.length - failed} 封已读，${failed} 封同步失败`, 'error')
-    else pushToast(selected.length ? `已将 ${selected.length} 封邮件标为已读` : '所选邮件已经是已读状态', 'success')
   }
 
   const cancelAttachment = (attachmentId: string) => {
@@ -990,7 +1067,7 @@ function App() {
 
           <div className="sidebar-footer">
             <TooltipButton label="设置" active={isSettingsOpen} onClick={() => setSettingsOpen((value) => !value)}><Icon name="settings" size={19} /></TooltipButton>
-            <TooltipButton label="帮助中心" onClick={() => pushToast('帮助中心即将上线', 'info')}><Icon name="help" size={19} /></TooltipButton>
+            <TooltipButton label="帮助中心" active={isHelpOpen} onClick={() => { setOpenMenu(null); setHelpOpen(true) }}><Icon name="help" size={19} /></TooltipButton>
             <TooltipButton label="收起侧栏" className="sidebar-collapse"><Icon name="menu" size={19} /></TooltipButton>
           </div>
         </aside>
@@ -1005,7 +1082,15 @@ function App() {
             <button type="button" className="toolbar-action" onClick={() => { void applyBulkMove('archive') }} disabled={!selectedVisibleMails.length}><Icon name="archive" size={17} /> <span>归档</span></button>
             <button type="button" className="toolbar-action" onClick={() => { void applyBulkMove('delete') }} disabled={!selectedVisibleMails.length}><Icon name="trash" size={17} /> <span>删除</span></button>
             <button type="button" className="toolbar-action" onClick={() => { void markSelectedRead() }} disabled={!selectedVisibleMails.length}><Icon name="message" size={17} /> <span>标为已读</span></button>
-            <TooltipButton label="更多操作" onClick={() => pushToast('更多批量操作即将上线', 'info')}><Icon name="more" size={18} /></TooltipButton>
+            <div className="menu-anchor">
+              <TooltipButton label="更多操作" active={openMenu === 'bulk'} ariaExpanded={openMenu === 'bulk'} onClick={() => setOpenMenu((current) => current === 'bulk' ? null : 'bulk')}><Icon name="more" size={18} /></TooltipButton>
+              {openMenu === 'bulk' && <div className="action-menu" role="menu" aria-label="更多批量操作">
+                <button type="button" role="menuitem" disabled={!selectedVisibleMails.length} onClick={markSelectedUnread}><Icon name="message" size={16} />标为未读</button>
+                <button type="button" role="menuitem" disabled={!selectedVisibleMails.length} onClick={() => { void setSelectedStarred(true) }}><Icon name="star" size={16} />批量加星</button>
+                <button type="button" role="menuitem" disabled={!selectedVisibleMails.length} onClick={() => { void setSelectedStarred(false) }}><Icon name="star" size={16} />批量取消星标</button>
+                <button type="button" role="menuitem" disabled={!selectedVisibleMails.length} onClick={() => { setSelectedMailIds([]); setOpenMenu(null) }}><Icon name="close" size={16} />取消选择</button>
+              </div>}
+            </div>
           </div>
           <div className="mail-list-scroll">
             <AnimatePresence initial={false} mode="popLayout">
@@ -1031,7 +1116,14 @@ function App() {
         <section className="reading-panel" aria-label="邮件阅读区">
           <div className="reading-toolbar">
             <div className="reading-actions"><TooltipButton label="回复" onClick={() => setComposeOpen(true)}><Icon name="reply" size={18} /></TooltipButton><span>回复</span><TooltipButton label="回复全部" onClick={() => setComposeOpen(true)}><Icon name="reply" size={18} /></TooltipButton><span>回复全部</span><TooltipButton label="转发" onClick={() => setComposeOpen(true)}><Icon name="forward" size={18} /></TooltipButton><span>转发</span><TooltipButton label="归档" onClick={() => { void runMove(selectedMail, 'archive') }}><Icon name="archive" size={18} /></TooltipButton><span>归档</span><TooltipButton label="删除" onClick={() => { void runMove(selectedMail, 'delete') }}><Icon name="trash" size={18} /></TooltipButton><span>删除</span></div>
-            <TooltipButton label="更多邮件操作" onClick={() => pushToast('更多邮件操作即将上线', 'info')}><Icon name="more" size={19} /></TooltipButton>
+            <div className="menu-anchor">
+              <TooltipButton label="更多邮件操作" active={openMenu === 'message'} ariaExpanded={openMenu === 'message'} onClick={() => setOpenMenu((current) => current === 'message' ? null : 'message')}><Icon name="more" size={19} /></TooltipButton>
+              {openMenu === 'message' && <div className="action-menu" role="menu" aria-label="更多邮件操作">
+                <button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail'} onClick={() => { void markSelectedMessageUnread() }}><Icon name="message" size={16} />标为未读</button>
+                <button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail'} onClick={() => { void copySelectedMessage() }}><Icon name="copy" size={16} />复制邮件正文</button>
+                <button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail'} onClick={() => { setOpenMenu(null); window.print() }}><Icon name="document" size={16} />打印邮件</button>
+              </div>}
+            </div>
           </div>
           <div className="reading-scroll">
             <div className="reading-heading"><div><h1>{selectedMail.subject}</h1><div className="message-tags"><span className="tag tag-account"><ProviderMark provider={accounts.find((account) => account.id === selectedMail.accountId)?.provider ?? 'google'} size="sm" /> {accounts.find((account) => account.id === selectedMail.accountId)?.label ?? 'Google'}</span>{selectedMail.hasHtml && <span className="tag">HTML 邮件</span>}</div></div><TooltipButton label={selectedMail.starred ? '取消星标' : '添加星标'} className={`reading-star ${selectedMail.starred ? 'is-starred' : ''}`} onClick={() => toggleStar(selectedMail)}><Icon name="star" size={24} weight={selectedMail.starred ? 'Filled' : 'Outline'} /></TooltipButton></div>
@@ -1062,11 +1154,16 @@ function App() {
         {isSettingsOpen && <motion.div className="settings-popover" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}><div className="settings-title"><span><Icon name="settings" size={17} />偏好设置</span><TooltipButton label="关闭设置" onClick={() => setSettingsOpen(false)}><Icon name="close" size={17} /></TooltipButton></div><div className="settings-row"><span><Icon name={theme === 'dark' ? 'moon' : 'theme'} size={17} /><span>外观主题<small>{theme === 'dark' ? '深色 · 午夜蓝' : '浅色 · 雪白'}</small></span></span><button type="button" className="theme-switch" onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}><span className={theme === 'light' ? 'is-light' : ''}>{theme === 'dark' ? '深' : '浅'}</span></button></div><label className="settings-row css-row"><span><Icon name="brush" size={17} /><span>用户 CSS<small>可覆盖 MailGo 视觉变量</small></span></span><textarea value={customCss} onChange={(event) => setCustomCss(event.target.value)} placeholder="例如：:root { --accent: #ff6b8a; }" /></label><div className="settings-row"><span><Icon name="cloud" size={17} /><span>关闭时后台运行<small>最小化到系统托盘并继续同步</small></span></span><button type="button" className={`toggle-switch ${minimizeToTray ? 'is-on' : ''}`} onClick={() => { const next = !minimizeToTray; setMinimizeToTray(next); void invoke('app.set_minimize_to_tray', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-row"><span><Icon name="image" size={17} /><span>加载远程图片<small>{remoteImagesEnabled ? '已允许 HTTPS 图片，可能包含追踪像素' : '默认屏蔽，保护隐私；CID 内嵌图片不受影响'}</small></span></span><button type="button" aria-label="加载远程图片" className={`toggle-switch ${remoteImagesEnabled ? 'is-on' : ''}`} onClick={() => { const next = !remoteImagesEnabled; setRemoteImagesEnabled(next); void invoke('app.set_remote_images', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-row"><span><Icon name="bell" size={17} /><span>后台新邮件提醒<small>窗口隐藏时发送 Windows 托盘通知</small></span></span><button type="button" aria-label="后台新邮件提醒" className={`toggle-switch ${notificationsEnabled ? 'is-on' : ''}`} onClick={() => { const next = !notificationsEnabled; setNotificationsEnabled(next); void invoke('app.set_notifications', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-actions"><button type="button" onClick={exportAccounts}><Icon name="download" size={16} />导出账户配置</button><button type="button" onClick={() => importInputRef.current?.click()} disabled={isImporting}><Icon name="folder" size={16} />{isImporting ? '导入中…' : '导入账户配置'}</button></div><input ref={importInputRef} type="file" accept="application/json,.json" hidden onChange={importAccounts} /></motion.div>}
       </AnimatePresence>
 
+      <AnimatePresence>{isHelpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}</AnimatePresence>
       <AnimatePresence>{isComposeOpen && <ComposeModal accountId={selectedAccountId ?? accounts[0]?.id} onClose={() => setComposeOpen(false)} onSent={() => { setComposeOpen(false); pushToast('邮件已发送', 'success') }} onError={(message) => pushToast(message, 'error')} />}</AnimatePresence>
       <AnimatePresence>{isAccountModalOpen && <AccountModal provider={provider} setProvider={changeProvider} providerDefinition={selectedProvider} accountEmail={accountEmail} setAccountEmail={setAccountEmail} authorizationCode={authorizationCode} setAuthorizationCode={setAuthorizationCode} showAuthorizationCode={showAuthorizationCode} setShowAuthorizationCode={setShowAuthorizationCode} customImapHost={customImapHost} setCustomImapHost={setCustomImapHost} customImapPort={customImapPort} setCustomImapPort={setCustomImapPort} customImapSecurity={customImapSecurity} setCustomImapSecurity={setCustomImapSecurity} customSmtpHost={customSmtpHost} setCustomSmtpHost={setCustomSmtpHost} customSmtpPort={customSmtpPort} setCustomSmtpPort={setCustomSmtpPort} customSmtpSecurity={customSmtpSecurity} setCustomSmtpSecurity={setCustomSmtpSecurity} customAuthentication={customAuthentication} setCustomAuthentication={setCustomAuthentication} deviceFlow={deviceFlow} onClose={() => setAccountModalOpen(false)} onOpenProvider={() => { void handleOpenProvider() }} onCopy={handleCopy} onAdd={handleAddAccount} />}</AnimatePresence>
       <div className="toast-stack" aria-live="polite">{toasts.map((toast) => <motion.div key={toast.id} className={`toast toast-${toast.tone}`} initial={{ opacity: 0, y: 12, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 12 }}><Icon name={toast.tone === 'success' ? 'checkCircle' : toast.tone === 'error' ? 'info' : 'bell'} size={17} /><span>{toast.message}</span></motion.div>)}</div>
     </div>
   )
+}
+
+function HelpModal({ onClose }: { onClose: () => void }) {
+  return <motion.div className="modal-backdrop help-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="help-modal" initial={{ opacity: 0, y: 14, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 8, scale: 0.98 }} role="dialog" aria-modal="true" aria-labelledby="help-title"><div className="modal-header"><div><Icon name="help" size={21} /><h2 id="help-title">MailGo 帮助中心</h2></div><TooltipButton label="关闭帮助中心" onClick={onClose}><Icon name="close" size={19} /></TooltipButton></div><div className="help-modal-body"><section><h3>常用快捷键</h3><div className="shortcut-row"><span>写邮件</span><kbd>C</kbd></div><div className="shortcut-row"><span>聚焦搜索</span><kbd>Ctrl K</kbd></div><div className="shortcut-row"><span>回复当前邮件</span><kbd>R</kbd></div><div className="shortcut-row"><span>关闭弹窗</span><kbd>Esc</kbd></div></section><section><h3>账户与同步</h3><p>Google 与 Outlook 优先使用 OAuth 安全授权；QQ 邮箱和自定义 IMAP/SMTP 使用服务商生成的授权码或应用密码。</p><p>同步失败时，邮件仍保留在本地缓存；离线状态下的归档、删除和已读操作会在恢复连接后重放。</p></section><section><h3>隐私与安全</h3><p>授权凭据只交给本机安全存储，导出的账户配置不包含授权码。HTML 邮件默认屏蔽远程图片，避免追踪像素；需要时可在设置中显式开启。</p></section></div><div className="modal-footer"><span><Icon name="shieldCheck" size={17} />MailGo 运行在本机，数据由你控制</span><button className="gradient-button" type="button" onClick={onClose}>知道了</button></div></motion.div></motion.div>
 }
 
 function AccountModal({ provider, setProvider, providerDefinition, accountEmail, setAccountEmail, authorizationCode, setAuthorizationCode, showAuthorizationCode, setShowAuthorizationCode, customImapHost, setCustomImapHost, customImapPort, setCustomImapPort, customImapSecurity, setCustomImapSecurity, customSmtpHost, setCustomSmtpHost, customSmtpPort, setCustomSmtpPort, customSmtpSecurity, setCustomSmtpSecurity, customAuthentication, setCustomAuthentication, deviceFlow, onClose, onOpenProvider, onCopy, onAdd }: { provider: Provider; setProvider: (provider: Provider) => void; providerDefinition: ReturnType<typeof providerFor>; accountEmail: string; setAccountEmail: (value: string) => void; authorizationCode: string; setAuthorizationCode: (value: string) => void; showAuthorizationCode: boolean; setShowAuthorizationCode: (value: boolean) => void; customImapHost: string; setCustomImapHost: (value: string) => void; customImapPort: string; setCustomImapPort: (value: string) => void; customImapSecurity: string; setCustomImapSecurity: (value: string) => void; customSmtpHost: string; setCustomSmtpHost: (value: string) => void; customSmtpPort: string; setCustomSmtpPort: (value: string) => void; customSmtpSecurity: string; setCustomSmtpSecurity: (value: string) => void; customAuthentication: string; setCustomAuthentication: (value: string) => void; deviceFlow: DeviceFlowState | null; onClose: () => void; onOpenProvider: () => void; onCopy: () => void; onAdd: () => void }) {

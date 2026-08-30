@@ -143,6 +143,11 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .filter-button:hover, .filter-button.is-active { border-color: rgba(119, 129, 255, .55); color: #d9dcff; background: var(--accent-soft); }
 .filter-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
 .list-toolbar { height: 45px; display: flex; align-items: center; gap: 4px; padding: 0 13px 0 22px; border-bottom: 1px solid var(--line); color: var(--muted); }
+.menu-anchor { position: relative; display: inline-flex; }
+.action-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 25; min-width: 174px; display: grid; gap: 2px; padding: 5px; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface); box-shadow: var(--shadow); }
+.action-menu button { width: 100%; min-height: 32px; display: flex; align-items: center; gap: 8px; padding: 0 9px; border-radius: 6px; color: var(--muted-strong); background: transparent; text-align: left; font-size: 11px; white-space: nowrap; }
+.action-menu button:hover:not(:disabled) { color: var(--text); background: var(--surface-hover); }
+.action-menu button:disabled { cursor: not-allowed; opacity: .42; }
 .selection-count { margin: 0 4px 0 2px; color: var(--accent); font-size: 11px; font-weight: 600; white-space: nowrap; }
 .toolbar-action { height: 32px; display: inline-flex; align-items: center; gap: 7px; padding: 0 8px; border-radius: 6px; color: var(--muted-strong); background: transparent; font-size: 11px; }
 .toolbar-action:hover { color: var(--text); background: var(--surface-hover); }
@@ -340,6 +345,17 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .secondary-button { height: 42px; padding: 0 24px; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--muted-strong); background: transparent; }
 .secondary-button:hover { color: var(--text); background: var(--surface-hover); }
 .modal-footer .gradient-button { min-width: 130px; height: 42px; }
+.help-modal { width: min(560px, calc(100vw - 60px)); overflow: hidden; border: 1px solid rgba(139, 160, 210, .34); border-radius: 13px; background: linear-gradient(145deg, #121e35, #0d172a); box-shadow: 0 34px 120px rgba(0, 0, 0, .52); }
+:root[data-theme='light'] .help-modal { background: #fff; border-color: var(--line-strong); }
+.help-modal-body { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; max-height: min(56vh, 440px); overflow: auto; padding: 18px 20px; }
+.help-modal-body section { padding: 13px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
+.help-modal-body section:last-child { grid-column: 1 / -1; }
+.help-modal-body h3 { margin: 0 0 11px; color: var(--text); font-size: 12px; }
+.help-modal-body p { margin: 0 0 10px; color: var(--muted); font-size: 11px; line-height: 1.65; }
+.help-modal-body p:last-child { margin-bottom: 0; }
+.shortcut-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 27px; color: var(--muted-strong); font-size: 11px; }
+.shortcut-row + .shortcut-row { border-top: 1px solid var(--line); }
+.shortcut-row kbd { color: var(--text); }
 
 .compose-backdrop { align-items: end; justify-items: end; padding: 0 30px 30px 0; }
 .compose-modal { width: min(600px, calc(100vw - 60px)); overflow: hidden; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
@@ -399,4 +415,14 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; transition-duration: .001ms !important; }
+}
+
+@media print {
+  body { min-width: 0; color: #111827; background: white; }
+  .titlebar, .sidebar, .mail-list-panel, .auth-panel, .auth-panel-reopen, .reading-toolbar, .reply-composer, .attachments, .toast-stack { display: none !important; }
+  .app-shell, .workspace, .reading-panel { width: 100%; min-height: 0; height: auto; display: block; overflow: visible; background: white; }
+  .reading-scroll { overflow: visible; padding: 0; }
+  .reading-heading h1, .sender-copy strong, .message-content { color: #111827; }
+  .sender-row { margin-top: 18px; }
+  .content-mode-row { display: none; }
 }
