@@ -24,12 +24,12 @@ export const providerDefinitions: ProviderDefinition[] = [
   {
     id: 'outlook',
     label: 'Outlook',
-    description: 'Outlook.com / Microsoft 365',
+    description: 'Outlook.com / Microsoft 365 · 设备授权',
     accent: '#2f80ed',
     icon: 'O',
-    authUrl: 'https://account.live.com/proofs/manage',
-    guide: ['打开 Microsoft 账户安全页面', '进入高级安全选项', '创建应用密码并返回 MailGo'],
-    requiresAuthCode: true,
+    authUrl: 'https://microsoft.com/devicelogin',
+    guide: ['打开 Microsoft 设备验证页面', '输入 MailGo 显示的设备代码', '完成账户授权后返回 MailGo'],
+    requiresAuthCode: false,
   },
   {
     id: 'other',
