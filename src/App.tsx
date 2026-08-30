@@ -358,6 +358,26 @@ function App() {
   }, [isNativeRuntime])
 
   useEffect(() => {
+    if (!isNativeRuntime) return
+    let cancelled = false
+    const refreshBackgroundStatuses = async () => {
+      const nativeState = await readNativeState()
+      if (cancelled || !nativeState) return
+      setAccounts((current) => current.map((account) => {
+        const refreshed = nativeState.accounts.find((item) => item.id === account.id)
+        return refreshed
+          ? { ...account, unread: refreshed.unread, status: refreshed.status, lastSync: refreshed.lastSync }
+          : account
+      }))
+    }
+    const timer = window.setInterval(() => { void refreshBackgroundStatuses() }, 30_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [isNativeRuntime])
+
+  useEffect(() => {
     const styleId = 'mailgo-user-theme'
     let style = document.getElementById(styleId) as HTMLStyleElement | null
     if (!style) {

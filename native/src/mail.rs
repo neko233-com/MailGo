@@ -319,9 +319,10 @@ fn part_bytes(part: &mail_parser::MessagePart<'_>) -> Vec<u8> {
     }
 }
 
-/// The only HTML that crosses the IPC boundary is cleaned with a strict allowlist. Remote images
-/// and tracking-related attributes are omitted by default; inline `cid:` images are resolved only
-/// from the same MIME message.
+/// The only HTML that crosses the IPC boundary is cleaned with a strict allowlist. Safe HTTPS image
+/// sources are retained so the renderer can honor the user's explicit remote-image preference;
+/// the renderer blocks them by default. Inline `cid:` images are resolved only from the same MIME
+/// message.
 pub fn sanitize_html(input: &str) -> String {
     let mut allowed_schemes = HashSet::new();
     allowed_schemes.insert("cid");
@@ -332,13 +333,17 @@ pub fn sanitize_html(input: &str) -> String {
         .attribute_filter(|element, attribute, value| {
             let element = element.to_ascii_lowercase();
             let attribute = attribute.to_ascii_lowercase();
-            if (element == "img" && matches!(attribute.as_str(), "src" | "srcset"))
+            if (element == "img" && attribute == "srcset")
                 || matches!(
                     attribute.as_str(),
                     "style" | "srcdoc" | "ping" | "formaction" | "xlink:href"
                 )
             {
-                if element == "img" && attribute == "src" && value.starts_with("cid:") {
+                return None;
+            }
+            if element == "img" && attribute == "src" {
+                let normalized = value.to_ascii_lowercase();
+                if normalized.starts_with("cid:") || normalized.starts_with("https://") {
                     return Some(Cow::Borrowed(value));
                 }
                 return None;
@@ -375,15 +380,27 @@ mod tests {
     }
 
     #[test]
-    fn blocks_remote_images_and_unsafe_attributes_but_keeps_safe_links() {
+    fn retains_safe_remote_images_but_blocks_unsafe_attributes_and_links() {
         let html = sanitize_html(
             r#"<p style="background:url(https://tracker.example/pixel)">ok</p><img src="https://tracker.example/pixel" srcset="https://tracker.example/2x"><a href="mailto:person@example.com" target="_blank">contact</a><img src="cid:logo@example.com">"#,
         );
-        assert!(!html.contains("tracker.example"));
+        assert!(html.contains("<img src=\"https://tracker.example/pixel\""));
+        assert!(!html.contains("srcset="));
         assert!(!html.contains("style="));
         assert!(html.contains("mailto:person@example.com"));
         assert!(html.contains("cid:logo@example.com"));
         assert!(html.contains("noreferrer noopener"));
+    }
+
+    #[test]
+    fn removes_non_https_image_sources() {
+        let html = sanitize_html(
+            r#"<img src="http://tracker.example/pixel"><img src="data:text/html,evil"><img src="javascript:alert(1)"><p>ok</p>"#,
+        );
+        assert!(!html.contains("tracker.example"));
+        assert!(!html.contains("data:text/html"));
+        assert!(!html.contains("javascript:"));
+        assert!(html.contains("ok"));
     }
 
     #[test]

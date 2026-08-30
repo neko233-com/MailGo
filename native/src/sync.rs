@@ -125,7 +125,18 @@ pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathB
                 };
                 let credential = match crate::load_credential(&account) {
                     Ok(credential) => credential,
-                    Err(_) => continue,
+                    Err(error) => {
+                        crate::record_account_sync_failure(
+                            &shared,
+                            &account.id,
+                            needs_reauthorization(&error),
+                        );
+                        tracing::warn!(
+                            account_id = %account.id,
+                            "background credential load failed: {error}"
+                        );
+                        continue;
+                    }
                 };
                 match sync_account(
                     &account.id,
@@ -161,10 +172,17 @@ pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathB
                             }
                         }
                     }
-                    Err(error) => tracing::warn!(
-                        account_id = %account.id,
-                        "background sync failed: {error}"
-                    ),
+                    Err(error) => {
+                        crate::record_account_sync_failure(
+                            &shared,
+                            &account.id,
+                            needs_reauthorization(&error),
+                        );
+                        tracing::warn!(
+                            account_id = %account.id,
+                            "background sync failed: {error}"
+                        );
+                    }
                 }
             }
         })
@@ -593,6 +611,10 @@ enum SyncErrorClass {
     RateLimited,
     Transport,
     Permanent,
+}
+
+pub fn needs_reauthorization(error: &anyhow::Error) -> bool {
+    classify_sync_error(error) == SyncErrorClass::Authentication
 }
 
 fn classify_sync_error(error: &anyhow::Error) -> SyncErrorClass {
@@ -1717,6 +1739,10 @@ mod tests {
             classify_sync_error(&anyhow!("message headers could not be parsed")),
             SyncErrorClass::Permanent
         );
+        assert!(needs_reauthorization(&anyhow!(
+            "OAuth access token expired; reauthorization is required"
+        )));
+        assert!(!needs_reauthorization(&anyhow!("connection reset by peer")));
     }
 
     #[test]

@@ -28,7 +28,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 22. Windows desktop can export/import fully configured accounts through a password-protected Argon2id + ChaCha20-Poly1305 bundle; decrypted credentials are written only to Windows Credential Manager and imported account caches are reset before the next sync.
 23. The per-user rdesktop updater preserves a working installation when local application-control policy blocks source builds and only accepts a checksum-verified official binary fallback when it is newer.
 24. Persisted state loading explicitly migrates legacy missing fields and both snake_case/camelCase spellings, normalizes the current schema version, and rejects future unsupported versions before touching the backup state.
-25. Native MIME sanitization now removes remote image sources and tracking-related attributes before caching while preserving safe HTTPS/mailto links and inline CID images.
+25. Native MIME sanitization now retains only safe HTTPS image sources and removes tracking-related attributes before caching; the renderer blocks remote images by default while preserving safe HTTPS/mailto links and inline CID images.
 26. Sync retry handling honors numeric `Retry-After` hints that survive transport errors, with a bounded 1–300 second cap and exponential fallback for providers that omit the hint.
 27. Offline flag and move queues are covered by executable regression tests for coalescing semantics and immediate encrypted-cache consistency; temporary test state is process-scoped and cleaned up after each case.
 28. The native queue-status IPC exposes only encrypted-queue counts, and the desktop cache footer reports pending local operations across all configured accounts after mutations and sync.
@@ -36,6 +36,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 30. Full MIME parsing is bounded to 64 MiB, attachments are capped by count and aggregate size, and untrusted attachment names are normalized before they enter cache metadata or download flows.
 31. Native attachment upload sessions are cleared after every send attempt, and OAuth pending/callback secrets are zeroized when their in-memory session values are released.
 32. Native IPC validates bounded recipient, subject, body, HTML, and manual-credential fields before any SMTP, OAuth, or keyring operation.
+33. Credential, configuration, and IMAP failures now persist an offline or reauthorization-needed account status across manual sync, first sync, background sync, and restart; the desktop renderer refreshes those statuses while the tray scheduler continues running.
 
 ## Remaining production acceptance work
 

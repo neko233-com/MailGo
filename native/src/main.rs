@@ -297,9 +297,12 @@ fn credential_entry(account_id: &str) -> Result<keyring::Entry> {
 
 fn load_credential(account: &PersistedAccount) -> Result<String> {
     let entry = credential_entry(&account.id)?;
-    let raw = entry
-        .get_password()
-        .map_err(|error| anyhow!("credential unavailable: {error}"))?;
+    let raw = entry.get_password().map_err(|error| match error {
+        keyring::Error::NoEntry => {
+            anyhow!("account credential is missing; reauthorization required")
+        }
+        error => anyhow!("credential store unavailable: {error}"),
+    })?;
     let provider = providers::ProviderKind::parse(&account.provider)?;
     let refreshed = oauth::refresh_if_needed(provider, &raw)?;
     if refreshed != raw {
@@ -320,6 +323,37 @@ fn account_for(shared: &Arc<Mutex<MailGoState>>, account_id: &str) -> Result<Per
         .find(|account| account.id == account_id)
         .cloned()
         .ok_or_else(|| anyhow!("account not found"))
+}
+
+pub(crate) fn record_account_sync_failure(
+    shared: &Arc<Mutex<MailGoState>>,
+    account_id: &str,
+    needs_auth: bool,
+) {
+    let Ok(mut app) = shared.lock() else {
+        tracing::warn!(account_id = %account_id, "background sync status lock poisoned");
+        return;
+    };
+    if let Some(account) = app
+        .state
+        .accounts
+        .iter_mut()
+        .find(|account| account.id == account_id)
+    {
+        account.status = if needs_auth {
+            "needs-auth".into()
+        } else {
+            "offline".into()
+        };
+        account.last_sync = if needs_auth {
+            "等待重新授权".into()
+        } else {
+            "后台同步失败，可重试".into()
+        };
+        if let Err(error) = app.save() {
+            tracing::warn!(account_id = %account_id, "background sync status save failed: {error}");
+        }
+    }
 }
 
 fn profile_for_account(account: &PersistedAccount) -> Result<providers::ProviderProfile> {
@@ -955,15 +989,45 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
             "sync.account" => {
                 let account_id = string_field(&message.payload, "accountId")?;
                 let account = account_for(shared, &account_id)?;
-                let profile = profile_for_account(&account)?;
-                let credential = load_credential(&account)?;
-                let result = sync::sync_account(
+                let profile = match profile_for_account(&account) {
+                    Ok(profile) => profile,
+                    Err(error) => {
+                        record_account_sync_failure(
+                            shared,
+                            &account.id,
+                            sync::needs_reauthorization(&error),
+                        );
+                        return Err(error);
+                    }
+                };
+                let credential = match load_credential(&account) {
+                    Ok(credential) => credential,
+                    Err(error) => {
+                        record_account_sync_failure(
+                            shared,
+                            &account.id,
+                            sync::needs_reauthorization(&error),
+                        );
+                        return Err(error);
+                    }
+                };
+                let result = match sync::sync_account(
                     &account.id,
                     profile,
                     &account.email,
                     &credential,
                     &cache_dir(),
-                )?;
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        record_account_sync_failure(
+                            shared,
+                            &account.id,
+                            sync::needs_reauthorization(&error),
+                        );
+                        return Err(error);
+                    }
+                };
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                 if let Some(stored) = app
                     .state
@@ -995,9 +1059,29 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     .unwrap_or(50)
                     .clamp(1, 100);
                 let account = account_for(shared, &account_id)?;
-                let profile = profile_for_account(&account)?;
-                let credential = load_credential(&account)?;
-                let result = sync::sync_folder_page(
+                let profile = match profile_for_account(&account) {
+                    Ok(profile) => profile,
+                    Err(error) => {
+                        record_account_sync_failure(
+                            shared,
+                            &account.id,
+                            sync::needs_reauthorization(&error),
+                        );
+                        return Err(error);
+                    }
+                };
+                let credential = match load_credential(&account) {
+                    Ok(credential) => credential,
+                    Err(error) => {
+                        record_account_sync_failure(
+                            shared,
+                            &account.id,
+                            sync::needs_reauthorization(&error),
+                        );
+                        return Err(error);
+                    }
+                };
+                let result = match sync::sync_folder_page(
                     &account.id,
                     profile,
                     &account.email,
@@ -1006,7 +1090,17 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     before_uid,
                     limit,
                     &cache_dir(),
-                )?;
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        record_account_sync_failure(
+                            shared,
+                            &account.id,
+                            sync::needs_reauthorization(&error),
+                        );
+                        return Err(error);
+                    }
+                };
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                 if let Some(stored) = app
                     .state
@@ -1034,6 +1128,11 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     let profile = match profile_for_account(&account) {
                         Ok(profile) => profile,
                         Err(error) => {
+                            record_account_sync_failure(
+                                shared,
+                                &account.id,
+                                sync::needs_reauthorization(&error),
+                            );
                             failed.push(
                                 json!({ "accountId": account.id, "message": error.to_string() }),
                             );
@@ -1043,20 +1142,12 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     let credential = match load_credential(&account) {
                         Ok(credential) => credential,
                         Err(error) => {
-                            failed.push(json!({ "accountId": account.id, "message": "requires authorization" }));
-                            let mut app =
-                                shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-                            if let Some(stored) = app
-                                .state
-                                .accounts
-                                .iter_mut()
-                                .find(|item| item.id == account.id)
-                            {
-                                stored.status = "needs-auth".to_string();
-                                stored.last_sync = "等待重新授权".to_string();
-                            }
-                            app.save()?;
-                            let _ = error;
+                            let needs_auth = sync::needs_reauthorization(&error);
+                            failed.push(json!({
+                                "accountId": account.id,
+                                "message": if needs_auth { "requires authorization" } else { "credential store unavailable" },
+                            }));
+                            record_account_sync_failure(shared, &account.id, needs_auth);
                             continue;
                         }
                     };
@@ -1083,10 +1174,17 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                             app.save()?;
                             synced.push(serde_json::to_value(result)?);
                         }
-                        Err(error) => failed.push(json!({
-                            "accountId": account.id,
-                            "message": error.to_string(),
-                        })),
+                        Err(error) => {
+                            record_account_sync_failure(
+                                shared,
+                                &account.id,
+                                sync::needs_reauthorization(&error),
+                            );
+                            failed.push(json!({
+                                "accountId": account.id,
+                                "message": error.to_string(),
+                            }));
+                        }
                     }
                 }
                 Ok(json!({ "accepted": true, "mode": "imap", "synced": synced, "failed": failed }))
