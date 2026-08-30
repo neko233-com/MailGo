@@ -16,6 +16,7 @@ The current foundation includes:
 - Rust `neko233-com/rdesktop` WebView2 shell with custom frameless title bar and preserved WebView data directory under `%LOCALAPPDATA%\\MailGo\\WebView2`.
 - Windows Credential Manager integration through `keyring` for authorization-code storage; secrets never enter `state.json` or account exports.
 - Native IMAP sync uses UID-based incremental header caching across provider folder mappings, bounded `UID FLAGS` refreshes, lazy full-message retrieval, replayable offline flag mutations, local flag updates, and DPAPI-protected mailbox/attachment caches on Windows. Attachment downloads use bounded start/chunk/cancel IPC with progress and cancellation support.
+- Native sync discovers selectable IMAP mailboxes (including custom folders), persists a bounded per-account folder index, and exposes those folders in the desktop sidebar for offline browsing and UID pagination.
 - Mail actions use UID semantics end-to-end: batch selection supports mark-read, archive, and delete; archive/trash operations update encrypted local folder caches immediately and queue provider mutations when offline. Gmail archive removes the Inbox label instead of copying the message into a duplicate folder.
 - The desktop cache footer reports the number of encrypted flag/move mutations still waiting for provider replay across all accounts; the renderer receives counts only, never queue contents.
 - Native SMTP sending supports plain text and HTML alternatives through provider-specific TLS/STARTTLS defaults.

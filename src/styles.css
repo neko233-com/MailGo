@@ -94,6 +94,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .nav-row.is-selected .nav-icon { color: #9ca5ff; }
 .nav-count, .account-count { margin-left: auto; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .nav-count-selected { color: #dfe1ff; background: rgba(115, 130, 247, .4); padding: 3px 8px; border-radius: 6px; }
+.server-folders { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
+.server-folders-heading { padding-bottom: 6px; }
+.server-folders-heading small { color: var(--muted); font-size: 10px; font-weight: 500; letter-spacing: 0; }
+.server-folders-list { display: grid; gap: 2px; max-height: 180px; overflow: auto; }
+.server-folder-row { height: 38px; padding: 0 10px; gap: 10px; }
+.server-folder-copy { min-width: 0; display: flex; flex-direction: column; gap: 1px; overflow: hidden; }
+.server-folder-copy span, .server-folder-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.server-folder-copy span { color: inherit; font-size: 12px; }
+.server-folder-copy small { color: var(--muted); font-size: 9px; }
 .sidebar-section { border-top: 1px solid var(--line); margin-top: 15px; padding-top: 14px; }
 .section-label-row, .storage-meta, .storage-foot, .list-footer, .settings-title { display: flex; align-items: center; justify-content: space-between; }
 .section-label-row { padding: 0 8px 8px; color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: .06em; }

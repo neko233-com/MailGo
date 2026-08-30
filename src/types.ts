@@ -78,6 +78,7 @@ export interface ExportedAccount {
 
 export interface NativeState {
   accounts: MailAccount[]
+  folders?: Record<string, string[]>
   theme: ThemeMode
   minimizeToTray: boolean
   offlineMode: boolean

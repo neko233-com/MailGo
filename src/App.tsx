@@ -108,6 +108,28 @@ function nativeFolderName(account: MailAccount, folder: FolderId): string {
   return account.provider === 'google' ? '[Gmail]/All Mail' : 'Archive'
 }
 
+function nativeFolderLabel(folder: string) {
+  const parts = folder.split(/[\\/]/).filter(Boolean)
+  return parts[parts.length - 1] || folder
+}
+
+function isSameNativeFolder(left: string, right: string) {
+  return left.toLocaleLowerCase() === right.toLocaleLowerCase()
+}
+
+function customNativeFolders(account: MailAccount, folders: string[] | undefined) {
+  const builtInFolders = folderLabels
+    .filter((folder) => folder.id !== 'starred')
+    .map((folder) => nativeFolderName(account, folder.id))
+  const result: string[] = []
+  for (const folder of folders ?? []) {
+    if (!folder.trim() || folder.length > 512 || /[\\r\\n]/.test(folder) || builtInFolders.some((builtIn) => isSameNativeFolder(builtIn, folder))) continue
+    if (!result.some((known) => isSameNativeFolder(known, folder))) result.push(folder)
+    if (result.length === 64) break
+  }
+  return result
+}
+
 function nativeMailboxKey(accountId: string, folder: string) {
   return `${accountId}::${folder}`
 }
@@ -247,6 +269,8 @@ function App() {
   const [isSyncing, setSyncing] = useState(false)
   const [isLoadingEarlier, setLoadingEarlier] = useState(false)
   const [mailboxMeta, setMailboxMeta] = useState<Record<string, { oldestUid?: number; hasMore?: boolean }>>({})
+  const [nativeFolders, setNativeFolders] = useState<Record<string, string[]>>({})
+  const [selectedNativeFolder, setSelectedNativeFolder] = useState<{ accountId: string; name: string } | null>(null)
   const [isHtmlMode, setHtmlMode] = useState(false)
   const [isImporting, setImporting] = useState(false)
   const [transferMode, setTransferMode] = useState<TransferMode | null>(null)
@@ -397,6 +421,7 @@ function App() {
     void readNativeState().then(async (nativeState) => {
       if (cancelled || !nativeState) return
       if (isNativeRuntime) setAccounts(nativeState.accounts)
+      if (isNativeRuntime) setNativeFolders(nativeState.folders ?? {})
       setTheme(nativeState.theme)
       setMinimizeToTray(nativeState.minimizeToTray)
       setNotificationsEnabled(nativeState.notificationsEnabled ?? true)
@@ -514,27 +539,42 @@ function App() {
   const allMails = useMemo(() => isNativeRuntime ? [...mails, ...localDraftMails] : mails, [isNativeRuntime, localDraftMails, mails])
   const displayedFolderLabels = useMemo(() => {
     if (!isNativeRuntime) return folderLabels
+    const matchesFixedFolder = (mail: MailMessage, folder: FolderId) => {
+      if (folder === 'starred') return mail.starred
+      const account = accounts.find((item) => item.id === mail.accountId)
+      return mail.nativeFolder && account
+        ? isSameNativeFolder(mail.nativeFolder, nativeFolderName(account, folder))
+        : mail.folder === folder
+    }
     return folderLabels.map((folder) => ({
       ...folder,
       unread: folder.id === 'drafts'
         ? nativeDrafts.length
-        : folder.id === 'starred'
-          ? allMails.filter((mail) => mail.starred && mail.unread).length
-          : allMails.filter((mail) => mail.folder === folder.id && mail.unread).length,
+        : allMails.filter((mail) => matchesFixedFolder(mail, folder.id) && mail.unread).length,
     }))
-  }, [allMails, isNativeRuntime, nativeDrafts.length])
+  }, [accounts, allMails, isNativeRuntime, nativeDrafts.length])
   const visibleMails = useMemo(() => {
     const lowerQuery = query.trim().toLowerCase()
     return allMails.filter((mail) => {
-      const folderMatch = selectedFolder === 'starred' ? mail.starred : mail.folder === selectedFolder
-      const accountMatch = !selectedAccountId || mail.accountId === selectedAccountId
+      const nativeFolder = mail.nativeFolder
+      const folderMatch = selectedNativeFolder
+        ? mail.accountId === selectedNativeFolder.accountId && typeof nativeFolder === 'string' && isSameNativeFolder(nativeFolder, selectedNativeFolder.name)
+        : selectedFolder === 'starred'
+          ? mail.starred
+          : (() => {
+              const account = accounts.find((item) => item.id === mail.accountId)
+              return nativeFolder && account
+                ? isSameNativeFolder(nativeFolder, nativeFolderName(account, selectedFolder))
+                : mail.folder === selectedFolder
+            })()
+      const accountMatch = selectedNativeFolder ? true : !selectedAccountId || mail.accountId === selectedAccountId
       const categoryMatch = !selectedCategory || mail.category === selectedCategory
       const adMatch = !hideAds || !mail.isAd || Boolean(selectedCategory)
       const unreadMatch = !filterUnread || mail.unread
       const queryMatch = !lowerQuery || `${mail.senderName} ${mail.subject} ${mail.preview}`.toLowerCase().includes(lowerQuery)
       return folderMatch && accountMatch && categoryMatch && adMatch && unreadMatch && queryMatch
     })
-  }, [allMails, filterUnread, hideAds, query, selectedAccountId, selectedCategory, selectedFolder])
+  }, [accounts, allMails, filterUnread, hideAds, query, selectedAccountId, selectedCategory, selectedFolder, selectedNativeFolder])
 
   const selectedMail = visibleMails.find((mail) => mail.id === selectedMailId) ?? visibleMails[0] ?? {
     id: 'empty-mail',
@@ -568,9 +608,10 @@ function App() {
   )
   const allVisibleSelected = visibleMails.length > 0 && selectedVisibleMails.length === visibleMails.length
 
-  const canLoadEarlier = isNativeRuntime && selectedFolder !== 'starred' && accounts
+  const canLoadEarlier = isNativeRuntime && !selectedNativeFolder && selectedFolder !== 'starred' && accounts
     .filter((account) => !selectedAccountId || account.id === selectedAccountId)
     .some((account) => mailboxMeta[nativeMailboxKey(account.id, nativeFolderName(account, selectedFolder))]?.hasMore)
+    || isNativeRuntime && Boolean(selectedNativeFolder) && Boolean(mailboxMeta[nativeMailboxKey(selectedNativeFolder!.accountId, selectedNativeFolder!.name)]?.hasMore)
 
   const selectMail = async (mail: MailMessage) => {
     setSelectedMailId(mail.id)
@@ -864,10 +905,17 @@ function App() {
 
   const selectFolder = (folder: FolderId) => {
     setSelectedFolder(folder)
+    setSelectedNativeFolder(null)
     setSelectedCategory(null)
     setSelectedAccountId(null)
     setSelectedMailIds([])
-    const first = allMails.find((mail) => folder === 'starred' ? mail.starred : mail.folder === folder)
+    const first = allMails.find((mail) => {
+      if (folder === 'starred') return mail.starred
+      const account = accounts.find((item) => item.id === mail.accountId)
+      return mail.nativeFolder && account
+        ? isSameNativeFolder(mail.nativeFolder, nativeFolderName(account, folder))
+        : mail.folder === folder
+    })
     if (first) setSelectedMailId(first.id)
     if (isNativeRuntime && folder !== 'starred') {
       void Promise.all(accounts.map(async (account) => {
@@ -886,10 +934,33 @@ function App() {
     }
   }
 
+  const selectNativeFolder = (account: MailAccount, folder: string) => {
+    setSelectedFolder('archive')
+    setSelectedNativeFolder({ accountId: account.id, name: folder })
+    setSelectedCategory(null)
+    setSelectedAccountId(account.id)
+    setSelectedMailIds([])
+    const first = allMails.find((mail) => mail.accountId === account.id && mail.nativeFolder && isSameNativeFolder(mail.nativeFolder, folder))
+    if (first) setSelectedMailId(first.id)
+    if (!isNativeRuntime) return
+    void invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, folder }).then((result) => {
+      if (!result.mailbox) return
+      const converted = result.mailbox.messages.map((message) => nativeMessageToUi(message, account))
+      setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(account.id, folder)]: { oldestUid: result.mailbox!.oldestUid, hasMore: result.mailbox!.hasMore } }))
+      setMails((current) => [...current.filter((mail) => !(mail.accountId === account.id && mail.nativeFolder && isSameNativeFolder(mail.nativeFolder, folder))), ...converted])
+      if (converted.length) setSelectedMailId((current) => current === 'launch-plan' ? converted[0].id : current)
+    }).catch(() => pushToast(`${account.label} 的“${nativeFolderLabel(folder)}”暂时无法读取`, 'error'))
+  }
+
   const loadEarlier = async () => {
     if (!isNativeRuntime || selectedFolder === 'starred' || isLoadingEarlier) return
-    const targetAccounts = accounts.filter((account) => !selectedAccountId || account.id === selectedAccountId)
-    const pendingAccounts = targetAccounts.filter((account) => mailboxMeta[nativeMailboxKey(account.id, nativeFolderName(account, selectedFolder))]?.hasMore)
+    const targetAccounts = selectedNativeFolder
+      ? accounts.filter((account) => account.id === selectedNativeFolder.accountId)
+      : accounts.filter((account) => !selectedAccountId || account.id === selectedAccountId)
+    const pendingAccounts = targetAccounts.filter((account) => {
+      const serverFolder = selectedNativeFolder?.name ?? nativeFolderName(account, selectedFolder)
+      return mailboxMeta[nativeMailboxKey(account.id, serverFolder)]?.hasMore
+    })
     if (!pendingAccounts.length) {
       pushToast('已经加载到更早的邮件', 'info')
       return
@@ -898,7 +969,7 @@ function App() {
     try {
       let loaded = 0
       await Promise.all(pendingAccounts.map(async (account) => {
-        const serverFolder = nativeFolderName(account, selectedFolder)
+        const serverFolder = selectedNativeFolder?.name ?? nativeFolderName(account, selectedFolder)
         const meta = mailboxMeta[nativeMailboxKey(account.id, serverFolder)]
         try {
           const pageResult = await invoke<NativeSyncItem>('sync.page', {
@@ -927,6 +998,7 @@ function App() {
   const selectCategory = (category: SmartCategory) => {
     setSelectedCategory(category)
     setSelectedFolder('inbox')
+    setSelectedNativeFolder(null)
     setSelectedAccountId(null)
     const first = mails.find((mail) => mail.category === category)
     if (first) setSelectedMailId(first.id)
@@ -940,6 +1012,13 @@ function App() {
     setSyncing(true)
     try {
       const result = await invoke<NativeSyncResponse>('sync.all', {}, 60_000)
+      setNativeFolders((current) => {
+        const next = { ...current }
+        for (const item of result.synced ?? []) {
+          if (item.folders?.length) next[item.accountId] = item.folders
+        }
+        return next
+      })
       setAccounts((current) => current.map((account) => {
         const synced = result.synced?.find((item) => item.accountId === account.id)
         const failed = result.failed?.find((item) => item.accountId === account.id)
@@ -1062,6 +1141,13 @@ function App() {
     setAccounts((current) => existingAccount
       ? current.map((account) => account.id === id ? newAccount : account)
       : [...current, newAccount])
+    if (existingAccount) {
+      setNativeFolders((current) => {
+        const next = { ...current }
+        delete next[id]
+        return next
+      })
+    }
     let accountStored = false
     try {
       await invoke('accounts.add', {
@@ -1084,7 +1170,8 @@ function App() {
         } : {}),
       })
       accountStored = true
-      const result = await invoke<{ unread?: number }>('sync.account', { accountId: id }, 60_000)
+      const result = await invoke<NativeSyncItem>('sync.account', { accountId: id }, 60_000)
+      if (result.folders?.length) setNativeFolders((current) => ({ ...current, [id]: result.folders! }))
       setAccounts((current) => current.map((account) => account.id === id ? { ...account, unread: result.unread ?? 0, status: 'synced', lastSync: '刚刚同步' } : account))
       if (isNativeRuntime) {
         const mailbox = await invoke<NativeMailboxResponse>('mail.list', { accountId: id })
@@ -1140,6 +1227,12 @@ function App() {
       setAccounts((current) => current.filter((item) => item.id !== account.id))
       setMails((current) => current.filter((mail) => mail.accountId !== account.id))
       setNativeDrafts((current) => current.filter((draft) => draft.accountId !== account.id))
+      setNativeFolders((current) => {
+        const next = { ...current }
+        delete next[account.id]
+        return next
+      })
+      setSelectedNativeFolder((current) => current?.accountId === account.id ? null : current)
       setMailboxMeta((current) => Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${account.id}::`))))
       setSelectedAccountId((current) => current === account.id ? null : current)
       setEditingAccountId(null)
@@ -1216,6 +1309,7 @@ function App() {
         }]
       }).slice(0, 64)
       setAccounts((current) => [...current.filter((account) => !imported.some((item) => item.id === account.id)), ...imported])
+      setNativeFolders((current) => Object.fromEntries(Object.entries(current).filter(([accountId]) => !imported.some((account) => account.id === accountId))))
       try { await invoke('accounts.import', { accounts: imported }) } catch { /* Browser preview fallback. */ }
       pushToast(`已导入 ${imported.length} 个账户，请逐一补充授权码`, 'success')
     } catch (error) {
@@ -1273,6 +1367,7 @@ function App() {
         const nativeState = await readNativeState()
         if (nativeState) {
           setAccounts(nativeState.accounts)
+          setNativeFolders(nativeState.folders ?? {})
           setMails((current) => current.filter((mail) => nativeState.accounts.some((account) => account.id === mail.accountId)))
           void refreshNativeDrafts(nativeState.accounts)
         }
@@ -1300,6 +1395,13 @@ function App() {
     window.__RDESKTOP_WINDOW__?.close()
   }
 
+  const nativeFolderGroups = useMemo(
+    () => accounts
+      .map((account) => ({ account, folders: customNativeFolders(account, nativeFolders[account.id]) }))
+      .filter((group) => group.folders.length > 0),
+    [accounts, nativeFolders],
+  )
+
   return (
     <div className="app-shell">
       <style>{`.reicon { width: 1em; height: 1em; }`}</style>
@@ -1319,13 +1421,27 @@ function App() {
             <button className="compose-button" type="button" onClick={() => openCompose()}><Icon name="edit" size={19} /><span>写邮件</span><span className="compose-shortcut">C</span></button>
             <nav className="folder-nav" aria-label="邮件文件夹">
               {displayedFolderLabels.map((folder) => (
-                <button key={folder.id} type="button" className={`nav-row ${selectedFolder === folder.id && !selectedCategory ? 'is-selected' : ''}`} onClick={() => selectFolder(folder.id)}>
+                <button key={folder.id} type="button" className={`nav-row ${selectedFolder === folder.id && !selectedCategory && !selectedNativeFolder ? 'is-selected' : ''}`} onClick={() => selectFolder(folder.id)}>
                   <span className="nav-icon"><Icon name={folder.icon as IconName} size={19} weight={selectedFolder === folder.id ? 'Filled' : 'Outline'} /></span>
                   <span>{folder.label}</span>
                   {folder.unread > 0 && <span className={`nav-count ${selectedFolder === folder.id ? 'nav-count-selected' : ''}`}>{formatCount(folder.unread)}</span>}
                 </button>
               ))}
             </nav>
+            {isNativeRuntime && nativeFolderGroups.length > 0 && <div className="server-folders" aria-label="服务器文件夹">
+              <div className="section-label-row server-folders-heading"><span>服务器文件夹</span><small>已发现</small></div>
+              <div className="server-folders-list">
+                {nativeFolderGroups.flatMap(({ account, folders }) => folders.map((folder) => {
+                  const selected = Boolean(selectedNativeFolder && selectedNativeFolder.accountId === account.id && isSameNativeFolder(selectedNativeFolder.name, folder))
+                  const unread = allMails.filter((mail) => mail.accountId === account.id && mail.nativeFolder && isSameNativeFolder(mail.nativeFolder, folder) && mail.unread).length
+                  return <button key={`${account.id}::${folder}`} type="button" className={`nav-row server-folder-row ${selected ? 'is-selected' : ''}`} onClick={() => selectNativeFolder(account, folder)} title={`${account.label} · ${folder}`}>
+                    <span className="nav-icon"><Icon name="folder" size={17} weight={selected ? 'Filled' : 'Outline'} /></span>
+                    <span className="server-folder-copy"><span>{nativeFolderLabel(folder)}</span><small>{account.label}</small></span>
+                    {unread > 0 && <span className={`nav-count ${selected ? 'nav-count-selected' : ''}`}>{formatCount(unread)}</span>}
+                  </button>
+                }))}
+              </div>
+            </div>}
           </div>
 
           <div className="sidebar-section smart-section">
@@ -1343,7 +1459,7 @@ function App() {
             <div className="section-label-row"><span>账户</span><TooltipButton label="添加账户" onClick={openNewAccount}><Icon name="add" size={16} /></TooltipButton></div>
             <div className="account-list">
               {accounts.map((account) => (
-                <button key={account.id} type="button" className={`account-row ${selectedAccountId === account.id ? 'is-selected' : ''}`} onClick={() => { setSelectedAccountId(account.id); setSelectedCategory(null); setSelectedFolder('inbox'); setSelectedMailIds([]) }}>
+                <button key={account.id} type="button" className={`account-row ${selectedAccountId === account.id && !selectedNativeFolder ? 'is-selected' : ''}`} onClick={() => { setSelectedAccountId(account.id); setSelectedCategory(null); setSelectedNativeFolder(null); setSelectedFolder('inbox'); setSelectedMailIds([]) }}>
                   <ProviderMark provider={account.provider} size="sm" />
                   <span className="account-copy"><strong>{account.label}</strong><small>{account.email}</small></span>
                   {account.unread > 0 && <span className="account-count">{account.unread}</span>}

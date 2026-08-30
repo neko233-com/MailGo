@@ -15,6 +15,7 @@ use crate::providers::{Authentication, ProviderProfile, TransportSecurity};
 const HEADER_FETCH_QUERY: &str = "UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]";
 const FULL_FETCH_QUERY: &str = "UID FLAGS RFC822";
 const MAX_HEADER_MESSAGES: usize = 100;
+const MAX_DISCOVERED_FOLDERS: usize = 64;
 const CACHE_FILE: &str = "inbox.bin";
 const MUTATION_FILE: &str = "mutations.bin";
 const MOVE_MUTATION_FILE: &str = "moves.bin";
@@ -1599,6 +1600,7 @@ fn discover_folders(
             names
                 .iter()
                 .map(|name| name.name().to_string())
+                .filter(|name| is_safe_discovered_folder(name))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -1617,10 +1619,10 @@ fn discover_folders(
         })
         .collect::<Vec<_>>();
     for name in listed {
-        if is_likely_mail_folder(&name)
-            && !folders
-                .iter()
-                .any(|folder| folder.eq_ignore_ascii_case(&name))
+        if !folders
+            .iter()
+            .any(|folder| folder.eq_ignore_ascii_case(&name))
+            && folders.len() < MAX_DISCOVERED_FOLDERS
         {
             folders.push(name);
         }
@@ -1628,18 +1630,12 @@ fn discover_folders(
     folders
 }
 
-fn is_likely_mail_folder(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    name == "inbox"
-        || name.contains("sent")
-        || name.contains("draft")
-        || name.contains("spam")
-        || name.contains("junk")
-        || name.contains("trash")
-        || name.contains("deleted")
-        || name.contains("archive")
-        || name.contains("all mail")
-        || name.contains("allmail")
+fn is_safe_discovered_folder(name: &str) -> bool {
+    name.trim().len() <= 512
+        && !name.trim().is_empty()
+        && !name
+            .chars()
+            .any(|character| matches!(character, '\r' | '\n'))
 }
 
 fn folders_for(provider: crate::providers::ProviderKind) -> Vec<&'static str> {
@@ -1783,11 +1779,11 @@ mod tests {
     }
 
     #[test]
-    fn folder_discovery_only_adopts_mailbox_like_names() {
-        assert!(is_likely_mail_folder("[Gmail]/All Mail"));
-        assert!(is_likely_mail_folder("Archive 2026"));
-        assert!(is_likely_mail_folder("Junk Email"));
-        assert!(!is_likely_mail_folder("Contacts"));
+    fn folder_discovery_accepts_custom_mailbox_names_safely() {
+        assert!(is_safe_discovered_folder("Projects/2026"));
+        assert!(is_safe_discovered_folder("团队收件箱"));
+        assert!(!is_safe_discovered_folder("Contacts\r\nUID FETCH 1 ALL"));
+        assert!(!is_safe_discovered_folder(""));
     }
 
     #[test]

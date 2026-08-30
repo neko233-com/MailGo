@@ -38,6 +38,7 @@ const MAX_OUTGOING_ATTACHMENTS: usize = 10;
 const MAX_ACTIVE_ATTACHMENT_UPLOADS: usize = 4;
 const ATTACHMENT_UPLOAD_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_IMPORTED_ACCOUNTS: usize = 64;
+const MAX_FOLDERS_PER_ACCOUNT: usize = 64;
 const MAX_ACCOUNT_ID_LENGTH: usize = 128;
 const MAX_ACCOUNT_LABEL_LENGTH: usize = 128;
 const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
@@ -69,6 +70,8 @@ struct PersistedAccount {
 struct PersistedState {
     schema_version: u32,
     accounts: Vec<PersistedAccount>,
+    #[serde(default)]
+    folder_names: HashMap<String, Vec<String>>,
     theme: String,
     minimize_to_tray: bool,
     offline_mode: bool,
@@ -86,6 +89,8 @@ struct PersistedStateDisk {
     schema_version: Option<u32>,
     #[serde(default)]
     accounts: Vec<PersistedAccount>,
+    #[serde(default, alias = "folderNames")]
+    folder_names: HashMap<String, Vec<String>>,
     #[serde(default = "default_theme")]
     theme: String,
     #[serde(default = "default_minimize_to_tray", alias = "minimizeToTray")]
@@ -132,9 +137,11 @@ fn decode_persisted_state(contents: &str) -> Result<PersistedState> {
             "MailGo state schema {version} is newer than supported schema {STATE_SCHEMA_VERSION}"
         ));
     }
+    let accounts = sanitize_persisted_accounts(disk.accounts);
     Ok(PersistedState {
         schema_version: STATE_SCHEMA_VERSION,
-        accounts: sanitize_persisted_accounts(disk.accounts),
+        folder_names: sanitize_persisted_folder_names(disk.folder_names, &accounts),
+        accounts,
         theme: if disk.theme == "light" {
             "light".to_string()
         } else {
@@ -146,6 +153,46 @@ fn decode_persisted_state(contents: &str) -> Result<PersistedState> {
         remote_images_enabled: disk.remote_images_enabled,
         hide_ads: disk.hide_ads,
     })
+}
+
+fn sanitize_folder_names(folder_names: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for folder in folder_names {
+        if folder.trim().is_empty()
+            || folder.len() > 512
+            || folder
+                .chars()
+                .any(|character| matches!(character, '\r' | '\n'))
+            || normalized
+                .iter()
+                .any(|known: &String| known.eq_ignore_ascii_case(folder))
+        {
+            continue;
+        }
+        normalized.push(folder.clone());
+        if normalized.len() == MAX_FOLDERS_PER_ACCOUNT {
+            break;
+        }
+    }
+    normalized
+}
+
+fn sanitize_persisted_folder_names(
+    folder_names: HashMap<String, Vec<String>>,
+    accounts: &[PersistedAccount],
+) -> HashMap<String, Vec<String>> {
+    let known_accounts = accounts
+        .iter()
+        .map(|account| account.id.as_str())
+        .collect::<HashSet<_>>();
+    folder_names
+        .into_iter()
+        .filter_map(|(account_id, folders)| {
+            known_accounts
+                .contains(account_id.as_str())
+                .then(|| (account_id, sanitize_folder_names(&folders)))
+        })
+        .collect()
 }
 
 fn sanitize_persisted_accounts(accounts: Vec<PersistedAccount>) -> Vec<PersistedAccount> {
@@ -168,6 +215,7 @@ impl Default for PersistedState {
         Self {
             schema_version: STATE_SCHEMA_VERSION,
             accounts: Vec::new(),
+            folder_names: HashMap::new(),
             theme: "dark".to_string(),
             minimize_to_tray: true,
             offline_mode: true,
@@ -268,6 +316,7 @@ impl MailGoState {
     fn snapshot(&self) -> Value {
         json!({
             "accounts": self.state.accounts,
+            "folders": self.state.folder_names,
             "theme": self.state.theme,
             "minimizeToTray": self.state.minimize_to_tray,
             "offlineMode": self.state.offline_mode,
@@ -380,6 +429,36 @@ pub(crate) fn record_account_sync_failure(
         if let Err(error) = app.save() {
             tracing::warn!(account_id = %account_id, "background sync status save failed: {error}");
         }
+    }
+}
+
+fn record_account_sync_success(app: &mut MailGoState, result: &sync::SyncResult) {
+    record_account_sync_success_with_mode(app, result, true);
+}
+
+fn record_account_sync_success_with_mode(
+    app: &mut MailGoState,
+    result: &sync::SyncResult,
+    replace_folders: bool,
+) {
+    if let Some(account) = app
+        .state
+        .accounts
+        .iter_mut()
+        .find(|item| item.id == result.account_id)
+    {
+        account.unread = result.unread as u32;
+        account.status = "synced".to_string();
+        account.last_sync = "刚刚同步".to_string();
+    }
+    let discovered = sanitize_folder_names(&result.folders);
+    if replace_folders || !app.state.folder_names.contains_key(&result.account_id) {
+        app.state
+            .folder_names
+            .insert(result.account_id.clone(), discovered);
+    } else if let Some(existing) = app.state.folder_names.get_mut(&result.account_id) {
+        existing.extend(discovered);
+        *existing = sanitize_folder_names(existing);
     }
 }
 
@@ -816,6 +895,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                 app.state.accounts.retain(|account| account.id != id);
                 app.state.accounts.push(new_account);
+                app.state.folder_names.remove(&id);
                 app.save()?;
                 Ok(json!({ "id": id, "stored": true }))
             }
@@ -904,6 +984,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     }
                     app.state.accounts.retain(|account| account.id != id);
                     app.state.accounts.push(imported_account);
+                    app.state.folder_names.remove(id);
                     imported += 1;
                 }
                 app.save()?;
@@ -920,6 +1001,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     .and_then(|entry| entry.delete_credential().map_err(anyhow::Error::from));
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                 app.state.accounts.retain(|account| account.id != id);
+                app.state.folder_names.remove(&id);
                 app.save()?;
                 Ok(json!({ "removed": id }))
             }
@@ -1016,6 +1098,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                             account.last_sync = "等待首次同步".to_string();
                             app.state.accounts.retain(|item| item.id != account.id);
                             app.state.accounts.push(account);
+                            app.state.folder_names.remove(&record.account.id);
                         }
                         app.save()?;
                         Ok(records.len() as u32)
@@ -1126,16 +1209,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     }
                 };
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-                if let Some(stored) = app
-                    .state
-                    .accounts
-                    .iter_mut()
-                    .find(|item| item.id == account.id)
-                {
-                    stored.unread = result.unread as u32;
-                    stored.status = "synced".to_string();
-                    stored.last_sync = "刚刚同步".to_string();
-                }
+                record_account_sync_success(&mut app, &result);
                 app.save()?;
                 Ok(serde_json::to_value(result)?)
             }
@@ -1199,16 +1273,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     }
                 };
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-                if let Some(stored) = app
-                    .state
-                    .accounts
-                    .iter_mut()
-                    .find(|item| item.id == account.id)
-                {
-                    stored.unread = result.unread as u32;
-                    stored.status = "synced".to_string();
-                    stored.last_sync = "刚刚同步".to_string();
-                }
+                record_account_sync_success_with_mode(&mut app, &result, false);
                 app.save()?;
                 Ok(serde_json::to_value(result)?)
             }
@@ -1258,16 +1323,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                         Ok(result) => {
                             let mut app =
                                 shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-                            if let Some(stored) = app
-                                .state
-                                .accounts
-                                .iter_mut()
-                                .find(|item| item.id == account.id)
-                            {
-                                stored.unread = result.unread as u32;
-                                stored.status = "synced".to_string();
-                                stored.last_sync = "刚刚同步".to_string();
-                            }
+                            record_account_sync_success(&mut app, &result);
                             app.save()?;
                             synced.push(serde_json::to_value(result)?);
                         }
@@ -1849,7 +1905,8 @@ mod tests {
                 "offlineMode": false,
                 "notificationsEnabled": true,
                 "remoteImagesEnabled": true,
-                "hideAds": true
+                "hideAds": true,
+                "folderNames": {"missing": ["Ignored"]}
             }"#,
         )
         .unwrap();
@@ -1858,6 +1915,26 @@ mod tests {
         assert!(!state.offline_mode);
         assert!(state.remote_images_enabled);
         assert!(state.hide_ads);
+        assert!(state.folder_names.is_empty());
+    }
+
+    #[test]
+    fn state_decoder_sanitizes_discovered_folder_names() {
+        let state = decode_persisted_state(
+            r##"{
+                "accounts": [{"id":"safe","provider":"qq","label":"first","email":"first@example.invalid","unread":0,"accent":"#111","status":"offline","lastSync":"never"}],
+                "folder_names": {
+                    "safe": ["Projects", "projects", "Team / 2026", "bad\r\nfolder", ""] ,
+                    "missing": ["Should not survive"]
+                }
+            }"##,
+        )
+        .unwrap();
+        assert_eq!(
+            state.folder_names.get("safe").unwrap(),
+            &["Projects".to_string(), "Team / 2026".to_string()]
+        );
+        assert!(!state.folder_names.contains_key("missing"));
     }
 
     #[test]
