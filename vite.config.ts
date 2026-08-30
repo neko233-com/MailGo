@@ -12,5 +12,14 @@ export default defineConfig({
     target: 'es2022',
     outDir: 'dist',
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'vendor-react': ['react', 'react-dom'],
+          'vendor-motion': ['motion/react'],
+          'vendor-icons': ['reicon-react'],
+        },
+      },
+    },
   },
 })
