@@ -27,6 +27,7 @@ export interface MailMessage {
   dateGroup: string
   unread: boolean
   starred: boolean
+  isAd?: boolean
   accent: string
   avatar: string
   body: string[]
@@ -82,6 +83,7 @@ export interface NativeState {
   offlineMode: boolean
   notificationsEnabled: boolean
   remoteImagesEnabled: boolean
+  hideAds: boolean
 }
 
 export interface NativeSyncItem {

@@ -203,6 +203,7 @@ export const sampleMails: MailMessage[] = [
     avatar: '',
     body: ['Discover what is new this month.', 'Manage your email preferences from Apple at any time.'],
     hasHtml: true,
+    isAd: true,
   },
 ]
 

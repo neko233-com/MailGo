@@ -75,6 +75,8 @@ struct PersistedState {
     notifications_enabled: bool,
     #[serde(default)]
     remote_images_enabled: bool,
+    #[serde(default = "default_hide_ads", alias = "hideAds")]
+    hide_ads: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +98,8 @@ struct PersistedStateDisk {
     notifications_enabled: bool,
     #[serde(default, alias = "remoteImagesEnabled")]
     remote_images_enabled: bool,
+    #[serde(default = "default_hide_ads", alias = "hideAds")]
+    hide_ads: bool,
 }
 
 fn default_theme() -> String {
@@ -112,6 +116,10 @@ fn default_offline_mode() -> bool {
 
 fn default_notifications_enabled() -> bool {
     true
+}
+
+fn default_hide_ads() -> bool {
+    false
 }
 
 fn decode_persisted_state(contents: &str) -> Result<PersistedState> {
@@ -135,6 +143,7 @@ fn decode_persisted_state(contents: &str) -> Result<PersistedState> {
         offline_mode: disk.offline_mode,
         notifications_enabled: disk.notifications_enabled,
         remote_images_enabled: disk.remote_images_enabled,
+        hide_ads: disk.hide_ads,
     })
 }
 
@@ -148,6 +157,7 @@ impl Default for PersistedState {
             offline_mode: true,
             notifications_enabled: true,
             remote_images_enabled: false,
+            hide_ads: false,
         }
     }
 }
@@ -247,6 +257,7 @@ impl MailGoState {
             "offlineMode": self.state.offline_mode,
             "notificationsEnabled": self.state.notifications_enabled,
             "remoteImagesEnabled": self.state.remote_images_enabled,
+            "hideAds": self.state.hide_ads,
         })
     }
 }
@@ -606,6 +617,17 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     .unwrap_or(false);
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                 app.state.remote_images_enabled = enabled;
+                app.save()?;
+                Ok(json!({ "enabled": enabled }))
+            }
+            "app.set_hide_ads" => {
+                let enabled = message
+                    .payload
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                app.state.hide_ads = enabled;
                 app.save()?;
                 Ok(json!({ "enabled": enabled }))
             }
@@ -1729,6 +1751,7 @@ mod tests {
         assert!(!state.minimize_to_tray);
         assert!(!state.notifications_enabled);
         assert!(!state.remote_images_enabled);
+        assert!(!state.hide_ads);
     }
 
     #[test]
@@ -1741,7 +1764,8 @@ mod tests {
                 "minimizeToTray": false,
                 "offlineMode": false,
                 "notificationsEnabled": true,
-                "remoteImagesEnabled": true
+                "remoteImagesEnabled": true,
+                "hideAds": true
             }"#,
         )
         .unwrap();
@@ -1749,6 +1773,7 @@ mod tests {
         assert!(!state.minimize_to_tray);
         assert!(!state.offline_mode);
         assert!(state.remote_images_enabled);
+        assert!(state.hide_ads);
     }
 
     #[test]

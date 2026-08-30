@@ -133,6 +133,7 @@ function nativeMessageToUi(message: NativeCachedMessage, account: MailAccount): 
     dateGroup,
     unread: message.unread,
     starred: message.starred,
+    isAd: message.isAd,
     accent: account.accent,
     avatar: senderName.split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase() || '?',
     body: message.textBody ? message.textBody.split(/\r?\n\s*\r?\n/).filter(Boolean) : ['正在加载邮件正文…'],
@@ -157,6 +158,10 @@ function loadTheme(): ThemeMode {
 
 function loadRemoteImages() {
   return window.localStorage.getItem('mailgo-remote-images') === 'true'
+}
+
+function loadHideAds() {
+  return window.localStorage.getItem('mailgo-hide-ads') === 'true'
 }
 
 function ProviderMark({ provider, size = 'md' }: { provider: Provider; size?: 'sm' | 'md' | 'lg' }) {
@@ -219,6 +224,7 @@ function App() {
   const [minimizeToTray, setMinimizeToTray] = useState(true)
   const [notificationsEnabled, setNotificationsEnabled] = useState(true)
   const [remoteImagesEnabled, setRemoteImagesEnabled] = useState(loadRemoteImages)
+  const [hideAds, setHideAds] = useState(loadHideAds)
   const [pendingOperations, setPendingOperations] = useState(0)
   const [provider, setProvider] = useState<Provider>('qq')
   const [accountEmail, setAccountEmail] = useState('')
@@ -337,6 +343,7 @@ function App() {
       setMinimizeToTray(nativeState.minimizeToTray)
       setNotificationsEnabled(nativeState.notificationsEnabled ?? true)
       setRemoteImagesEnabled(nativeState.remoteImagesEnabled ?? false)
+      setHideAds(nativeState.hideAds ?? false)
       void refreshPendingOperations(nativeState.accounts)
       if (!isNativeRuntime) return
       await Promise.all(nativeState.accounts.map(async (account) => {
@@ -394,6 +401,10 @@ function App() {
   }, [remoteImagesEnabled])
 
   useEffect(() => {
+    window.localStorage.setItem('mailgo-hide-ads', String(hideAds))
+  }, [hideAds])
+
+  useEffect(() => {
     if (!isAccountModalOpen) {
       accountPrefillRef.current = null
       return
@@ -438,11 +449,12 @@ function App() {
       const folderMatch = selectedFolder === 'starred' ? mail.starred : mail.folder === selectedFolder
       const accountMatch = !selectedAccountId || mail.accountId === selectedAccountId
       const categoryMatch = !selectedCategory || mail.category === selectedCategory
+      const adMatch = !hideAds || !mail.isAd || Boolean(selectedCategory)
       const unreadMatch = !filterUnread || mail.unread
       const queryMatch = !lowerQuery || `${mail.senderName} ${mail.subject} ${mail.preview}`.toLowerCase().includes(lowerQuery)
-      return folderMatch && accountMatch && categoryMatch && unreadMatch && queryMatch
+      return folderMatch && accountMatch && categoryMatch && adMatch && unreadMatch && queryMatch
     })
-  }, [filterUnread, mails, query, selectedAccountId, selectedCategory, selectedFolder])
+  }, [filterUnread, hideAds, mails, query, selectedAccountId, selectedCategory, selectedFolder])
 
   const selectedMail = visibleMails.find((mail) => mail.id === selectedMailId) ?? visibleMails[0] ?? {
     id: 'empty-mail',
@@ -1257,6 +1269,14 @@ function App() {
             <div className="storage-meta"><span>本地缓存</span><span>4.2 GB / 15 GB</span></div>
             <div className="storage-track"><span /></div>
             <div className="storage-foot"><span aria-live="polite"><Icon name={pendingOperations ? 'rotate' : 'cloud'} size={13} /> {pendingOperations ? `${pendingOperations} 项操作待同步` : '离线可查看最近邮件'}</span><button type="button" onClick={handleSync}><Icon name="rotate" size={13} /> {isSyncing ? '同步中…' : '立即同步'}</button></div>
+          </div>
+
+          <div className="sidebar-quick-settings">
+            <button type="button" className={hideAds ? 'is-on' : ''} aria-label={hideAds ? '广告已屏蔽' : '广告已分类'} aria-pressed={hideAds} onClick={() => { const next = !hideAds; setHideAds(next); void invoke('app.set_hide_ads', { enabled: next }).catch(() => undefined) }}>
+              <Icon name="shield" size={15} />
+              <span>广告 {hideAds ? '已屏蔽' : '已分类'}</span>
+              <small>{hideAds ? '普通列表隐藏' : '普通列表显示'}</small>
+            </button>
           </div>
 
           <div className="sidebar-footer">

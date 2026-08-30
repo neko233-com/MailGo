@@ -37,6 +37,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 31. Native attachment upload sessions are cleared after every send attempt, and OAuth pending/callback secrets are zeroized when their in-memory session values are released.
 32. Native IPC validates bounded recipient, subject, body, HTML, and manual-credential fields before any SMTP, OAuth, or keyring operation.
 33. Credential, configuration, and IMAP failures now persist an offline or reauthorization-needed account status across manual sync, first sync, background sync, and restart; the desktop renderer refreshes those statuses while the tray scheduler continues running.
+34. Advertising classification now has a persisted user-controlled suppression mode: normal lists can hide classified ads while Apple Connect security mail remains visible and Apple/other advertising remains reachable through smart categories.
 
 ## Remaining production acceptance work
 

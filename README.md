@@ -12,6 +12,7 @@ The current foundation includes:
 - Local-first UI state with offline cache indicators and a Rust IPC boundary for durable state.
 - Provider quick links and guided authorization-code onboarding.
 - Safe HTML preview mode, attachments, smart categories (including Apple Connect and Apple advertising), search, unread filter, star, reply, compose, theme switching, and user CSS overrides.
+- Local-only advertising classification can optionally hide ads from normal lists while keeping Apple Connect security mail and smart-category access visible.
 - Rust `neko233-com/rdesktop` WebView2 shell with custom frameless title bar and preserved WebView data directory under `%LOCALAPPDATA%\\MailGo\\WebView2`.
 - Windows Credential Manager integration through `keyring` for authorization-code storage; secrets never enter `state.json` or account exports.
 - Native IMAP sync uses UID-based incremental header caching across provider folder mappings, bounded `UID FLAGS` refreshes, lazy full-message retrieval, replayable offline flag mutations, local flag updates, and DPAPI-protected mailbox/attachment caches on Windows. Attachment downloads use bounded start/chunk/cancel IPC with progress and cancellation support.
