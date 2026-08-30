@@ -795,6 +795,8 @@ pub fn save_cached_message(
     mailbox
         .messages
         .sort_by_key(|cached| std::cmp::Reverse(cached.uid));
+    mailbox.oldest_uid = mailbox.messages.iter().map(|cached| cached.uid).min();
+    mailbox.synced_at = now_stamp();
     save_mailbox(cache_root, account_id, &mailbox).map(|_| ())
 }
 

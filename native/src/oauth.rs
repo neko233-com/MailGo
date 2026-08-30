@@ -106,15 +106,21 @@ pub fn start(provider: ProviderKind, email: &str) -> Result<(PendingSession, Sta
     let code_verifier = random_string(64);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
     let session_id = random_string(24);
-    let authorization_url = Serializer::new(format!("{}?", config.authorization_endpoint))
+    let mut authorization = Serializer::new(format!("{}?", config.authorization_endpoint));
+    authorization
         .append_pair("client_id", &config.client_id)
         .append_pair("response_type", "code")
         .append_pair("redirect_uri", &config.redirect_uri)
         .append_pair("scope", config.scopes)
         .append_pair("state", &state)
         .append_pair("code_challenge", &challenge)
-        .append_pair("code_challenge_method", "S256")
-        .finish();
+        .append_pair("code_challenge_method", "S256");
+    if provider == ProviderKind::Google {
+        authorization
+            .append_pair("access_type", "offline")
+            .append_pair("prompt", "consent");
+    }
+    let authorization_url = authorization.finish();
     let now = now_seconds();
     let callback = Arc::new(Mutex::new(None));
     spawn_loopback_listener(&config.redirect_uri, callback.clone());
@@ -603,6 +609,7 @@ mod tests {
         let (session, response) = start(ProviderKind::Google, "person@example.com").unwrap();
         assert!(response.authorization_url.contains("code_challenge="));
         assert!(response.authorization_url.contains("state="));
+        assert!(response.authorization_url.contains("access_type=offline"));
         assert!(!response.authorization_url.contains("access_token"));
         assert_eq!(session.email, "person@example.com");
     }

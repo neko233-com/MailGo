@@ -24,7 +24,11 @@ pub struct Classification {
 pub fn classify(sender: &str, subject: &str, has_list_unsubscribe: bool) -> Classification {
     let sender = sender.trim().to_ascii_lowercase();
     let subject = subject.trim().to_ascii_lowercase();
-    let apple_sender = sender.ends_with("@apple.com") || sender.contains("apple");
+    let sender_domain = sender
+        .rsplit_once('@')
+        .map(|(_, domain)| domain.trim_end_matches('.'))
+        .unwrap_or_default();
+    let apple_sender = sender_domain == "apple.com" || sender_domain.ends_with(".apple.com");
     let security_subject = [
         "security",
         "sign in",
@@ -63,9 +67,15 @@ pub fn classify(sender: &str, subject: &str, has_list_unsubscribe: bool) -> Clas
         };
     }
 
-    let social_sender = ["linkedin.", "facebook.", "instagram.", "twitter.", "x.com"]
-        .iter()
-        .any(|domain| sender.contains(domain));
+    let social_sender = [
+        "linkedin.com",
+        "facebook.com",
+        "instagram.com",
+        "twitter.com",
+        "x.com",
+    ]
+    .iter()
+    .any(|domain| sender_domain == *domain || sender_domain.ends_with(&format!(".{domain}")));
     if social_sender {
         return Classification {
             category: SmartCategory::Social,
@@ -109,5 +119,14 @@ mod tests {
         let result = classify("news@apple.com", "Discover what is new this month", true);
         assert_eq!(result.category, SmartCategory::AppleAds);
         assert!(result.is_ad);
+    }
+
+    #[test]
+    fn does_not_trust_brand_names_inside_unrelated_domains() {
+        let apple = classify("security@apple.example.com", "New offer", true);
+        assert_eq!(apple.category, SmartCategory::Ads);
+
+        let social = classify("alerts@notlinkedin.com", "New message", false);
+        assert_eq!(social.category, SmartCategory::Inbox);
     }
 }
