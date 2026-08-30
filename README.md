@@ -49,6 +49,8 @@ For rdesktop Agent-first development, use the installed CLI (kept current by the
 rdesktop dev --path .
 ```
 
+The per-user `MailGo-rdesktop-updater` task runs weekly. It first installs from the upstream repository; if Windows application control blocks Cargo build scripts, it only accepts a checksum-verified official release binary that is newer than the installed CLI and otherwise preserves the current installation without downgrading it.
+
 ## Build the Windows shell
 
 ```powershell

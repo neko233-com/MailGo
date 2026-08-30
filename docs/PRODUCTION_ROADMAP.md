@@ -26,6 +26,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 20. Release packaging has a reproducible Windows portable ZIP path; the native shell resolves renderer assets beside the executable, with an environment override for controlled deployment.
 21. Existing accounts can re-enter the authorization flow without changing their stable account ID, and native account removal clears the protected credential plus the account-scoped offline cache.
 22. Windows desktop can export/import fully configured accounts through a password-protected Argon2id + ChaCha20-Poly1305 bundle; decrypted credentials are written only to Windows Credential Manager and imported account caches are reset before the next sync.
+23. The per-user rdesktop updater preserves a working installation when local application-control policy blocks source builds and only accepts a checksum-verified official binary fallback when it is newer.
 
 ## Remaining production acceptance work
 
