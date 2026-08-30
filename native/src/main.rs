@@ -67,6 +67,8 @@ struct PersistedState {
     offline_mode: bool,
     #[serde(default = "default_notifications_enabled")]
     notifications_enabled: bool,
+    #[serde(default)]
+    remote_images_enabled: bool,
 }
 
 fn default_notifications_enabled() -> bool {
@@ -82,6 +84,7 @@ impl Default for PersistedState {
             minimize_to_tray: true,
             offline_mode: true,
             notifications_enabled: true,
+            remote_images_enabled: false,
         }
     }
 }
@@ -182,6 +185,7 @@ impl MailGoState {
             "minimizeToTray": self.state.minimize_to_tray,
             "offlineMode": self.state.offline_mode,
             "notificationsEnabled": self.state.notifications_enabled,
+            "remoteImagesEnabled": self.state.remote_images_enabled,
         })
     }
 }
@@ -412,6 +416,17 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     .unwrap_or(true);
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                 app.state.notifications_enabled = enabled;
+                app.save()?;
+                Ok(json!({ "enabled": enabled }))
+            }
+            "app.set_remote_images" => {
+                let enabled = message
+                    .payload
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                app.state.remote_images_enabled = enabled;
                 app.save()?;
                 Ok(json!({ "enabled": enabled }))
             }

@@ -37,7 +37,7 @@ function formatCount(value: number) {
   return value > 99 ? '99+' : String(value)
 }
 
-function sanitizeHtml(input: string) {
+function sanitizeHtml(input: string, allowRemoteImages = false) {
   const documentParser = new DOMParser().parseFromString(input, 'text/html')
   documentParser.querySelectorAll('script, iframe, object, embed, form, link, meta, style').forEach((node) => node.remove())
   documentParser.querySelectorAll('*').forEach((node) => {
@@ -47,7 +47,7 @@ function sanitizeHtml(input: string) {
       const isSafeUrl = name === 'href'
         ? /^(https:\/\/|mailto:|#)/i.test(value)
         : name === 'src'
-          ? /^(https:\/\/|cid:|data:image\/(?:png|gif|jpe?g|webp);base64,)/i.test(value)
+          ? /^(cid:|data:image\/(?:png|gif|jpe?g|webp);base64,)/i.test(value) || (allowRemoteImages && /^https:\/\//i.test(value))
           : false
       if (name.startsWith('on') || ['style', 'srcdoc', 'srcset', 'ping', 'formaction', 'xlink:href'].includes(name)) node.removeAttribute(attribute.name)
       if (['href', 'src', 'action'].includes(name) && !isSafeUrl) {
@@ -146,6 +146,10 @@ function loadTheme(): ThemeMode {
   return stored === 'light' ? 'light' : 'dark'
 }
 
+function loadRemoteImages() {
+  return window.localStorage.getItem('mailgo-remote-images') === 'true'
+}
+
 function ProviderMark({ provider, size = 'md' }: { provider: Provider; size?: 'sm' | 'md' | 'lg' }) {
   const definition = providerFor(provider)
   return (
@@ -201,6 +205,7 @@ function App() {
   const [toasts, setToasts] = useState<Toast[]>([])
   const [minimizeToTray, setMinimizeToTray] = useState(true)
   const [notificationsEnabled, setNotificationsEnabled] = useState(true)
+  const [remoteImagesEnabled, setRemoteImagesEnabled] = useState(loadRemoteImages)
   const [provider, setProvider] = useState<Provider>('qq')
   const [accountEmail, setAccountEmail] = useState('')
   const [authorizationCode, setAuthorizationCode] = useState('')
@@ -286,6 +291,7 @@ function App() {
       setTheme(nativeState.theme)
       setMinimizeToTray(nativeState.minimizeToTray)
       setNotificationsEnabled(nativeState.notificationsEnabled ?? true)
+      setRemoteImagesEnabled(nativeState.remoteImagesEnabled ?? false)
       if (!isNativeRuntime) return
       await Promise.all(nativeState.accounts.map(async (account) => {
         try {
@@ -318,6 +324,10 @@ function App() {
   }, [customCss])
 
   useEffect(() => {
+    window.localStorage.setItem('mailgo-remote-images', String(remoteImagesEnabled))
+  }, [remoteImagesEnabled])
+
+  useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault()
@@ -332,7 +342,20 @@ function App() {
     return () => window.removeEventListener('keydown', handleShortcut)
   }, [])
 
-  const selectedMail = mails.find((mail) => mail.id === selectedMailId) ?? mails[0] ?? {
+  const selectedProvider = providerFor(provider)
+  const visibleMails = useMemo(() => {
+    const lowerQuery = query.trim().toLowerCase()
+    return mails.filter((mail) => {
+      const folderMatch = selectedFolder === 'starred' ? mail.starred : mail.folder === selectedFolder
+      const accountMatch = !selectedAccountId || mail.accountId === selectedAccountId
+      const categoryMatch = !selectedCategory || mail.category === selectedCategory
+      const unreadMatch = !filterUnread || mail.unread
+      const queryMatch = !lowerQuery || `${mail.senderName} ${mail.subject} ${mail.preview}`.toLowerCase().includes(lowerQuery)
+      return folderMatch && accountMatch && categoryMatch && unreadMatch && queryMatch
+    })
+  }, [filterUnread, mails, query, selectedAccountId, selectedCategory, selectedFolder])
+
+  const selectedMail = visibleMails.find((mail) => mail.id === selectedMailId) ?? visibleMails[0] ?? {
     id: 'empty-mail',
     accountId: '',
     folder: selectedFolder,
@@ -348,19 +371,7 @@ function App() {
     avatar: 'M',
     body: ['当前文件夹没有可显示的邮件。'],
   } satisfies MailMessage
-  const selectedProvider = providerFor(provider)
   const selectedMailAccount = accounts.find((account) => account.id === selectedMail.accountId)
-  const visibleMails = useMemo(() => {
-    const lowerQuery = query.trim().toLowerCase()
-    return mails.filter((mail) => {
-      const folderMatch = selectedFolder === 'starred' ? mail.starred : mail.folder === selectedFolder
-      const accountMatch = !selectedAccountId || mail.accountId === selectedAccountId
-      const categoryMatch = !selectedCategory || mail.category === selectedCategory
-      const unreadMatch = !filterUnread || mail.unread
-      const queryMatch = !lowerQuery || `${mail.senderName} ${mail.subject} ${mail.preview}`.toLowerCase().includes(lowerQuery)
-      return folderMatch && accountMatch && categoryMatch && unreadMatch && queryMatch
-    })
-  }, [filterUnread, mails, query, selectedAccountId, selectedCategory, selectedFolder])
 
   const groupedMails = useMemo(() => {
     return visibleMails.reduce<Record<string, MailMessage[]>>((groups, mail) => {
@@ -1026,8 +1037,8 @@ function App() {
             <div className="reading-heading"><div><h1>{selectedMail.subject}</h1><div className="message-tags"><span className="tag tag-account"><ProviderMark provider={accounts.find((account) => account.id === selectedMail.accountId)?.provider ?? 'google'} size="sm" /> {accounts.find((account) => account.id === selectedMail.accountId)?.label ?? 'Google'}</span>{selectedMail.hasHtml && <span className="tag">HTML 邮件</span>}</div></div><TooltipButton label={selectedMail.starred ? '取消星标' : '添加星标'} className={`reading-star ${selectedMail.starred ? 'is-starred' : ''}`} onClick={() => toggleStar(selectedMail)}><Icon name="star" size={24} weight={selectedMail.starred ? 'Filled' : 'Outline'} /></TooltipButton></div>
             <div className="sender-row"><Avatar message={selectedMail} size="lg" /><div className="sender-copy"><div><strong>{selectedMail.senderName}</strong> <span>&lt;{selectedMail.from}&gt;</span></div><div className="recipient">收件人： {selectedMailAccount?.label ?? '当前账户'} &lt;{selectedMailAccount?.email ?? '—'}&gt;</div></div><time>{selectedMail.timestamp}<br /><span>今天</span></time><TooltipButton label="发件人更多信息"><Icon name="more" size={19} /></TooltipButton></div>
             <div className="message-content">
-              {selectedMail.hasHtml && <div className="content-mode-row"><span>此邮件包含富文本内容</span><button type="button" className="text-action" onClick={() => setHtmlMode((value) => !value)}>{isHtmlMode ? '查看纯文本' : '渲染 HTML'} <Icon name="grid" size={14} /></button></div>}
-              {isHtmlMode && selectedMail.hasHtml ? <div className="html-rendered" dangerouslySetInnerHTML={{ __html: sanitizeHtml(selectedMail.htmlBody ?? initialHtml) }} /> : selectedMail.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
+              {selectedMail.hasHtml && <div className="content-mode-row"><span>此邮件包含富文本内容{!remoteImagesEnabled && ' · 远程图片已屏蔽'}</span><button type="button" className="text-action" onClick={() => setHtmlMode((value) => !value)}>{isHtmlMode ? '查看纯文本' : '渲染 HTML'} <Icon name="grid" size={14} /></button></div>}
+              {isHtmlMode && selectedMail.hasHtml ? <div className="html-rendered" dangerouslySetInnerHTML={{ __html: sanitizeHtml(selectedMail.htmlBody ?? initialHtml, remoteImagesEnabled) }} /> : selectedMail.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
             </div>
             {selectedMail.attachments && <div className="attachments"><div className="attachments-heading"><span><Icon name="paperclip" size={20} /> {selectedMail.attachments.length} 个附件</span><div><button type="button" onClick={() => { void Promise.all(selectedMail.attachments?.map(downloadAttachment) ?? []) }}><Icon name="download" size={17} /> 全部下载</button><button type="button" onClick={() => pushToast('正在保存到本地缓存', 'success')}><Icon name="cloud" size={17} /> 保存到云盘</button></div></div><div className="attachment-grid">{selectedMail.attachments.map((attachment) => { const progress = attachmentProgress[attachment.id]; return <button type="button" className="attachment-card" key={attachment.id} onClick={() => { if (progress != null) cancelAttachment(attachment.id); else void downloadAttachment(attachment) }}><span className={`file-glyph file-${attachment.kind}`}>{attachment.kind === 'pdf' ? 'PDF' : attachment.kind === 'sheet' ? 'X' : 'FILE'}</span><span className="attachment-copy"><strong>{attachment.name}</strong><small>{progress != null ? `${progress}% · 点击取消` : attachment.size}</small></span><Icon name={progress != null ? 'close' : 'download'} size={17} /></button> })}</div></div>}
             <div className="reply-composer"><Avatar message={{ ...selectedMail, avatar: 'OC', accent: '#2a5596' }} size="sm" /><div className="reply-input" onClick={() => setComposeOpen(true)}>点击回复，或按 R 快速回复<div className="reply-tools"><span><Icon name="paperclip" size={19} /></span><span><Icon name="image" size={19} /></span><span className="reply-emoji">☺</span><span className="reply-a">A</span><button type="button" onClick={(event) => { event.stopPropagation(); setComposeOpen(true) }}>回复 <span>⌄</span></button></div></div></div>
@@ -1048,7 +1059,7 @@ function App() {
       </div>
 
       <AnimatePresence>
-        {isSettingsOpen && <motion.div className="settings-popover" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}><div className="settings-title"><span><Icon name="settings" size={17} />偏好设置</span><TooltipButton label="关闭设置" onClick={() => setSettingsOpen(false)}><Icon name="close" size={17} /></TooltipButton></div><div className="settings-row"><span><Icon name={theme === 'dark' ? 'moon' : 'theme'} size={17} /><span>外观主题<small>{theme === 'dark' ? '深色 · 午夜蓝' : '浅色 · 雪白'}</small></span></span><button type="button" className="theme-switch" onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}><span className={theme === 'light' ? 'is-light' : ''}>{theme === 'dark' ? '深' : '浅'}</span></button></div><label className="settings-row css-row"><span><Icon name="brush" size={17} /><span>用户 CSS<small>可覆盖 MailGo 视觉变量</small></span></span><textarea value={customCss} onChange={(event) => setCustomCss(event.target.value)} placeholder="例如：:root { --accent: #ff6b8a; }" /></label><div className="settings-row"><span><Icon name="cloud" size={17} /><span>关闭时后台运行<small>最小化到系统托盘并继续同步</small></span></span><button type="button" className={`toggle-switch ${minimizeToTray ? 'is-on' : ''}`} onClick={() => { const next = !minimizeToTray; setMinimizeToTray(next); void invoke('app.set_minimize_to_tray', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-row"><span><Icon name="bell" size={17} /><span>后台新邮件提醒<small>窗口隐藏时发送 Windows 托盘通知</small></span></span><button type="button" aria-label="后台新邮件提醒" className={`toggle-switch ${notificationsEnabled ? 'is-on' : ''}`} onClick={() => { const next = !notificationsEnabled; setNotificationsEnabled(next); void invoke('app.set_notifications', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-actions"><button type="button" onClick={exportAccounts}><Icon name="download" size={16} />导出账户配置</button><button type="button" onClick={() => importInputRef.current?.click()} disabled={isImporting}><Icon name="folder" size={16} />{isImporting ? '导入中…' : '导入账户配置'}</button></div><input ref={importInputRef} type="file" accept="application/json,.json" hidden onChange={importAccounts} /></motion.div>}
+        {isSettingsOpen && <motion.div className="settings-popover" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}><div className="settings-title"><span><Icon name="settings" size={17} />偏好设置</span><TooltipButton label="关闭设置" onClick={() => setSettingsOpen(false)}><Icon name="close" size={17} /></TooltipButton></div><div className="settings-row"><span><Icon name={theme === 'dark' ? 'moon' : 'theme'} size={17} /><span>外观主题<small>{theme === 'dark' ? '深色 · 午夜蓝' : '浅色 · 雪白'}</small></span></span><button type="button" className="theme-switch" onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}><span className={theme === 'light' ? 'is-light' : ''}>{theme === 'dark' ? '深' : '浅'}</span></button></div><label className="settings-row css-row"><span><Icon name="brush" size={17} /><span>用户 CSS<small>可覆盖 MailGo 视觉变量</small></span></span><textarea value={customCss} onChange={(event) => setCustomCss(event.target.value)} placeholder="例如：:root { --accent: #ff6b8a; }" /></label><div className="settings-row"><span><Icon name="cloud" size={17} /><span>关闭时后台运行<small>最小化到系统托盘并继续同步</small></span></span><button type="button" className={`toggle-switch ${minimizeToTray ? 'is-on' : ''}`} onClick={() => { const next = !minimizeToTray; setMinimizeToTray(next); void invoke('app.set_minimize_to_tray', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-row"><span><Icon name="image" size={17} /><span>加载远程图片<small>{remoteImagesEnabled ? '已允许 HTTPS 图片，可能包含追踪像素' : '默认屏蔽，保护隐私；CID 内嵌图片不受影响'}</small></span></span><button type="button" aria-label="加载远程图片" className={`toggle-switch ${remoteImagesEnabled ? 'is-on' : ''}`} onClick={() => { const next = !remoteImagesEnabled; setRemoteImagesEnabled(next); void invoke('app.set_remote_images', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-row"><span><Icon name="bell" size={17} /><span>后台新邮件提醒<small>窗口隐藏时发送 Windows 托盘通知</small></span></span><button type="button" aria-label="后台新邮件提醒" className={`toggle-switch ${notificationsEnabled ? 'is-on' : ''}`} onClick={() => { const next = !notificationsEnabled; setNotificationsEnabled(next); void invoke('app.set_notifications', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-actions"><button type="button" onClick={exportAccounts}><Icon name="download" size={16} />导出账户配置</button><button type="button" onClick={() => importInputRef.current?.click()} disabled={isImporting}><Icon name="folder" size={16} />{isImporting ? '导入中…' : '导入账户配置'}</button></div><input ref={importInputRef} type="file" accept="application/json,.json" hidden onChange={importAccounts} /></motion.div>}
       </AnimatePresence>
 
       <AnimatePresence>{isComposeOpen && <ComposeModal accountId={selectedAccountId ?? accounts[0]?.id} onClose={() => setComposeOpen(false)} onSent={() => { setComposeOpen(false); pushToast('邮件已发送', 'success') }} onError={(message) => pushToast(message, 'error')} />}</AnimatePresence>

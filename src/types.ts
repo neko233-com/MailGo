@@ -81,6 +81,7 @@ export interface NativeState {
   minimizeToTray: boolean
   offlineMode: boolean
   notificationsEnabled: boolean
+  remoteImagesEnabled: boolean
 }
 
 export interface NativeSyncItem {
