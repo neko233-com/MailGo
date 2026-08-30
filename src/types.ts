@@ -154,6 +154,14 @@ export interface NativeDeviceStartResponse {
   interval: number
 }
 
+export interface NativeAuthStartResponse {
+  sessionId: string
+  authorizationUrl: string
+  redirectUri: string
+  state: string
+  expiresIn: number
+}
+
 export interface NativeCachedMessage {
   id: string
   accountId: string

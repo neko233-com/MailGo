@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Icon, type IconName } from './components/Icon'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
 import { invoke, readNativeState } from './lib/ipc'
-import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeMailboxResponse, NativeMessageResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
+import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeMailboxResponse, NativeMessageResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 type ToastTone = 'info' | 'success' | 'error'
 type Toast = { id: number; message: string; tone: ToastTone }
@@ -205,6 +205,7 @@ function App() {
   const [accountEmail, setAccountEmail] = useState('')
   const [authorizationCode, setAuthorizationCode] = useState('')
   const [oauthSessionId, setOauthSessionId] = useState('')
+  const [oauthState, setOauthState] = useState('')
   const [deviceFlow, setDeviceFlow] = useState<DeviceFlowState | null>(null)
   const [showAuthorizationCode, setShowAuthorizationCode] = useState(false)
   const [customCss, setCustomCss] = useState(() => window.localStorage.getItem('mailgo-custom-css') ?? '')
@@ -236,6 +237,7 @@ function App() {
     setCustomAuthentication(nextProvider === 'outlook' || nextProvider === 'google' ? 'oauth2' : nextProvider === 'other' ? 'password' : 'app-password')
     setAuthorizationCode('')
     setOauthSessionId('')
+    setOauthState('')
     setDeviceFlow(null)
   }
 
@@ -727,11 +729,12 @@ function App() {
           pushToast(`Outlook 设备码 ${flow.userCode} 已生成，完成验证后会自动检测`, 'info')
           return
         }
-        const flow = await invoke<{ sessionId: string; authorizationUrl: string }>('auth.start', {
+        const flow = await invoke<NativeAuthStartResponse>('auth.start', {
           provider,
           email: accountEmail.trim(),
         })
         setOauthSessionId(flow.sessionId)
+        setOauthState(flow.state)
         window.open(flow.authorizationUrl, '_blank', 'noopener,noreferrer')
         pushToast('OAuth 授权页面已打开，完成后将授权码粘贴回来', 'info')
         return
@@ -790,6 +793,7 @@ function App() {
         authorizationCode,
         authentication: customAuthentication,
         ...(oauthSessionId ? { oauthSessionId } : {}),
+        ...(oauthSessionId && oauthState ? { oauthState } : {}),
         ...(provider === 'other' ? {
           imapHost: customImapHost.trim(),
           imapPort: Number(customImapPort),
@@ -818,6 +822,7 @@ function App() {
     }
     setAuthorizationCode('')
     setOauthSessionId('')
+    setOauthState('')
     setDeviceFlow(null)
     setAccountEmail('')
     setAccountModalOpen(false)

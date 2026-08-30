@@ -46,6 +46,7 @@ pub struct StartResponse {
     pub session_id: String,
     pub authorization_url: String,
     pub redirect_uri: String,
+    pub state: String,
     pub expires_in: u64,
 }
 
@@ -146,6 +147,7 @@ pub fn start(provider: ProviderKind, email: &str) -> Result<(PendingSession, Sta
             session_id,
             authorization_url,
             redirect_uri: config.redirect_uri,
+            state,
             expires_in: SESSION_TTL_SECONDS,
         },
     ))
@@ -337,10 +339,9 @@ pub fn exchange_code(
     if now_seconds().saturating_sub(session.created_at) > SESSION_TTL_SECONDS {
         return Err(anyhow!("OAuth sign-in session expired; start again"));
     }
-    if let Some(returned_state) = returned_state {
-        if returned_state != session.state {
-            return Err(anyhow!("OAuth state validation failed"));
-        }
+    let returned_state = returned_state.ok_or_else(|| anyhow!("OAuth state is missing"))?;
+    if returned_state != session.state {
+        return Err(anyhow!("OAuth state validation failed"));
     }
     let code = code.trim();
     if code.is_empty() || code.len() > 8192 {
