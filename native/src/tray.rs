@@ -56,6 +56,10 @@ mod windows_tray {
         }
     }
 
+    pub fn activate_main_window() {
+        unsafe { show_main_window() }
+    }
+
     unsafe fn run() {
         let instance = GetModuleHandleW(null());
         let class = WNDCLASSW {
@@ -290,7 +294,7 @@ mod windows_tray {
 }
 
 #[cfg(target_os = "windows")]
-pub use windows_tray::{hide_main_window, set_minimize_to_tray, start};
+pub use windows_tray::{activate_main_window, hide_main_window, set_minimize_to_tray, start};
 
 #[cfg(not(target_os = "windows"))]
 pub fn start(_minimize_to_tray: bool) {}
@@ -300,3 +304,6 @@ pub fn set_minimize_to_tray(_enabled: bool) {}
 
 #[cfg(not(target_os = "windows"))]
 pub fn hide_main_window() {}
+
+#[cfg(not(target_os = "windows"))]
+pub fn activate_main_window() {}

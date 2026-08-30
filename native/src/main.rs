@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -11,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 mod classifier;
+mod instance;
 mod mail;
+mod oauth;
 mod providers;
 mod send;
 mod sync;
@@ -64,6 +67,7 @@ impl Default for PersistedState {
 struct MailGoState {
     state_path: PathBuf,
     state: PersistedState,
+    auth_sessions: HashMap<String, oauth::PendingSession>,
 }
 
 impl MailGoState {
@@ -71,28 +75,62 @@ impl MailGoState {
         let root = app_data_dir();
         fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
         let state_path = root.join("state.json");
+        let backup_path = root.join("state.json.bak");
         let state = match fs::read_to_string(&state_path) {
-            Ok(contents) => serde_json::from_str::<PersistedState>(&contents)
-                .with_context(|| format!("parse {}", state_path.display()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => PersistedState::default(),
+            Ok(contents) => match serde_json::from_str::<PersistedState>(&contents) {
+                Ok(state) => state,
+                Err(primary_error) => match fs::read_to_string(&backup_path) {
+                    Ok(backup) => {
+                        serde_json::from_str::<PersistedState>(&backup).with_context(|| {
+                            format!("parse {} after {}", backup_path.display(), primary_error)
+                        })?
+                    }
+                    Err(_) => {
+                        return Err(primary_error)
+                            .with_context(|| format!("parse {}", state_path.display()))
+                    }
+                },
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::read_to_string(&backup_path) {
+                    Ok(backup) => serde_json::from_str::<PersistedState>(&backup)
+                        .with_context(|| format!("parse {}", backup_path.display()))?,
+                    Err(backup_error) if backup_error.kind() == std::io::ErrorKind::NotFound => {
+                        PersistedState::default()
+                    }
+                    Err(backup_error) => {
+                        return Err(backup_error)
+                            .with_context(|| format!("read {}", backup_path.display()))
+                    }
+                }
+            }
             Err(error) => {
                 return Err(error).with_context(|| format!("read {}", state_path.display()))
             }
         };
-        Ok(Self { state_path, state })
+        Ok(Self {
+            state_path,
+            state,
+            auth_sessions: HashMap::new(),
+        })
     }
 
     fn save(&self) -> Result<()> {
         let temporary_path = self.state_path.with_extension("json.tmp");
+        let backup_path = self.state_path.with_extension("json.bak");
         let payload = serde_json::to_vec_pretty(&self.state)?;
         fs::write(&temporary_path, payload)
             .with_context(|| format!("write {}", temporary_path.display()))?;
         if self.state_path.exists() {
-            fs::remove_file(&self.state_path)
-                .with_context(|| format!("replace {}", self.state_path.display()))?;
+            let _ = fs::remove_file(&backup_path);
+            fs::rename(&self.state_path, &backup_path)
+                .with_context(|| format!("backup {}", self.state_path.display()))?;
         }
-        fs::rename(&temporary_path, &self.state_path)
-            .with_context(|| format!("commit {}", self.state_path.display()))?;
+        if let Err(error) = fs::rename(&temporary_path, &self.state_path) {
+            let _ = fs::rename(&backup_path, &self.state_path);
+            return Err(error).with_context(|| format!("commit {}", self.state_path.display()));
+        }
+        let _ = fs::remove_file(backup_path);
         Ok(())
     }
 
@@ -126,10 +164,19 @@ fn credential_entry(account_id: &str) -> Result<keyring::Entry> {
         .map_err(|error| anyhow!("credential store unavailable: {error}"))
 }
 
-fn load_credential(account_id: &str) -> Result<String> {
-    credential_entry(account_id)?
+fn load_credential(account: &PersistedAccount) -> Result<String> {
+    let entry = credential_entry(&account.id)?;
+    let raw = entry
         .get_password()
-        .map_err(|error| anyhow!("credential unavailable: {error}"))
+        .map_err(|error| anyhow!("credential unavailable: {error}"))?;
+    let provider = providers::ProviderKind::parse(&account.provider)?;
+    let refreshed = oauth::refresh_if_needed(provider, &raw)?;
+    if refreshed != raw {
+        entry
+            .set_password(&refreshed)
+            .map_err(|error| anyhow!("save refreshed credential: {error}"))?;
+    }
+    Ok(refreshed)
 }
 
 fn account_for(shared: &Arc<Mutex<MailGoState>>, account_id: &str) -> Result<PersistedAccount> {
@@ -147,7 +194,15 @@ fn account_for(shared: &Arc<Mutex<MailGoState>>, account_id: &str) -> Result<Per
 fn profile_for_account(account: &PersistedAccount) -> Result<providers::ProviderProfile> {
     let provider = providers::ProviderKind::parse(&account.provider)?;
     if provider != providers::ProviderKind::Other {
-        return providers::profile_for(provider);
+        let mut profile = providers::profile_for(provider)?;
+        if let Some(authentication) = account.authentication.as_deref() {
+            let authentication = providers::Authentication::parse(authentication)?;
+            if authentication == providers::Authentication::OAuth2 && !profile.supports_oauth {
+                return Err(anyhow!("this provider does not support OAuth2 in MailGo"));
+            }
+            profile.authentication = authentication;
+        }
+        return Ok(profile);
     }
     providers::profile_for_custom(&providers::CustomConnectionSettings {
         imap_host: account
@@ -251,12 +306,22 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 app.save()?;
                 Ok(json!({ "theme": theme }))
             }
+            "auth.start" => {
+                let provider =
+                    providers::ProviderKind::parse(&string_field(&message.payload, "provider")?)?;
+                let email = string_field(&message.payload, "email")?;
+                providers::validate_email(&email)?;
+                let (session, response) = oauth::start(provider, &email)?;
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                app.auth_sessions.insert(session.id.clone(), session);
+                Ok(serde_json::to_value(response)?)
+            }
             "accounts.add" => {
                 let id = string_field(&message.payload, "id")?;
                 let provider = string_field(&message.payload, "provider")?;
                 let label = string_field(&message.payload, "label")?;
                 let email = string_field(&message.payload, "email")?;
-                let authorization_code = string_field(&message.payload, "authorizationCode")?;
+                let supplied_credential = string_field(&message.payload, "authorizationCode")?;
                 let provider_kind = providers::ProviderKind::parse(&provider)?;
                 providers::validate_email(&email)?;
                 let new_account = PersistedAccount {
@@ -276,12 +341,32 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     smtp_security: optional_string_field(&message.payload, "smtpSecurity"),
                     authentication: optional_string_field(&message.payload, "authentication"),
                 };
-                profile_for_account(&new_account)?;
+                let profile = profile_for_account(&new_account)?;
 
-                // Authorization codes never enter PersistedState or logs. They are kept in the
-                // OS credential store (Windows Credential Manager through keyring-rs).
+                let credential = if profile.authentication == providers::Authentication::OAuth2 {
+                    let session_id = string_field(&message.payload, "oauthSessionId")?;
+                    let returned_state = optional_string_field(&message.payload, "oauthState");
+                    let pending = shared
+                        .lock()
+                        .map_err(|_| anyhow!("state lock poisoned"))?
+                        .auth_sessions
+                        .remove(&session_id)
+                        .ok_or_else(|| anyhow!("OAuth sign-in session is missing or expired"))?;
+                    if pending.provider != provider_kind
+                        || !pending.email.eq_ignore_ascii_case(&new_account.email)
+                    {
+                        return Err(anyhow!("OAuth sign-in session does not match this account"));
+                    }
+                    oauth::exchange_code(&pending, &supplied_credential, returned_state.as_deref())?
+                } else {
+                    supplied_credential
+                };
+
+                // Authorization codes and access tokens never enter PersistedState or logs. The
+                // resulting provider credential is kept in the OS credential store. OAuth flows
+                // retain refresh tokens only inside this same protected entry.
                 credential_entry(&id)?
-                    .set_password(&authorization_code)
+                    .set_password(&credential)
                     .map_err(|error| anyhow!("save credential: {error}"))?;
 
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
@@ -394,7 +479,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 let account_id = string_field(&message.payload, "accountId")?;
                 let account = account_for(shared, &account_id)?;
                 let profile = profile_for_account(&account)?;
-                let credential = load_credential(&account.id)?;
+                let credential = load_credential(&account)?;
                 let result = sync::sync_account(
                     &account.id,
                     profile,
@@ -435,7 +520,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                             continue;
                         }
                     };
-                    let credential = match load_credential(&account.id) {
+                    let credential = match load_credential(&account) {
                         Ok(credential) => credential,
                         Err(error) => {
                             failed.push(json!({ "accountId": account.id, "message": "requires authorization" }));
@@ -488,7 +573,9 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
             }
             "mail.list" => {
                 let account_id = string_field(&message.payload, "accountId")?;
-                let mailbox = sync::load_mailbox(&cache_dir(), &account_id)?;
+                let folder = optional_string_field(&message.payload, "folder")
+                    .unwrap_or_else(|| "INBOX".to_string());
+                let mailbox = sync::load_mailbox_for_folder(&cache_dir(), &account_id, &folder)?;
                 Ok(json!({
                     "offline": mailbox.is_some(),
                     "mailbox": mailbox,
@@ -504,14 +591,17 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 }
                 let account = account_for(shared, &account_id)?;
                 let profile = profile_for_account(&account)?;
-                let credential = load_credential(&account.id)?;
+                let credential = load_credential(&account)?;
+                let folder = optional_string_field(&message.payload, "folder")
+                    .unwrap_or_else(|| "INBOX".to_string());
                 let detail = sync::fetch_message(
                     &account.id,
                     profile,
                     &account.email,
                     &credential,
-                    "INBOX",
+                    &folder,
                     uid,
+                    &cache_dir(),
                 )?;
                 if let Err(error) =
                     sync::save_cached_message(&cache_dir(), &account_id, &detail.message)
@@ -519,6 +609,22 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     tracing::warn!(account_id = %account_id, uid, "save full message cache failed: {error}");
                 }
                 Ok(json!({ "offline": false, "message": detail.message }))
+            }
+            "mail.attachment" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                let uid = u32_field(&message.payload, "uid")?;
+                let index = message
+                    .payload
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| anyhow!("missing or invalid field: index"))?;
+                Ok(serde_json::to_value(sync::load_attachment(
+                    &cache_dir(),
+                    &account_id,
+                    uid,
+                    index,
+                )?)?)
             }
             "mail.mark_read" | "mail.star" => {
                 let account_id = string_field(&message.payload, "accountId")?;
@@ -532,13 +638,13 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     .unwrap_or_else(|| "INBOX".to_string());
                 let account = account_for(shared, &account_id)?;
                 let profile = profile_for_account(&account)?;
-                let credential = load_credential(&account.id)?;
+                let credential = load_credential(&account)?;
                 let flag = if message.cmd == "mail.mark_read" {
                     "\\Seen"
                 } else {
                     "\\Flagged"
                 };
-                sync::set_flag(
+                let queued = if let Err(error) = sync::set_flag(
                     profile,
                     &account.email,
                     &credential,
@@ -546,7 +652,21 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     uid,
                     flag,
                     enabled,
-                )?;
+                ) {
+                    sync::queue_flag_mutation(
+                        &cache_dir(),
+                        &account_id,
+                        &folder,
+                        uid,
+                        flag,
+                        enabled,
+                    )
+                    .with_context(|| format!("queue mail flag after provider failure: {error}"))?;
+                    true
+                } else {
+                    sync::remove_queued_flag(&cache_dir(), &account_id, &folder, uid, flag)?;
+                    false
+                };
                 if let Err(error) = sync::update_cached_flags(
                     &cache_dir(),
                     &account_id,
@@ -557,7 +677,9 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 ) {
                     tracing::warn!(account_id = %account_id, uid, "update local message flags failed: {error}");
                 }
-                Ok(json!({ "accountId": account_id, "uid": uid, "enabled": enabled }))
+                Ok(
+                    json!({ "accountId": account_id, "uid": uid, "enabled": enabled, "queued": queued }),
+                )
             }
             "mail.send" => {
                 let account_id = string_field(&message.payload, "accountId")?;
@@ -567,7 +689,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 let html_body = optional_string_field(&message.payload, "htmlBody");
                 let account = account_for(shared, &account_id)?;
                 let profile = profile_for_account(&account)?;
-                let credential = load_credential(&account.id)?;
+                let credential = load_credential(&account)?;
                 send::send_message(
                     profile,
                     &account.email,
@@ -594,6 +716,10 @@ fn main() -> Result<()> {
         .with_target(false)
         .compact()
         .init();
+    let Some(_instance_guard) = instance::acquire()? else {
+        tray::activate_main_window();
+        return Ok(());
+    };
     let shared_state = Arc::new(Mutex::new(MailGoState::load()?));
     let state_for_handler = shared_state.clone();
     let handler =

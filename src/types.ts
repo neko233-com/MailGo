@@ -11,6 +11,7 @@ export interface MailAttachment {
   name: string
   size: string
   kind: 'pdf' | 'sheet' | 'image' | 'file'
+  nativeIndex?: number
 }
 
 export interface MailMessage {
@@ -88,6 +89,7 @@ export interface NativeSyncItem {
   unread: number
   cachePath: string
   syncedAt: string
+  folders?: string[]
 }
 
 export interface NativeSyncResponse {
@@ -98,10 +100,18 @@ export interface NativeSyncResponse {
 }
 
 export interface NativeCachedAttachment {
+  index: number
   fileName: string
   contentType: string
   contentId?: string
   size: number
+  cachePath?: string
+}
+
+export interface NativeAttachmentResponse {
+  fileName: string
+  contentType: string
+  dataBase64: string
 }
 
 export interface NativeCachedMessage {

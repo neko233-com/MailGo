@@ -5,6 +5,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use imap::types::Flag;
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +16,16 @@ const HEADER_FETCH_QUERY: &str = "UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]";
 const FULL_FETCH_QUERY: &str = "UID FLAGS RFC822";
 const MAX_HEADER_MESSAGES: usize = 100;
 const CACHE_FILE: &str = "inbox.bin";
+const MUTATION_FILE: &str = "mutations.bin";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingFlagMutation {
+    folder: String,
+    uid: u32,
+    flag: String,
+    enabled: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,12 +36,21 @@ pub struct SyncResult {
     pub unread: usize,
     pub cache_path: String,
     pub synced_at: String,
+    pub folders: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MailDetail {
     pub message: CachedMessage,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentDownload {
+    pub file_name: String,
+    pub content_type: String,
+    pub data_base64: String,
 }
 
 fn connect(profile: &ProviderProfile) -> Result<imap::Client<imap::Connection>> {
@@ -63,7 +83,7 @@ pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathB
                     Ok(profile) => profile,
                     Err(_) => continue,
                 };
-                let credential = match crate::load_credential(&account.id) {
+                let credential = match crate::load_credential(&account) {
                     Ok(credential) => credential,
                     Err(_) => continue,
                 };
@@ -139,73 +159,95 @@ pub fn sync_account(
                     "XOAUTH2",
                     &XOAuth2 {
                         user: email.to_string(),
-                        token: credential.to_string(),
+                        token: crate::oauth::access_token(credential),
                     },
                 )
                 .map_err(|(error, _)| anyhow!("IMAP OAuth authentication failed: {error}"))?,
         };
 
-    let mailbox = session.select("INBOX").context("select INBOX")?;
-    let mut uids = session
-        .uid_search("ALL")
-        .context("search INBOX")?
-        .into_iter()
-        .collect::<Vec<_>>();
-    uids.sort_unstable();
-    let selected_uids = uids
-        .into_iter()
-        .rev()
-        .take(MAX_HEADER_MESSAGES)
-        .collect::<Vec<_>>();
-    let uid_set = selected_uids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-
-    let mut messages = Vec::with_capacity(selected_uids.len());
-    if !uid_set.is_empty() {
-        let fetched = session
-            .uid_fetch(uid_set, HEADER_FETCH_QUERY)
-            .context("fetch message headers")?;
-        for item in fetched.iter() {
-            let Some(uid) = item.uid else { continue };
-            let Some(header) = item.header() else {
-                continue;
-            };
-            let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
-            let starred = item
-                .flags()
-                .iter()
-                .any(|flag| matches!(flag, Flag::Flagged));
-            if let Ok(message) = parse_header(account_id, "INBOX", uid, unread, starred, header) {
-                messages.push(message);
-            }
-        }
-    }
-    messages.sort_by_key(|message| std::cmp::Reverse(message.uid));
+    flush_queued_flags(&mut session, cache_root, account_id);
 
     let synced_at = now_stamp();
-    let mut cached = CachedMailbox::empty(account_id, "INBOX");
-    cached.uid_validity = mailbox.uid_validity;
-    cached.synced_at = synced_at.clone();
-    cached.messages = messages;
-    let cache_path = save_mailbox(cache_root, account_id, &cached)?;
-    let unread = cached
-        .messages
+    let mut synced_folders = Vec::new();
+    let mut inbox_fetched = 0usize;
+    let mut inbox_unread = 0usize;
+    let mut cache_path = cache_root.join(safe_component(account_id)).join(CACHE_FILE);
+
+    for folder in folders_for(profile.provider) {
+        let Ok(mailbox) = session.select(folder) else {
+            continue;
+        };
+        let mut uids = session
+            .uid_search("ALL")
+            .with_context(|| format!("search {folder}"))?
+            .into_iter()
+            .collect::<Vec<_>>();
+        uids.sort_unstable();
+        let selected_uids = uids
+            .into_iter()
+            .rev()
+            .take(MAX_HEADER_MESSAGES)
+            .collect::<Vec<_>>();
+        let uid_set = selected_uids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut messages = Vec::with_capacity(selected_uids.len());
+        if !uid_set.is_empty() {
+            let fetched = session
+                .uid_fetch(uid_set, HEADER_FETCH_QUERY)
+                .with_context(|| format!("fetch {folder} message headers"))?;
+            for item in fetched.iter() {
+                let Some(uid) = item.uid else { continue };
+                let Some(header) = item.header() else {
+                    continue;
+                };
+                let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
+                let starred = item
+                    .flags()
+                    .iter()
+                    .any(|flag| matches!(flag, Flag::Flagged));
+                if let Ok(message) = parse_header(account_id, folder, uid, unread, starred, header)
+                {
+                    messages.push(message);
+                }
+            }
+        }
+        messages.sort_by_key(|message| std::cmp::Reverse(message.uid));
+        let mut cached = CachedMailbox::empty(account_id, folder);
+        cached.uid_validity = mailbox.uid_validity;
+        cached.synced_at = synced_at.clone();
+        cached.messages = messages;
+        let path = save_mailbox(cache_root, account_id, &cached)?;
+        if folder.eq_ignore_ascii_case("INBOX") {
+            cache_path = path;
+            inbox_fetched = cached.messages.len();
+            inbox_unread = cached
+                .messages
+                .iter()
+                .filter(|message| message.unread)
+                .count();
+        }
+        synced_folders.push(folder.to_string());
+    }
+
+    if !synced_folders
         .iter()
-        .filter(|message| message.unread)
-        .count();
-    let fetched = cached.messages.len();
+        .any(|folder| folder.eq_ignore_ascii_case("INBOX"))
+    {
+        return Err(anyhow!("INBOX is unavailable on the mail server"));
+    }
 
     session.logout().ok();
     Ok(SyncResult {
         account_id: account_id.to_string(),
         folder: "INBOX".to_string(),
-        fetched,
-        unread,
+        fetched: inbox_fetched,
+        unread: inbox_unread,
         cache_path: cache_path.display().to_string(),
         synced_at,
+        folders: synced_folders,
     })
 }
 
@@ -218,6 +260,7 @@ pub fn fetch_message(
     credential: &str,
     folder: &str,
     uid: u32,
+    cache_root: &Path,
 ) -> Result<MailDetail> {
     let client = connect(&profile)?;
     let mut session =
@@ -230,7 +273,7 @@ pub fn fetch_message(
                     "XOAUTH2",
                     &XOAuth2 {
                         user: email.to_string(),
-                        token: credential.to_string(),
+                        token: crate::oauth::access_token(credential),
                     },
                 )
                 .map_err(|(error, _)| anyhow!("IMAP OAuth authentication failed: {error}"))?,
@@ -249,19 +292,92 @@ pub fn fetch_message(
         .flags()
         .iter()
         .any(|flag| matches!(flag, Flag::Flagged));
-    let message = parse_full(account_id, folder, uid, unread, starred, raw)?;
+    let mut message = parse_full(account_id, folder, uid, unread, starred, raw)?;
+    let payloads = crate::mail::extract_attachment_payloads(raw)?;
+    crate::mail::embed_inline_images(&mut message.html_body, &payloads);
+    store_attachment_payloads(cache_root, account_id, uid, &mut message, &payloads)?;
     session.logout().ok();
     Ok(MailDetail { message })
 }
 
-pub fn load_mailbox(cache_root: &Path, account_id: &str) -> Result<Option<CachedMailbox>> {
+fn store_attachment_payloads(
+    cache_root: &Path,
+    account_id: &str,
+    uid: u32,
+    message: &mut CachedMessage,
+    payloads: &[crate::mail::AttachmentPayload],
+) -> Result<()> {
+    if payloads.is_empty() {
+        return Ok(());
+    }
+    let directory = cache_root
+        .join(safe_component(account_id))
+        .join("attachments");
+    fs::create_dir_all(&directory).with_context(|| format!("create {}", directory.display()))?;
+    for (index, payload) in payloads.iter().enumerate() {
+        let path = directory.join(format!("{uid}-{index}.bin"));
+        let temporary = directory.join(format!("{uid}-{index}.bin.tmp"));
+        let encrypted = protect_cache(&payload.bytes)?;
+        fs::write(&temporary, encrypted).context("write cached attachment")?;
+        if path.exists() {
+            fs::remove_file(&path).context("replace cached attachment")?;
+        }
+        fs::rename(&temporary, &path).context("commit cached attachment")?;
+        if let Some(attachment) = message
+            .attachments
+            .iter_mut()
+            .find(|item| item.index == index)
+        {
+            attachment.cache_path = Some(path.display().to_string());
+        }
+    }
+    Ok(())
+}
+
+pub fn load_attachment(
+    cache_root: &Path,
+    account_id: &str,
+    uid: u32,
+    index: usize,
+) -> Result<AttachmentDownload> {
+    let mailbox = load_cached_message(cache_root, account_id, uid)?
+        .ok_or_else(|| anyhow!("message is not cached"))?;
+    let metadata = mailbox
+        .attachments
+        .iter()
+        .find(|attachment| attachment.index == index)
+        .ok_or_else(|| anyhow!("attachment is not available"))?;
+    let path = cache_root
+        .join(safe_component(account_id))
+        .join("attachments")
+        .join(format!("{uid}-{index}.bin"));
+    let encrypted =
+        fs::read(&path).with_context(|| format!("read attachment {}", path.display()))?;
+    let bytes = unprotect_cache(&encrypted).context("decrypt cached attachment")?;
+    Ok(AttachmentDownload {
+        file_name: metadata.file_name.clone(),
+        content_type: metadata.content_type.clone(),
+        data_base64: STANDARD.encode(bytes),
+    })
+}
+
+pub fn load_mailbox_for_folder(
+    cache_root: &Path,
+    account_id: &str,
+    folder: &str,
+) -> Result<Option<CachedMailbox>> {
     let directory = cache_root.join(safe_component(account_id));
-    let encrypted_path = directory.join(CACHE_FILE);
+    let encrypted_path = directory.join(cache_file_name(folder));
     let legacy_path = directory.join("inbox.json");
-    for path in [&encrypted_path, &legacy_path] {
+    let paths: Vec<&Path> = if folder.eq_ignore_ascii_case("INBOX") {
+        vec![encrypted_path.as_path(), legacy_path.as_path()]
+    } else {
+        vec![encrypted_path.as_path()]
+    };
+    for path in paths {
         match fs::read(path) {
             Ok(contents) => {
-                let decoded = if path == &encrypted_path {
+                let decoded = if path == encrypted_path.as_path() {
                     unprotect_cache(&contents)
                         .with_context(|| format!("decrypt {}", path.display()))?
                 } else {
@@ -284,12 +400,33 @@ pub fn load_cached_message(
     account_id: &str,
     uid: u32,
 ) -> Result<Option<CachedMessage>> {
-    Ok(load_mailbox(cache_root, account_id)?.and_then(|mailbox| {
-        mailbox
+    let directory = cache_root.join(safe_component(account_id));
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Ok(None);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("bin") {
+            continue;
+        }
+        let Some(contents) = fs::read(&path).ok() else {
+            continue;
+        };
+        let Ok(decoded) = unprotect_cache(&contents) else {
+            continue;
+        };
+        let Ok(mailbox) = serde_json::from_slice::<CachedMailbox>(&decoded) else {
+            continue;
+        };
+        if let Some(message) = mailbox
             .messages
             .into_iter()
             .find(|message| message.uid == uid)
-    }))
+        {
+            return Ok(Some(message));
+        }
+    }
+    Ok(None)
 }
 
 pub fn save_cached_message(
@@ -297,7 +434,7 @@ pub fn save_cached_message(
     account_id: &str,
     message: &CachedMessage,
 ) -> Result<()> {
-    let mut mailbox = load_mailbox(cache_root, account_id)?
+    let mut mailbox = load_mailbox_for_folder(cache_root, account_id, &message.folder)?
         .unwrap_or_else(|| CachedMailbox::empty(account_id, message.folder.as_str()));
     mailbox
         .messages
@@ -317,7 +454,7 @@ pub fn update_cached_flags(
     flag: &str,
     enabled: bool,
 ) -> Result<()> {
-    let Some(mut mailbox) = load_mailbox(cache_root, account_id)? else {
+    let Some(mut mailbox) = load_mailbox_for_folder(cache_root, account_id, folder)? else {
         return Ok(());
     };
     if let Some(message) = mailbox
@@ -357,7 +494,7 @@ pub fn set_flag(
                     "XOAUTH2",
                     &XOAuth2 {
                         user: email.to_string(),
-                        token: credential.to_string(),
+                        token: crate::oauth::access_token(credential),
                     },
                 )
                 .map_err(|(error, _)| anyhow!("IMAP OAuth authentication failed: {error}"))?,
@@ -373,15 +510,128 @@ pub fn set_flag(
     Ok(())
 }
 
+pub fn queue_flag_mutation(
+    cache_root: &Path,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    flag: &str,
+    enabled: bool,
+) -> Result<()> {
+    let directory = cache_root.join(safe_component(account_id));
+    fs::create_dir_all(&directory).with_context(|| format!("create {}", directory.display()))?;
+    let path = directory.join(MUTATION_FILE);
+    let mut mutations = load_mutations(&path)?;
+    mutations.retain(|mutation| {
+        !(mutation.folder.eq_ignore_ascii_case(folder)
+            && mutation.uid == uid
+            && mutation.flag == flag)
+    });
+    mutations.push(PendingFlagMutation {
+        folder: folder.to_string(),
+        uid,
+        flag: flag.to_string(),
+        enabled,
+    });
+    save_mutations(&path, &mutations)
+}
+
+pub fn remove_queued_flag(
+    cache_root: &Path,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    flag: &str,
+) -> Result<()> {
+    let path = cache_root
+        .join(safe_component(account_id))
+        .join(MUTATION_FILE);
+    let mut mutations = load_mutations(&path)?;
+    let original_len = mutations.len();
+    mutations.retain(|mutation| {
+        !(mutation.folder.eq_ignore_ascii_case(folder)
+            && mutation.uid == uid
+            && mutation.flag == flag)
+    });
+    if mutations.len() != original_len {
+        save_mutations(&path, &mutations)?;
+    }
+    Ok(())
+}
+
+fn flush_queued_flags(
+    session: &mut imap::Session<imap::Connection>,
+    cache_root: &Path,
+    account_id: &str,
+) {
+    let path = cache_root
+        .join(safe_component(account_id))
+        .join(MUTATION_FILE);
+    let Ok(mutations) = load_mutations(&path) else {
+        return;
+    };
+    if mutations.is_empty() {
+        return;
+    }
+    let mut remaining = Vec::new();
+    for mutation in mutations {
+        let applied = session
+            .select(&mutation.folder)
+            .and_then(|_| {
+                let operation = if mutation.enabled {
+                    "+FLAGS.SILENT"
+                } else {
+                    "-FLAGS.SILENT"
+                };
+                session
+                    .uid_store(
+                        mutation.uid.to_string(),
+                        format!("{operation} ({})", mutation.flag),
+                    )
+                    .map(|_| ())
+            })
+            .is_ok();
+        if !applied {
+            remaining.push(mutation);
+        }
+    }
+    if let Err(error) = save_mutations(&path, &remaining) {
+        tracing::warn!(account_id = %account_id, "save pending mail mutations failed: {error}");
+    }
+}
+
+fn load_mutations(path: &Path) -> Result<Vec<PendingFlagMutation>> {
+    match fs::read(path) {
+        Ok(contents) => {
+            let decoded = unprotect_cache(&contents)?;
+            serde_json::from_slice(&decoded).context("parse pending mail mutations")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn save_mutations(path: &Path, mutations: &[PendingFlagMutation]) -> Result<()> {
+    let temporary = path.with_extension("bin.tmp");
+    let payload = protect_cache(&serde_json::to_vec(mutations)?)?;
+    fs::write(&temporary, payload).context("write pending mail mutations")?;
+    if path.exists() {
+        fs::remove_file(path).context("replace pending mail mutations")?;
+    }
+    fs::rename(temporary, path).context("commit pending mail mutations")?;
+    Ok(())
+}
+
 fn save_mailbox(cache_root: &Path, account_id: &str, mailbox: &CachedMailbox) -> Result<PathBuf> {
     let directory = cache_root.join(safe_component(account_id));
     fs::create_dir_all(&directory).with_context(|| format!("create {}", directory.display()))?;
-    let path = directory.join(CACHE_FILE);
-    let temporary = directory.join("inbox.bin.tmp");
+    let file_name = cache_file_name(&mailbox.folder);
+    let path = directory.join(&file_name);
+    let temporary = directory.join(format!("{file_name}.tmp"));
     let payload = protect_cache(&serde_json::to_vec_pretty(mailbox)?)?;
     fs::write(&temporary, payload).context("write mailbox cache")?;
     if path.exists() {
-        let backup = directory.join("inbox.bin.bak");
+        let backup = directory.join(format!("{file_name}.bak"));
         let _ = fs::remove_file(&backup);
         fs::rename(&path, &backup).context("backup mailbox cache")?;
         if let Err(error) = fs::rename(&temporary, &path) {
@@ -495,6 +745,51 @@ fn now_stamp() -> String {
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
     format!("unix:{seconds}")
+}
+
+fn cache_file_name(folder: &str) -> String {
+    if folder.eq_ignore_ascii_case("INBOX") {
+        CACHE_FILE.into()
+    } else {
+        format!("folder_{}.bin", safe_component(folder))
+    }
+}
+
+fn folders_for(provider: crate::providers::ProviderKind) -> Vec<&'static str> {
+    match provider {
+        crate::providers::ProviderKind::Google => vec![
+            "INBOX",
+            "[Gmail]/Sent Mail",
+            "[Gmail]/Drafts",
+            "[Gmail]/Spam",
+            "[Gmail]/Trash",
+            "[Gmail]/All Mail",
+        ],
+        crate::providers::ProviderKind::Qq => {
+            vec!["INBOX", "Sent Messages", "Drafts", "Spam", "Trash"]
+        }
+        crate::providers::ProviderKind::Outlook => {
+            vec![
+                "INBOX",
+                "Sent Items",
+                "Drafts",
+                "Junk Email",
+                "Deleted Items",
+                "Archive",
+            ]
+        }
+        crate::providers::ProviderKind::Other => {
+            vec![
+                "INBOX",
+                "Sent",
+                "Sent Items",
+                "Drafts",
+                "Spam",
+                "Trash",
+                "Archive",
+            ]
+        }
+    }
 }
 
 #[cfg(test)]

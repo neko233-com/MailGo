@@ -33,7 +33,7 @@ pub fn send_message(
         None => builder.body(text_body.to_string())?,
     };
 
-    let credentials = Credentials::new(from.to_string(), credential.to_string());
+    let credentials = Credentials::new(from.to_string(), crate::oauth::access_token(credential));
     let mut transport = match profile.smtp.security {
         TransportSecurity::Tls => SmtpTransport::relay(&profile.smtp.host),
         TransportSecurity::StartTls => SmtpTransport::starttls_relay(&profile.smtp.host),

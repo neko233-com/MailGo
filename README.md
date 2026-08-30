@@ -13,12 +13,23 @@ The current foundation includes:
 - Safe HTML preview mode, attachments, smart categories (including Apple Connect and Apple advertising), search, unread filter, star, reply, compose, theme switching, and user CSS overrides.
 - Rust `neko233-com/rdesktop` WebView2 shell with custom frameless title bar and preserved WebView data directory under `%LOCALAPPDATA%\\MailGo\\WebView2`.
 - Windows Credential Manager integration through `keyring` for authorization-code storage; secrets never enter `state.json` or account exports.
-- Native IMAP sync uses UID-based header caching, lazy full-message retrieval, local flag updates, and a DPAPI-protected mailbox cache on Windows.
+- Native IMAP sync uses UID-based header caching across provider folder mappings, lazy full-message retrieval, replayable offline flag mutations, local flag updates, and DPAPI-protected mailbox/attachment caches on Windows.
 - Native SMTP sending supports plain text and HTML alternatives through provider-specific TLS/STARTTLS defaults.
 - Windows tray lifecycle is implemented with the generated `resources/icons/mailgo.ico`: close-to-tray, restore on click, deliberate quit, and a five-minute background sync scheduler.
 - Custom IMAP/SMTP onboarding accepts host, port, TLS mode, and password/app-password/OAuth2 settings without putting credentials in metadata.
 
-Provider authentication is deliberately explicit: Gmail and QQ use provider-issued app passwords in the quick-start flow; Outlook and custom OAuth2 accounts expect a provider-issued Bearer access token. A future release can add OAuth authorization-code exchange once MailGo's registered client IDs and redirect policy are provisioned.
+Provider authentication is deliberately explicit: Gmail and QQ use provider-issued app passwords in the quick-start flow; Outlook and custom OAuth2 accounts can use a provider-issued Bearer access token. Set `MAILGO_GOOGLE_CLIENT_ID` or `MAILGO_OUTLOOK_CLIENT_ID` (and an optional redirect URI/client secret) to enable the native OAuth2 + PKCE authorization-code exchange. The app never persists the one-time code itself.
+
+For a registered desktop OAuth client, configure the client before launching the native shell:
+
+```powershell
+$env:MAILGO_GOOGLE_CLIENT_ID = "your-registered-google-client-id"
+$env:MAILGO_GOOGLE_REDIRECT_URI = "http://127.0.0.1:8765/oauth/callback"
+$env:MAILGO_OUTLOOK_CLIENT_ID = "your-registered-microsoft-client-id"
+$env:MAILGO_OUTLOOK_REDIRECT_URI = "http://127.0.0.1:8765/oauth/callback"
+```
+
+The redirect URI must be registered exactly with the provider. A loopback callback listener and device-flow UX remain planned; until then, paste the provider-returned authorization code into the account assistant.
 
 ## Run the browser development surface
 

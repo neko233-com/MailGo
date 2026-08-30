@@ -3,6 +3,7 @@ use std::collections::HashSet;
 
 use ammonia::Builder;
 use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use mail_parser::{Address, Message, MessageParser, MimeHeaders, PartType};
 use serde::{Deserialize, Serialize};
 
@@ -14,10 +15,20 @@ const MAX_PREVIEW_CHARS: usize = 240;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CachedAttachment {
+    #[serde(default)]
+    pub index: usize,
     pub file_name: String,
     pub content_type: String,
     pub content_id: Option<String>,
     pub size: usize,
+    #[serde(default)]
+    pub cache_path: Option<String>,
+}
+
+pub struct AttachmentPayload {
+    pub content_type: String,
+    pub content_id: Option<String>,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,9 +147,12 @@ fn build_message(
     );
     let attachments = parsed
         .attachments()
+        .enumerate()
         .map(|part| CachedAttachment {
-            file_name: part.attachment_name().unwrap_or("attachment").to_string(),
+            index: part.0,
+            file_name: part.1.attachment_name().unwrap_or("attachment").to_string(),
             content_type: part
+                .1
                 .content_type()
                 .map(|kind| {
                     kind.c_subtype
@@ -147,8 +161,9 @@ fn build_message(
                         .unwrap_or_else(|| kind.c_type.to_string())
                 })
                 .unwrap_or_else(|| "application/octet-stream".into()),
-            content_id: part.content_id().map(str::to_string),
-            size: part_size(part),
+            content_id: part.1.content_id().map(str::to_string),
+            size: part_size(part.1),
+            cache_path: None,
         })
         .collect();
 
@@ -180,6 +195,51 @@ fn build_message(
     })
 }
 
+pub fn extract_attachment_payloads(raw: &[u8]) -> Result<Vec<AttachmentPayload>> {
+    let parsed = MessageParser::default()
+        .parse(raw)
+        .ok_or_else(|| anyhow!("message could not be parsed"))?;
+    Ok(parsed
+        .attachments()
+        .map(|part| AttachmentPayload {
+            content_type: part
+                .content_type()
+                .map(|kind| {
+                    kind.c_subtype
+                        .as_ref()
+                        .map(|subtype| format!("{}/{}", kind.c_type, subtype))
+                        .unwrap_or_else(|| kind.c_type.to_string())
+                })
+                .unwrap_or_else(|| "application/octet-stream".into()),
+            content_id: part.content_id().map(str::to_string),
+            bytes: part_bytes(part),
+        })
+        .collect())
+}
+
+pub fn embed_inline_images(html: &mut Option<String>, payloads: &[AttachmentPayload]) {
+    let Some(html) = html.as_mut() else { return };
+    for payload in payloads {
+        if !payload
+            .content_type
+            .to_ascii_lowercase()
+            .starts_with("image/")
+            || payload.bytes.len() > 1024 * 1024
+        {
+            continue;
+        }
+        let Some(content_id) = payload.content_id.as_deref() else {
+            continue;
+        };
+        let encoded = STANDARD.encode(&payload.bytes);
+        let data_uri = format!("data:{};base64,{}", payload.content_type, encoded);
+        for needle in [format!("cid:{content_id}"), format!("cid:<{content_id}>")] {
+            let replaced = html.replace(&needle, &data_uri);
+            *html = replaced;
+        }
+    }
+}
+
 fn address_parts(address: Option<&Address<'_>>) -> (String, String) {
     let Some(first) = address.and_then(Address::first) else {
         return (String::new(), String::new());
@@ -196,6 +256,16 @@ fn part_size(part: &mail_parser::MessagePart<'_>) -> usize {
         PartType::Binary(value) | PartType::InlineBinary(value) => value.len(),
         PartType::Message(message) => message.raw_message().len(),
         PartType::Multipart(_) => 0,
+    }
+}
+
+fn part_bytes(part: &mail_parser::MessagePart<'_>) -> Vec<u8> {
+    match &part.body {
+        PartType::Text(value) => value.as_bytes().to_vec(),
+        PartType::Html(value) => value.as_bytes().to_vec(),
+        PartType::Binary(value) | PartType::InlineBinary(value) => value.to_vec(),
+        PartType::Message(message) => message.raw_message().to_vec(),
+        PartType::Multipart(_) => Vec::new(),
     }
 }
 
@@ -221,7 +291,7 @@ mod tests {
     #[test]
     fn parses_and_sanitizes_full_message() {
         let message = parse_full("account", "INBOX", 7, true, false, RAW.as_bytes()).unwrap();
-        assert_eq!(message.id, "<mailgo-test@example.com>");
+        assert_eq!(message.id, "mailgo-test@example.com");
         assert_eq!(message.category, SmartCategory::AppleConnect);
         assert_eq!(message.sender_email, "no-reply@apple.com");
         let html = message.html_body.unwrap();

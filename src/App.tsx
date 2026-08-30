@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Icon, type IconName } from './components/Icon'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
 import { invoke, readNativeState } from './lib/ipc'
-import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeCachedMessage, NativeMailboxResponse, NativeMessageResponse, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
+import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentResponse, NativeCachedMessage, NativeMailboxResponse, NativeMessageResponse, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 type ToastTone = 'info' | 'success' | 'error'
 type Toast = { id: number; message: string; tone: ToastTone }
@@ -50,6 +50,25 @@ function nativeCategory(category: NativeCachedMessage['category']): SmartCategor
   return category === 'inbox' ? undefined : category
 }
 
+function uiFolderForNative(folder: string): FolderId {
+  const normalized = folder.toLowerCase()
+  if (normalized === 'inbox') return 'inbox'
+  if (normalized.includes('sent')) return 'sent'
+  if (normalized.includes('draft')) return 'drafts'
+  if (normalized.includes('spam') || normalized.includes('junk')) return 'spam'
+  if (normalized.includes('trash') || normalized.includes('deleted')) return 'trash'
+  return 'archive'
+}
+
+function nativeFolderName(account: MailAccount, folder: FolderId): string {
+  if (folder === 'inbox') return 'INBOX'
+  if (folder === 'sent') return account.provider === 'google' ? '[Gmail]/Sent Mail' : account.provider === 'outlook' ? 'Sent Items' : 'Sent Messages'
+  if (folder === 'drafts') return account.provider === 'google' ? '[Gmail]/Drafts' : 'Drafts'
+  if (folder === 'spam') return account.provider === 'google' ? '[Gmail]/Spam' : account.provider === 'outlook' ? 'Junk Email' : 'Spam'
+  if (folder === 'trash') return account.provider === 'google' ? '[Gmail]/Trash' : account.provider === 'outlook' ? 'Deleted Items' : 'Trash'
+  return account.provider === 'google' ? '[Gmail]/All Mail' : 'Archive'
+}
+
 function nativeAttachmentKind(contentType: string): MailAttachment['kind'] {
   if (contentType === 'application/pdf') return 'pdf'
   if (contentType.includes('spreadsheet') || contentType.includes('excel')) return 'sheet'
@@ -68,9 +87,9 @@ function nativeMessageToUi(message: NativeCachedMessage, account: MailAccount): 
     : '最近'
   const senderName = message.senderName || message.senderEmail || '未知发件人'
   return {
-    id: `${message.accountId}:${message.uid}`,
+    id: `${message.accountId}:${message.folder}:${message.uid}`,
     accountId: message.accountId,
-    folder: message.folder.toLowerCase() === 'inbox' ? 'inbox' : 'archive',
+    folder: uiFolderForNative(message.folder),
     category: nativeCategory(message.category),
     from: message.senderEmail || 'unknown@example.com',
     senderName,
@@ -88,6 +107,7 @@ function nativeMessageToUi(message: NativeCachedMessage, account: MailAccount): 
       name: attachment.fileName || 'attachment',
       size: attachment.size > 1024 * 1024 ? `${(attachment.size / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(attachment.size / 1024))} KB`,
       kind: nativeAttachmentKind(attachment.contentType),
+      nativeIndex: attachment.index,
     })),
     hasHtml: Boolean(message.htmlBody),
     htmlBody: message.htmlBody,
@@ -155,6 +175,7 @@ function App() {
   const [provider, setProvider] = useState<Provider>('qq')
   const [accountEmail, setAccountEmail] = useState('')
   const [authorizationCode, setAuthorizationCode] = useState('')
+  const [oauthSessionId, setOauthSessionId] = useState('')
   const [showAuthorizationCode, setShowAuthorizationCode] = useState(false)
   const [customCss, setCustomCss] = useState(() => window.localStorage.getItem('mailgo-custom-css') ?? '')
   const [customImapHost, setCustomImapHost] = useState('imap.example.com')
@@ -171,6 +192,12 @@ function App() {
     const id = Date.now() + Math.random()
     setToasts((current) => [...current.slice(-2), { id, message, tone }])
     window.setTimeout(() => setToasts((current) => current.filter((toast) => toast.id !== id)), 3600)
+  }
+
+  const changeProvider = (nextProvider: Provider) => {
+    setProvider(nextProvider)
+    setCustomAuthentication(nextProvider === 'outlook' ? 'oauth2' : nextProvider === 'other' ? 'password' : 'app-password')
+    setOauthSessionId('')
   }
 
   useEffect(() => {
@@ -256,7 +283,7 @@ function App() {
     if (isNativeRuntime && mail.nativeUid) {
       void invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: false }).catch(() => undefined)
       try {
-        const result = await invoke<NativeMessageResponse>('mail.get', { accountId: mail.accountId, uid: mail.nativeUid })
+        const result = await invoke<NativeMessageResponse>('mail.get', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid })
         const account = accounts.find((item) => item.id === mail.accountId)
         if (account && result.message) {
           const converted = nativeMessageToUi(result.message, account)
@@ -278,12 +305,48 @@ function App() {
     pushToast(nextStarred ? '已添加到星标' : '已移出星标', 'success')
   }
 
+  const downloadAttachment = async (attachment: MailAttachment) => {
+    if (!isNativeRuntime || selectedMail.nativeUid == null || attachment.nativeIndex == null) {
+      pushToast(`${attachment.name} 已加入下载队列`, 'success')
+      return
+    }
+    try {
+      const response = await invoke<NativeAttachmentResponse>('mail.attachment', {
+        accountId: selectedMail.accountId,
+        uid: selectedMail.nativeUid,
+        index: attachment.nativeIndex,
+      }, 60_000)
+      const binary = Uint8Array.from(atob(response.dataBase64), (character) => character.charCodeAt(0))
+      const url = URL.createObjectURL(new Blob([binary], { type: response.contentType }))
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = response.fileName
+      anchor.click()
+      URL.revokeObjectURL(url)
+      pushToast(`${response.fileName} 下载完成`, 'success')
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : '附件读取失败，请先打开邮件正文', 'error')
+    }
+  }
+
   const selectFolder = (folder: FolderId) => {
     setSelectedFolder(folder)
     setSelectedCategory(null)
     setSelectedAccountId(null)
     const first = mails.find((mail) => folder === 'starred' ? mail.starred : mail.folder === folder)
     if (first) setSelectedMailId(first.id)
+    if (isNativeRuntime && folder !== 'starred') {
+      void Promise.all(accounts.map(async (account) => {
+        try {
+          const serverFolder = nativeFolderName(account, folder)
+          const result = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, folder: serverFolder })
+          const converted = (result.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, account))
+          setMails((current) => [...current.filter((mail) => !(mail.accountId === account.id && mail.nativeFolder === serverFolder)), ...converted])
+        } catch {
+          // A provider may not expose every optional folder; its cached copy remains untouched.
+        }
+      }))
+    }
   }
 
   const selectCategory = (category: SmartCategory) => {
@@ -328,7 +391,21 @@ function App() {
     }
   }
 
-  const handleOpenProvider = () => {
+  const handleOpenProvider = async () => {
+    if (isNativeRuntime && customAuthentication === 'oauth2' && accountEmail.trim()) {
+      try {
+        const flow = await invoke<{ sessionId: string; authorizationUrl: string }>('auth.start', {
+          provider,
+          email: accountEmail.trim(),
+        })
+        setOauthSessionId(flow.sessionId)
+        window.open(flow.authorizationUrl, '_blank', 'noopener,noreferrer')
+        pushToast('OAuth 授权页面已打开，完成后将授权码粘贴回来', 'info')
+        return
+      } catch (error) {
+        pushToast(error instanceof Error ? error.message : 'OAuth 客户端尚未配置，将打开帮助页面', 'error')
+      }
+    }
     window.open(selectedProvider.authUrl, '_blank', 'noopener,noreferrer')
     pushToast(`${selectedProvider.label}设置已在浏览器中打开`, 'info')
   }
@@ -374,6 +451,8 @@ function App() {
         label: selectedProvider.label,
         email: accountEmail.trim(),
         authorizationCode,
+        authentication: customAuthentication,
+        ...(oauthSessionId ? { oauthSessionId } : {}),
         ...(provider === 'other' ? {
           imapHost: customImapHost.trim(),
           imapPort: Number(customImapPort),
@@ -393,10 +472,12 @@ function App() {
         if (converted.length) setSelectedMailId(converted[0].id)
       }
     } catch {
-      // The UI remains usable in browser preview; native mode reports the account for retry.
-      setAccounts((current) => current.map((account) => account.id === id ? { ...account, status: 'syncing', lastSync: '等待同步' } : account))
+      setAccounts((current) => current.filter((account) => account.id !== id))
+      pushToast('账户添加失败，请检查授权码、OAuth 配置或服务器设置', 'error')
+      return
     }
     setAuthorizationCode('')
+    setOauthSessionId('')
     setAccountEmail('')
     setAccountModalOpen(false)
     setSelectedAccountId(id)
@@ -578,7 +659,7 @@ function App() {
               {selectedMail.hasHtml && <div className="content-mode-row"><span>此邮件包含富文本内容</span><button type="button" className="text-action" onClick={() => setHtmlMode((value) => !value)}>{isHtmlMode ? '查看纯文本' : '渲染 HTML'} <Icon name="grid" size={14} /></button></div>}
               {isHtmlMode && selectedMail.hasHtml ? <div className="html-rendered" dangerouslySetInnerHTML={{ __html: sanitizeHtml(selectedMail.htmlBody ?? initialHtml) }} /> : selectedMail.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
             </div>
-            {selectedMail.attachments && <div className="attachments"><div className="attachments-heading"><span><Icon name="paperclip" size={20} /> {selectedMail.attachments.length} 个附件</span><div><button type="button" onClick={() => pushToast('附件下载已加入队列', 'success')}><Icon name="download" size={17} /> 全部下载</button><button type="button" onClick={() => pushToast('正在保存到本地缓存', 'success')}><Icon name="cloud" size={17} /> 保存到云盘</button></div></div><div className="attachment-grid">{selectedMail.attachments.map((attachment) => <button type="button" className="attachment-card" key={attachment.id} onClick={() => pushToast(`${attachment.name} 已加入下载队列`, 'success')}><span className={`file-glyph file-${attachment.kind}`}>{attachment.kind === 'pdf' ? 'PDF' : attachment.kind === 'sheet' ? 'X' : 'FILE'}</span><span className="attachment-copy"><strong>{attachment.name}</strong><small>{attachment.size}</small></span><Icon name="download" size={17} /></button>)}</div></div>}
+            {selectedMail.attachments && <div className="attachments"><div className="attachments-heading"><span><Icon name="paperclip" size={20} /> {selectedMail.attachments.length} 个附件</span><div><button type="button" onClick={() => { void Promise.all(selectedMail.attachments?.map(downloadAttachment) ?? []) }}><Icon name="download" size={17} /> 全部下载</button><button type="button" onClick={() => pushToast('正在保存到本地缓存', 'success')}><Icon name="cloud" size={17} /> 保存到云盘</button></div></div><div className="attachment-grid">{selectedMail.attachments.map((attachment) => <button type="button" className="attachment-card" key={attachment.id} onClick={() => { void downloadAttachment(attachment) }}><span className={`file-glyph file-${attachment.kind}`}>{attachment.kind === 'pdf' ? 'PDF' : attachment.kind === 'sheet' ? 'X' : 'FILE'}</span><span className="attachment-copy"><strong>{attachment.name}</strong><small>{attachment.size}</small></span><Icon name="download" size={17} /></button>)}</div></div>}
             <div className="reply-composer"><Avatar message={{ ...selectedMail, avatar: 'OC', accent: '#2a5596' }} size="sm" /><div className="reply-input" onClick={() => setComposeOpen(true)}>点击回复，或按 R 快速回复<div className="reply-tools"><span><Icon name="paperclip" size={19} /></span><span><Icon name="image" size={19} /></span><span className="reply-emoji">☺</span><span className="reply-a">A</span><button type="button" onClick={(event) => { event.stopPropagation(); setComposeOpen(true) }}>回复 <span>⌄</span></button></div></div></div>
           </div>
         </section>
@@ -588,7 +669,7 @@ function App() {
             <div className="auth-panel-header"><div><Icon name="key" size={20} /><strong>授权码助手</strong></div><TooltipButton label="关闭授权码助手" onClick={() => setAuthPanelOpen(false)}><Icon name="close" size={18} /></TooltipButton></div>
             <div className="auth-tabs"><button type="button" className="is-active"><Icon name="lock" size={16} />授权码</button><button type="button" onClick={() => setAccountModalOpen(true)}><Icon name="settings" size={16} />设置</button></div>
             <div className="auth-card"><div className="auth-illustration"><Icon name="shieldCheck" size={40} /></div><h2>快速获取授权码</h2><p>用于第三方服务登录验证</p><button className="gradient-button" type="button" onClick={() => setAccountModalOpen(true)}><Icon name="copy" size={17} />管理授权码</button><div className="auth-validity"><Icon name="clock" size={16} />授权码仅保存在本机安全存储</div></div>
-            <div className="auth-panel-section"><div className="panel-section-title">账户</div>{accounts.map((account) => <button type="button" className="auth-account-row" key={account.id} onClick={() => { setProvider(account.provider); setAccountEmail(account.email); setCustomImapHost(account.imapHost ?? 'imap.example.com'); setCustomImapPort(String(account.imapPort ?? 993)); setCustomImapSecurity(account.imapSecurity ?? 'tls'); setCustomSmtpHost(account.smtpHost ?? 'smtp.example.com'); setCustomSmtpPort(String(account.smtpPort ?? 465)); setCustomSmtpSecurity(account.smtpSecurity ?? 'tls'); setCustomAuthentication(account.authentication ?? 'password'); setAccountModalOpen(true) }}><ProviderMark provider={account.provider} size="sm" /><span><strong>{account.label}</strong><small>{account.email}</small></span><span className="auth-chevron">›</span></button>)}</div>
+            <div className="auth-panel-section"><div className="panel-section-title">账户</div>{accounts.map((account) => <button type="button" className="auth-account-row" key={account.id} onClick={() => { changeProvider(account.provider); setAccountEmail(account.email); setCustomImapHost(account.imapHost ?? 'imap.example.com'); setCustomImapPort(String(account.imapPort ?? 993)); setCustomImapSecurity(account.imapSecurity ?? 'tls'); setCustomSmtpHost(account.smtpHost ?? 'smtp.example.com'); setCustomSmtpPort(String(account.smtpPort ?? 465)); setCustomSmtpSecurity(account.smtpSecurity ?? 'tls'); setCustomAuthentication(account.authentication ?? (account.provider === 'outlook' ? 'oauth2' : 'app-password')); setAccountModalOpen(true) }}><ProviderMark provider={account.provider} size="sm" /><span><strong>{account.label}</strong><small>{account.email}</small></span><span className="auth-chevron">›</span></button>)}</div>
             <div className="auth-note"><Icon name="info" size={18} /><span>授权码仅用于登录验证<br />不会存储或同步到云端</span></div>
             <div className="auth-panel-foot"><button type="button" onClick={handleOpenProvider}><Icon name="link" size={15} />打开 {selectedProvider.label} 设置</button></div>
           </motion.aside>}
@@ -601,7 +682,7 @@ function App() {
       </AnimatePresence>
 
       <AnimatePresence>{isComposeOpen && <ComposeModal accountId={selectedAccountId ?? accounts[0]?.id} onClose={() => setComposeOpen(false)} onSent={() => { setComposeOpen(false); pushToast('邮件已发送', 'success') }} onError={(message) => pushToast(message, 'error')} />}</AnimatePresence>
-      <AnimatePresence>{isAccountModalOpen && <AccountModal provider={provider} setProvider={setProvider} providerDefinition={selectedProvider} accountEmail={accountEmail} setAccountEmail={setAccountEmail} authorizationCode={authorizationCode} setAuthorizationCode={setAuthorizationCode} showAuthorizationCode={showAuthorizationCode} setShowAuthorizationCode={setShowAuthorizationCode} customImapHost={customImapHost} setCustomImapHost={setCustomImapHost} customImapPort={customImapPort} setCustomImapPort={setCustomImapPort} customImapSecurity={customImapSecurity} setCustomImapSecurity={setCustomImapSecurity} customSmtpHost={customSmtpHost} setCustomSmtpHost={setCustomSmtpHost} customSmtpPort={customSmtpPort} setCustomSmtpPort={setCustomSmtpPort} customSmtpSecurity={customSmtpSecurity} setCustomSmtpSecurity={setCustomSmtpSecurity} customAuthentication={customAuthentication} setCustomAuthentication={setCustomAuthentication} onClose={() => setAccountModalOpen(false)} onOpenProvider={handleOpenProvider} onCopy={handleCopy} onAdd={handleAddAccount} />}</AnimatePresence>
+      <AnimatePresence>{isAccountModalOpen && <AccountModal provider={provider} setProvider={changeProvider} providerDefinition={selectedProvider} accountEmail={accountEmail} setAccountEmail={setAccountEmail} authorizationCode={authorizationCode} setAuthorizationCode={setAuthorizationCode} showAuthorizationCode={showAuthorizationCode} setShowAuthorizationCode={setShowAuthorizationCode} customImapHost={customImapHost} setCustomImapHost={setCustomImapHost} customImapPort={customImapPort} setCustomImapPort={setCustomImapPort} customImapSecurity={customImapSecurity} setCustomImapSecurity={setCustomImapSecurity} customSmtpHost={customSmtpHost} setCustomSmtpHost={setCustomSmtpHost} customSmtpPort={customSmtpPort} setCustomSmtpPort={setCustomSmtpPort} customSmtpSecurity={customSmtpSecurity} setCustomSmtpSecurity={setCustomSmtpSecurity} customAuthentication={customAuthentication} setCustomAuthentication={setCustomAuthentication} onClose={() => setAccountModalOpen(false)} onOpenProvider={() => { void handleOpenProvider() }} onCopy={handleCopy} onAdd={handleAddAccount} />}</AnimatePresence>
       <div className="toast-stack" aria-live="polite">{toasts.map((toast) => <motion.div key={toast.id} className={`toast toast-${toast.tone}`} initial={{ opacity: 0, y: 12, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 12 }}><Icon name={toast.tone === 'success' ? 'checkCircle' : toast.tone === 'error' ? 'info' : 'bell'} size={17} /><span>{toast.message}</span></motion.div>)}</div>
     </div>
   )
