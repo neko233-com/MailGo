@@ -2248,6 +2248,7 @@ checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
 [[package]]
 name = "rdesktop-core"
 version = "0.1.8"
+source = "git+https://github.com/neko233-com/rdesktop#e9b2ba8d7a6c22138d37ca0cccfc41bbfeb28439"
 dependencies = [
  "anyhow",
  "core-graphics 0.24.0",
@@ -2266,6 +2267,7 @@ dependencies = [
 [[package]]
 name = "rdesktop-webview"
 version = "0.1.8"
+source = "git+https://github.com/neko233-com/rdesktop#e9b2ba8d7a6c22138d37ca0cccfc41bbfeb28439"
 dependencies = [
  "anyhow",
  "percent-encoding",

@@ -7,8 +7,8 @@ publish = false
 [dependencies]
 anyhow = "1"
 keyring = "4.2"
-rdesktop-core = { path = "../../rdesktop/crates/rdesktop-core" }
-rdesktop-webview = { path = "../../rdesktop/crates/rdesktop-webview" }
+rdesktop-core = { git = "https://github.com/neko233-com/rdesktop", version = "0.1.8" }
+rdesktop-webview = { git = "https://github.com/neko233-com/rdesktop", version = "0.1.8" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"

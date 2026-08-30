@@ -21,10 +21,10 @@ npm install
 npm run dev
 ```
 
-For rdesktop Agent-first development, run the rdesktop CLI from the sibling checkout:
+For rdesktop Agent-first development, use the installed CLI (kept current by the local updater):
 
 ```powershell
-cargo run --manifest-path ..\\rdesktop\\Cargo.toml -p rdesktop-cli -- dev --path .
+rdesktop dev --path .
 ```
 
 ## Build the Windows shell
