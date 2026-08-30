@@ -93,8 +93,8 @@ pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathB
         .name("mailgo-sync-scheduler".into())
         .spawn(move || loop {
             thread::sleep(Duration::from_secs(300));
-            let accounts = match shared.lock() {
-                Ok(app) => app.state.accounts.clone(),
+            let (accounts, notifications_enabled) = match shared.lock() {
+                Ok(app) => (app.state.accounts.clone(), app.state.notifications_enabled),
                 Err(_) => {
                     tracing::warn!("background sync state lock poisoned");
                     continue;
@@ -117,6 +117,16 @@ pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathB
                     &cache_root,
                 ) {
                     Ok(result) => {
+                        if notifications_enabled && result.unread > account.unread as usize {
+                            crate::tray::notify_new_mail(
+                                "MailGo",
+                                &format!(
+                                    "{} 有 {} 封未读邮件",
+                                    account.label,
+                                    result.unread - account.unread as usize
+                                ),
+                            );
+                        }
                         if let Ok(mut app) = shared.lock() {
                             if let Some(stored) = app
                                 .state

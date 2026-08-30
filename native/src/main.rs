@@ -50,6 +50,12 @@ struct PersistedState {
     theme: String,
     minimize_to_tray: bool,
     offline_mode: bool,
+    #[serde(default = "default_notifications_enabled")]
+    notifications_enabled: bool,
+}
+
+fn default_notifications_enabled() -> bool {
+    true
 }
 
 impl Default for PersistedState {
@@ -60,6 +66,7 @@ impl Default for PersistedState {
             theme: "dark".to_string(),
             minimize_to_tray: true,
             offline_mode: true,
+            notifications_enabled: true,
         }
     }
 }
@@ -140,6 +147,7 @@ impl MailGoState {
             "theme": self.state.theme,
             "minimizeToTray": self.state.minimize_to_tray,
             "offlineMode": self.state.offline_mode,
+            "notificationsEnabled": self.state.notifications_enabled,
         })
     }
 }
@@ -290,6 +298,17 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 app.state.minimize_to_tray = enabled;
                 app.save()?;
                 tray::set_minimize_to_tray(enabled);
+                Ok(json!({ "enabled": enabled }))
+            }
+            "app.set_notifications" => {
+                let enabled = message
+                    .payload
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                app.state.notifications_enabled = enabled;
+                app.save()?;
                 Ok(json!({ "enabled": enabled }))
             }
             "app.hide_window" => {

@@ -80,6 +80,7 @@ export interface NativeState {
   theme: ThemeMode
   minimizeToTray: boolean
   offlineMode: boolean
+  notificationsEnabled: boolean
 }
 
 export interface NativeSyncItem {

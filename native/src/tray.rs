@@ -11,7 +11,8 @@ mod windows_tray {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Shell::{
-        Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+        Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD,
+        NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
@@ -31,6 +32,7 @@ mod windows_tray {
     const TRAY_CLASS: &[u16] = &[77, 97, 105, 108, 71, 111, 84, 114, 97, 121, 0];
 
     static TARGET_WINDOW: AtomicIsize = AtomicIsize::new(0);
+    static TRAY_WINDOW: AtomicIsize = AtomicIsize::new(0);
     static PREVIOUS_WNDPROC: AtomicIsize = AtomicIsize::new(0);
     static MINIMIZE_TO_TRAY: AtomicBool = AtomicBool::new(true);
     static ALLOW_CLOSE: AtomicBool = AtomicBool::new(false);
@@ -96,6 +98,7 @@ mod windows_tray {
             tracing::warn!("MailGo tray window creation failed");
             return;
         }
+        TRAY_WINDOW.store(tray_window, Ordering::Release);
 
         let icon = load_icon();
         let mut notification: NOTIFYICONDATAW = zeroed();
@@ -117,6 +120,7 @@ mod windows_tray {
             while PeekMessageW(&mut message, 0, 0, 0, PM_REMOVE) != 0 {
                 if message.message == windows_sys::Win32::UI::WindowsAndMessaging::WM_QUIT {
                     Shell_NotifyIconW(NIM_DELETE, &notification);
+                    TRAY_WINDOW.store(0, Ordering::Release);
                     DestroyWindow(tray_window);
                     return;
                 }
@@ -198,7 +202,36 @@ mod windows_tray {
     }
 
     fn copy_tip(target: &mut [u16; 128], value: &str) {
-        for (slot, character) in target.iter_mut().zip(value.encode_utf16()) {
+        let limit = target.len().saturating_sub(1);
+        for (slot, character) in target.iter_mut().take(limit).zip(value.encode_utf16()) {
+            *slot = character;
+        }
+    }
+
+    pub fn notify_new_mail(title: &str, message: &str) {
+        let hwnd = TRAY_WINDOW.load(Ordering::Acquire) as HWND;
+        if hwnd == 0 {
+            return;
+        }
+        unsafe {
+            let mut notification: NOTIFYICONDATAW = zeroed();
+            notification.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+            notification.hWnd = hwnd;
+            notification.uID = TRAY_ID;
+            notification.uFlags = NIF_INFO;
+            copy_text(&mut notification.szInfoTitle, title);
+            copy_text(&mut notification.szInfo, message);
+            notification.dwInfoFlags = NIIF_INFO;
+            Shell_NotifyIconW(NIM_MODIFY, &notification);
+        }
+    }
+
+    fn copy_text<const N: usize>(target: &mut [u16; N], value: &str) {
+        for (slot, character) in target
+            .iter_mut()
+            .take(N.saturating_sub(1))
+            .zip(value.encode_utf16())
+        {
             *slot = character;
         }
     }
@@ -294,6 +327,8 @@ mod windows_tray {
 }
 
 #[cfg(target_os = "windows")]
+pub use windows_tray::notify_new_mail;
+#[cfg(target_os = "windows")]
 pub use windows_tray::{activate_main_window, hide_main_window, set_minimize_to_tray, start};
 
 #[cfg(not(target_os = "windows"))]
@@ -307,3 +342,6 @@ pub fn hide_main_window() {}
 
 #[cfg(not(target_os = "windows"))]
 pub fn activate_main_window() {}
+
+#[cfg(not(target_os = "windows"))]
+pub fn notify_new_mail(_title: &str, _message: &str) {}
