@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Icon, type IconName } from './components/Icon'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
 import { invoke, readNativeState } from './lib/ipc'
-import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeMailboxResponse, NativeMessageResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
+import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeMailboxResponse, NativeMessageResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 type ToastTone = 'info' | 'success' | 'error'
 type Toast = { id: number; message: string; tone: ToastTone }
@@ -56,6 +56,15 @@ function sanitizeHtml(input: string) {
     })
   })
   return documentParser.body.innerHTML
+}
+
+function bytesToBase64(bytes: Uint8Array) {
+  let binary = ''
+  const blockSize = 0x8000
+  for (let offset = 0; offset < bytes.length; offset += blockSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + blockSize))
+  }
+  return btoa(binary)
 }
 
 function nativeCategory(category: NativeCachedMessage['category']): SmartCategory | undefined {
@@ -177,6 +186,7 @@ function App() {
   const [selectedCategory, setSelectedCategory] = useState<SmartCategory | null>(null)
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null)
   const [selectedMailId, setSelectedMailId] = useState('launch-plan')
+  const [selectedMailIds, setSelectedMailIds] = useState<string[]>([])
   const [query, setQuery] = useState('')
   const [filterUnread, setFilterUnread] = useState(false)
   const [isComposeOpen, setComposeOpen] = useState(false)
@@ -320,8 +330,24 @@ function App() {
     return () => window.removeEventListener('keydown', handleShortcut)
   }, [])
 
-  const selectedMail = mails.find((mail) => mail.id === selectedMailId) ?? mails[0]
+  const selectedMail = mails.find((mail) => mail.id === selectedMailId) ?? mails[0] ?? {
+    id: 'empty-mail',
+    accountId: '',
+    folder: selectedFolder,
+    from: '',
+    senderName: 'MailGo',
+    subject: '没有选中的邮件',
+    preview: '当前文件夹没有可显示的邮件。',
+    timestamp: '',
+    dateGroup: '',
+    unread: false,
+    starred: false,
+    accent: '#8b99b6',
+    avatar: 'M',
+    body: ['当前文件夹没有可显示的邮件。'],
+  } satisfies MailMessage
   const selectedProvider = providerFor(provider)
+  const selectedMailAccount = accounts.find((account) => account.id === selectedMail.accountId)
   const visibleMails = useMemo(() => {
     const lowerQuery = query.trim().toLowerCase()
     return mails.filter((mail) => {
@@ -341,6 +367,12 @@ function App() {
       return groups
     }, {})
   }, [visibleMails])
+
+  const selectedVisibleMails = useMemo(
+    () => visibleMails.filter((mail) => selectedMailIds.includes(mail.id)),
+    [selectedMailIds, visibleMails],
+  )
+  const allVisibleSelected = visibleMails.length > 0 && selectedVisibleMails.length === visibleMails.length
 
   const canLoadEarlier = isNativeRuntime && selectedFolder !== 'starred' && accounts
     .filter((account) => !selectedAccountId || account.id === selectedAccountId)
@@ -372,6 +404,116 @@ function App() {
       void invoke('mail.star', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: nextStarred }).catch(() => pushToast('星标同步失败，可稍后重试', 'error'))
     }
     pushToast(nextStarred ? '已添加到星标' : '已移出星标', 'success')
+  }
+
+  const toggleMailSelection = (mailId: string) => {
+    setSelectedMailIds((current) => current.includes(mailId)
+      ? current.filter((id) => id !== mailId)
+      : [...current, mailId])
+  }
+
+  const toggleAllVisible = () => {
+    setSelectedMailIds((current) => {
+      if (allVisibleSelected) {
+        const visibleIds = new Set(visibleMails.map((mail) => mail.id))
+        return current.filter((id) => !visibleIds.has(id))
+      }
+      return Array.from(new Set([...current, ...visibleMails.map((mail) => mail.id)]))
+    })
+  }
+
+  const moveMail = async (mail: MailMessage, operation: 'archive' | 'delete') => {
+    if (mail.id === 'empty-mail') return false
+    const account = accounts.find((item) => item.id === mail.accountId)
+    if (operation === 'archive' && mail.folder === 'archive') return false
+    const isPermanentDelete = operation === 'delete' && mail.folder === 'trash'
+    const targetFolder = isPermanentDelete || !account ? undefined : nativeFolderName(account, operation === 'archive' ? 'archive' : 'trash')
+    let queued = false
+    if (isNativeRuntime && account && mail.nativeUid != null) {
+      const result = await invoke<{ queued?: boolean }>('mail.' + operation, {
+        accountId: mail.accountId,
+        folder: mail.nativeFolder ?? 'INBOX',
+        uid: mail.nativeUid,
+        ...(targetFolder ? { targetFolder } : {}),
+      })
+      queued = Boolean(result.queued)
+    }
+    if (isPermanentDelete) {
+      setMails((current) => current.filter((item) => item.id !== mail.id))
+      if (selectedMailId === mail.id) {
+        const next = visibleMails.find((item) => item.id !== mail.id)
+        setSelectedMailId(next?.id ?? '')
+      }
+    } else {
+      const nextFolder = operation === 'archive' ? 'archive' : 'trash'
+      setMails((current) => current.map((item) => item.id === mail.id
+        ? { ...item, folder: nextFolder, nativeFolder: targetFolder ?? item.nativeFolder }
+        : item))
+    }
+    if (mail.unread && mail.folder === 'inbox') {
+      setAccounts((current) => current.map((item) => item.id === mail.accountId
+        ? { ...item, unread: Math.max(0, item.unread - 1) }
+        : item))
+    }
+    return queued
+  }
+
+  const runMove = async (mail: MailMessage, operation: 'archive' | 'delete') => {
+    try {
+      const queued = await moveMail(mail, operation)
+      pushToast(queued ? '操作已保存，联网后会自动同步' : operation === 'archive' ? '邮件已归档' : '邮件已移入回收站', 'success')
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : '邮件操作失败，请稍后重试', 'error')
+    }
+  }
+
+  const applyBulkMove = async (operation: 'archive' | 'delete') => {
+    if (!selectedVisibleMails.length) {
+      pushToast('请先选择邮件', 'info')
+      return
+    }
+    let failed = 0
+    let queued = 0
+    for (const mail of selectedVisibleMails) {
+      try {
+        if (await moveMail(mail, operation)) queued += 1
+      } catch {
+        failed += 1
+      }
+    }
+    const count = selectedVisibleMails.length - failed
+    setSelectedMailIds([])
+    if (failed) pushToast(`${count} 封邮件已处理，${failed} 封处理失败`, 'error')
+    else pushToast(`${operation === 'archive' ? `已归档 ${count} 封邮件` : `已将 ${count} 封邮件移入回收站`}${queued ? `，${queued} 封将在联网后同步` : ''}`, 'success')
+  }
+
+  const markSelectedRead = async () => {
+    if (!selectedVisibleMails.length) {
+      pushToast('请先选择邮件', 'info')
+      return
+    }
+    const selected = selectedVisibleMails.filter((mail) => mail.unread)
+    setMails((current) => current.map((mail) => selected.some((item) => item.id === mail.id) ? { ...mail, unread: false } : mail))
+    setAccounts((current) => current.map((account) => {
+      const decrement = selected.filter((mail) => mail.accountId === account.id).length
+      return decrement ? { ...account, unread: Math.max(0, account.unread - decrement) } : account
+    }))
+    let failed = 0
+    if (isNativeRuntime) {
+      const results = await Promise.all(selected.map(async (mail) => {
+        if (!mail.nativeUid) return true
+        try {
+          await invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: false })
+          return true
+        } catch {
+          return false
+        }
+      }))
+      failed = results.filter((result) => !result).length
+    }
+    setSelectedMailIds([])
+    if (failed) pushToast(`${selected.length - failed} 封已读，${failed} 封同步失败`, 'error')
+    else pushToast(selected.length ? `已将 ${selected.length} 封邮件标为已读` : '所选邮件已经是已读状态', 'success')
   }
 
   const cancelAttachment = (attachmentId: string) => {
@@ -457,6 +599,7 @@ function App() {
     setSelectedFolder(folder)
     setSelectedCategory(null)
     setSelectedAccountId(null)
+    setSelectedMailIds([])
     const first = mails.find((mail) => folder === 'starred' ? mail.starred : mail.folder === folder)
     if (first) setSelectedMailId(first.id)
     if (isNativeRuntime && folder !== 'starred') {
@@ -813,7 +956,7 @@ function App() {
             <div className="section-label-row"><span>账户</span><TooltipButton label="添加账户" onClick={() => setAccountModalOpen(true)}><Icon name="add" size={16} /></TooltipButton></div>
             <div className="account-list">
               {accounts.map((account) => (
-                <button key={account.id} type="button" className={`account-row ${selectedAccountId === account.id ? 'is-selected' : ''}`} onClick={() => { setSelectedAccountId(account.id); setSelectedCategory(null); setSelectedFolder('inbox') }}>
+                <button key={account.id} type="button" className={`account-row ${selectedAccountId === account.id ? 'is-selected' : ''}`} onClick={() => { setSelectedAccountId(account.id); setSelectedCategory(null); setSelectedFolder('inbox'); setSelectedMailIds([]) }}>
                   <ProviderMark provider={account.provider} size="sm" />
                   <span className="account-copy"><strong>{account.label}</strong><small>{account.email}</small></span>
                   {account.unread > 0 && <span className="account-count">{account.unread}</span>}
@@ -842,10 +985,10 @@ function App() {
             <button className={`filter-button ${filterUnread ? 'is-active' : ''}`} type="button" onClick={() => setFilterUnread((value) => !value)}><Icon name="filter" size={17} /> 筛选{filterUnread && <span className="filter-dot" />}</button>
           </div>
           <div className="list-toolbar">
-            <label className="checkbox-wrap"><input type="checkbox" aria-label="选择所有邮件" /><span /></label>
-            <button type="button" className="toolbar-action" onClick={() => pushToast('已将选中邮件归档', 'success')}><Icon name="archive" size={17} /> <span>归档</span></button>
-            <button type="button" className="toolbar-action" onClick={() => pushToast('已将选中邮件删除', 'success')}><Icon name="trash" size={17} /> <span>删除</span></button>
-            <button type="button" className="toolbar-action" onClick={() => pushToast('已标记为已读', 'success')}><Icon name="message" size={17} /> <span>标为已读</span></button>
+            <label className="checkbox-wrap"><input type="checkbox" aria-label="选择所有邮件" checked={allVisibleSelected} onChange={toggleAllVisible} /><span /></label>{selectedVisibleMails.length > 0 && <span className="selection-count">已选 {selectedVisibleMails.length} 封</span>}
+            <button type="button" className="toolbar-action" onClick={() => { void applyBulkMove('archive') }} disabled={!selectedVisibleMails.length}><Icon name="archive" size={17} /> <span>归档</span></button>
+            <button type="button" className="toolbar-action" onClick={() => { void applyBulkMove('delete') }} disabled={!selectedVisibleMails.length}><Icon name="trash" size={17} /> <span>删除</span></button>
+            <button type="button" className="toolbar-action" onClick={() => { void markSelectedRead() }} disabled={!selectedVisibleMails.length}><Icon name="message" size={17} /> <span>标为已读</span></button>
             <TooltipButton label="更多操作" onClick={() => pushToast('更多批量操作即将上线', 'info')}><Icon name="more" size={18} /></TooltipButton>
           </div>
           <div className="mail-list-scroll">
@@ -855,7 +998,7 @@ function App() {
                   <div className="mail-group-label">{group}</div>
                   {mails.map((mail) => (
                     <motion.div layout key={mail.id} className={`mail-row ${selectedMailId === mail.id ? 'is-selected' : ''} ${mail.unread ? 'is-unread' : ''}`} onClick={() => selectMail(mail)} whileHover={prefersReducedMotion ? undefined : { y: -1 }} transition={{ duration: 0.16 }}>
-                      <label className="checkbox-wrap row-checkbox" onClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`选择 ${mail.subject}`} /><span /></label>
+                      <label className="checkbox-wrap row-checkbox" onClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`选择 ${mail.subject}`} checked={selectedMailIds.includes(mail.id)} onChange={() => toggleMailSelection(mail.id)} /><span /></label>
                       <Avatar message={mail} size="md" />
                       <div className="mail-row-copy"><div className="mail-row-top"><strong>{mail.senderName}</strong><time>{mail.timestamp}</time></div><div className="mail-row-subject">{mail.subject}</div><p>{mail.preview}</p></div>
                       <button type="button" className={`star-button ${mail.starred ? 'is-starred' : ''}`} aria-label={mail.starred ? '取消星标' : '添加星标'} onClick={(event) => { event.stopPropagation(); toggleStar(mail) }}><Icon name="star" size={19} weight={mail.starred ? 'Filled' : 'Outline'} /></button>
@@ -871,12 +1014,12 @@ function App() {
 
         <section className="reading-panel" aria-label="邮件阅读区">
           <div className="reading-toolbar">
-            <div className="reading-actions"><TooltipButton label="回复" onClick={() => setComposeOpen(true)}><Icon name="reply" size={18} /></TooltipButton><span>回复</span><TooltipButton label="回复全部" onClick={() => setComposeOpen(true)}><Icon name="reply" size={18} /></TooltipButton><span>回复全部</span><TooltipButton label="转发" onClick={() => setComposeOpen(true)}><Icon name="forward" size={18} /></TooltipButton><span>转发</span><TooltipButton label="归档" onClick={() => pushToast('邮件已归档', 'success')}><Icon name="archive" size={18} /></TooltipButton><span>归档</span><TooltipButton label="删除" onClick={() => pushToast('邮件已移入回收站', 'success')}><Icon name="trash" size={18} /></TooltipButton><span>删除</span></div>
+            <div className="reading-actions"><TooltipButton label="回复" onClick={() => setComposeOpen(true)}><Icon name="reply" size={18} /></TooltipButton><span>回复</span><TooltipButton label="回复全部" onClick={() => setComposeOpen(true)}><Icon name="reply" size={18} /></TooltipButton><span>回复全部</span><TooltipButton label="转发" onClick={() => setComposeOpen(true)}><Icon name="forward" size={18} /></TooltipButton><span>转发</span><TooltipButton label="归档" onClick={() => { void runMove(selectedMail, 'archive') }}><Icon name="archive" size={18} /></TooltipButton><span>归档</span><TooltipButton label="删除" onClick={() => { void runMove(selectedMail, 'delete') }}><Icon name="trash" size={18} /></TooltipButton><span>删除</span></div>
             <TooltipButton label="更多邮件操作" onClick={() => pushToast('更多邮件操作即将上线', 'info')}><Icon name="more" size={19} /></TooltipButton>
           </div>
           <div className="reading-scroll">
             <div className="reading-heading"><div><h1>{selectedMail.subject}</h1><div className="message-tags"><span className="tag tag-account"><ProviderMark provider={accounts.find((account) => account.id === selectedMail.accountId)?.provider ?? 'google'} size="sm" /> {accounts.find((account) => account.id === selectedMail.accountId)?.label ?? 'Google'}</span>{selectedMail.hasHtml && <span className="tag">HTML 邮件</span>}</div></div><TooltipButton label={selectedMail.starred ? '取消星标' : '添加星标'} className={`reading-star ${selectedMail.starred ? 'is-starred' : ''}`} onClick={() => toggleStar(selectedMail)}><Icon name="star" size={24} weight={selectedMail.starred ? 'Filled' : 'Outline'} /></TooltipButton></div>
-            <div className="sender-row"><Avatar message={selectedMail} size="lg" /><div className="sender-copy"><div><strong>{selectedMail.senderName}</strong> <span>&lt;{selectedMail.from}&gt;</span></div><div className="recipient">收件人： Olivia Chen &lt;olivia.chen@gmail.com&gt;</div></div><time>{selectedMail.timestamp}<br /><span>今天</span></time><TooltipButton label="发件人更多信息"><Icon name="more" size={19} /></TooltipButton></div>
+            <div className="sender-row"><Avatar message={selectedMail} size="lg" /><div className="sender-copy"><div><strong>{selectedMail.senderName}</strong> <span>&lt;{selectedMail.from}&gt;</span></div><div className="recipient">收件人： {selectedMailAccount?.label ?? '当前账户'} &lt;{selectedMailAccount?.email ?? '—'}&gt;</div></div><time>{selectedMail.timestamp}<br /><span>今天</span></time><TooltipButton label="发件人更多信息"><Icon name="more" size={19} /></TooltipButton></div>
             <div className="message-content">
               {selectedMail.hasHtml && <div className="content-mode-row"><span>此邮件包含富文本内容</span><button type="button" className="text-action" onClick={() => setHtmlMode((value) => !value)}>{isHtmlMode ? '查看纯文本' : '渲染 HTML'} <Icon name="grid" size={14} /></button></div>}
               {isHtmlMode && selectedMail.hasHtml ? <div className="html-rendered" dangerouslySetInnerHTML={{ __html: sanitizeHtml(selectedMail.htmlBody ?? initialHtml) }} /> : selectedMail.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
@@ -926,28 +1069,108 @@ function ComposeModal({ accountId, onClose, onSent, onError }: { accountId?: str
   const [to, setTo] = useState('')
   const [subject, setSubject] = useState('')
   const [body, setBody] = useState('')
+  const [attachments, setAttachments] = useState<File[]>([])
   const [isSending, setSending] = useState(false)
+  const [uploadingName, setUploadingName] = useState('')
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const isNativeRuntime = Boolean(window.ipc?.postMessage)
+  const maxAttachmentBytes = 25 * 1024 * 1024
+  const maxTotalAttachmentBytes = 50 * 1024 * 1024
+
+  const addFiles = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const incoming = Array.from(event.target.files ?? [])
+    event.target.value = ''
+    let total = attachments.reduce((sum, file) => sum + file.size, 0)
+    const accepted: File[] = []
+    for (const file of incoming) {
+      if (attachments.length + accepted.length >= 10) {
+        onError('单封邮件最多添加 10 个附件')
+        break
+      }
+      if (file.size > maxAttachmentBytes) {
+        onError(file.name + ' 超过单个附件 25 MB 限制')
+        continue
+      }
+      if (total + file.size > maxTotalAttachmentBytes) {
+        onError('附件总大小不能超过 50 MB')
+        break
+      }
+      accepted.push(file)
+      total += file.size
+    }
+    if (accepted.length) setAttachments((current) => [...current, ...accepted])
+  }
+
+  const uploadAttachment = async (file: File) => {
+    const start = await invoke<NativeAttachmentUploadStartResponse>('mail.attachment.upload.start', {
+      fileName: file.name,
+      contentType: file.type || 'application/octet-stream',
+      size: file.size,
+    }, 60_000)
+    if (start.done) return start.uploadId
+    const chunkSize = Math.min(Math.max(1, start.chunkSize), 192 * 1024)
+    let offset = 0
+    try {
+      while (offset < file.size) {
+        const nextOffset = Math.min(file.size, offset + chunkSize)
+        const bytes = new Uint8Array(await file.slice(offset, nextOffset).arrayBuffer())
+        const result = await invoke<NativeAttachmentUploadChunkResponse>('mail.attachment.upload.chunk', {
+          uploadId: start.uploadId,
+          offset,
+          dataBase64: bytesToBase64(bytes),
+        }, 60_000)
+        if (result.uploadId !== start.uploadId || result.offset !== offset || result.nextOffset !== nextOffset || result.nextOffset <= offset || result.nextOffset > file.size) {
+          throw new Error('附件上传响应无效')
+        }
+        offset = result.nextOffset
+        setUploadingName(file.name + ' ' + Math.round((offset / file.size) * 100) + '%')
+        if (result.done !== (offset === file.size)) throw new Error('附件上传完成状态无效')
+      }
+      return start.uploadId
+    } catch (error) {
+      void invoke('mail.attachment.upload.cancel', { uploadId: start.uploadId }).catch(() => undefined)
+      throw error
+    }
+  }
+
   const send = async () => {
-    if (!to.includes('@')) {
+    if (!to.trim().includes('@')) {
       onError('请输入有效的收件人地址')
       return
     }
+    if (isNativeRuntime && !accountId) {
+      onError('请先添加一个可发送邮件的账户')
+      return
+    }
     setSending(true)
+    const uploadIds: string[] = []
     try {
-      if (window.ipc?.postMessage) {
-        if (!accountId) throw new Error('请先添加一个可发送邮件的账户')
-        await invoke('mail.send', { accountId, to: to.trim(), subject: subject.trim() || '(无主题)', textBody: body })
+      if (isNativeRuntime) {
+        for (const file of attachments) {
+          setUploadingName('正在上传 ' + file.name)
+          uploadIds.push(await uploadAttachment(file))
+        }
+        await invoke('mail.send', {
+          accountId,
+          to: to.trim(),
+          subject: subject.trim() || '(无主题)',
+          textBody: body,
+          ...(uploadIds.length ? { attachmentIds: uploadIds } : {}),
+        })
       } else {
         await new Promise((resolve) => window.setTimeout(resolve, 700))
       }
       onSent()
     } catch (error) {
+      await Promise.all(uploadIds.map((uploadId) => invoke('mail.attachment.upload.cancel', { uploadId }).catch(() => undefined)))
       onError(error instanceof Error ? error.message : '邮件发送失败，请稍后重试')
     } finally {
+      setUploadingName('')
       setSending(false)
     }
   }
-  return <motion.div className="modal-backdrop compose-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="compose-modal" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }}><div className="compose-header"><strong>新邮件</strong><div><TooltipButton label="最小化撰写窗口"><span className="window-minimize" /></TooltipButton><TooltipButton label="关闭撰写窗口" onClick={onClose}><Icon name="close" size={17} /></TooltipButton></div></div><label>收件人<input autoFocus value={to} onChange={(event) => setTo(event.target.value)} placeholder="name@example.com" /></label><label>主题<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="主题" /></label><textarea className="compose-body" value={body} onChange={(event) => setBody(event.target.value)} placeholder="写下你的邮件…" /><div className="compose-footer"><div><TooltipButton label="添加附件"><Icon name="paperclip" size={19} /></TooltipButton><TooltipButton label="插入图片"><Icon name="image" size={19} /></TooltipButton><TooltipButton label="格式"><span className="reply-a">A</span></TooltipButton></div><button type="button" className="gradient-button" onClick={send} disabled={isSending}>{isSending ? '发送中…' : '发送'}<Icon name="send" size={17} /></button></div></motion.div></motion.div>
+
+  return <motion.div className="modal-backdrop compose-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="compose-modal" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1 }} exit={{ opacity: 0, y: 20 }}><div className="compose-header"><strong>新邮件</strong><div><TooltipButton label="最小化撰写窗口"><span className="window-minimize" /></TooltipButton><TooltipButton label="关闭撰写窗口" onClick={onClose}><Icon name="close" size={17} /></TooltipButton></div></div><label>收件人<input autoFocus value={to} onChange={(event) => setTo(event.target.value)} placeholder="name@example.com" /></label><label>主题<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="主题" /></label><textarea className="compose-body" value={body} onChange={(event) => setBody(event.target.value)} placeholder="写下你的邮件…" />{attachments.length > 0 && <div className="compose-attachments" aria-label="待发送附件">{attachments.map((file, index) => <div className="compose-attachment" key={file.name + '-' + file.size + '-' + index}><span>{file.name}</span><small>{Math.max(1, Math.round(file.size / 1024))} KB</small><button type="button" onClick={() => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))} aria-label={'移除附件 ' + file.name}>×</button></div>)}</div>}{uploadingName && <div className="compose-uploading" aria-live="polite"><Icon name="rotate" size={14} />{uploadingName}</div>}<div className="compose-footer"><div><TooltipButton label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={19} /></TooltipButton><input ref={fileInputRef} type="file" multiple hidden onChange={addFiles} /><TooltipButton label="插入图片" onClick={() => fileInputRef.current?.click()}><Icon name="image" size={19} /></TooltipButton><TooltipButton label="格式"><span className="reply-a">A</span></TooltipButton></div><button type="button" className="gradient-button" onClick={send} disabled={isSending}>{isSending ? (uploadingName || '发送中…') : '发送'}<Icon name="send" size={17} /></button></div></motion.div></motion.div>
 }
 
 export default App

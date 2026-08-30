@@ -17,6 +17,7 @@ const FULL_FETCH_QUERY: &str = "UID FLAGS RFC822";
 const MAX_HEADER_MESSAGES: usize = 100;
 const CACHE_FILE: &str = "inbox.bin";
 const MUTATION_FILE: &str = "mutations.bin";
+const MOVE_MUTATION_FILE: &str = "moves.bin";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +26,16 @@ struct PendingFlagMutation {
     uid: u32,
     flag: String,
     enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingMoveMutation {
+    operation: String,
+    folder: String,
+    uid: u32,
+    #[serde(default)]
+    target_folder: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +216,7 @@ fn sync_account_once(
 
     let mut session = authenticate(&profile, email, credential)?;
 
+    flush_queued_moves(&mut session, cache_root, account_id, profile.provider);
     flush_queued_flags(&mut session, cache_root, account_id);
 
     let synced_at = now_stamp();
@@ -265,6 +277,7 @@ fn sync_folder_latest(
     cache_root: &Path,
     synced_at: String,
 ) -> Result<(CachedMailbox, usize)> {
+    validate_mailbox_name(folder)?;
     let mut all_uids = session
         .uid_search("ALL")
         .with_context(|| format!("search {folder}"))?
@@ -389,6 +402,7 @@ pub fn sync_folder_page(
     limit: usize,
     cache_root: &Path,
 ) -> Result<SyncResult> {
+    validate_mailbox_name(folder)?;
     let mut attempt = 0u32;
     loop {
         match sync_folder_page_once(
@@ -638,6 +652,7 @@ pub fn fetch_message(
     uid: u32,
     cache_root: &Path,
 ) -> Result<MailDetail> {
+    validate_mailbox_name(folder)?;
     let mut session = authenticate(&profile, email, credential)?;
     session.select(folder)?;
     let fetched = session.uid_fetch(uid.to_string(), FULL_FETCH_QUERY)?;
@@ -826,6 +841,343 @@ pub fn update_cached_flags(
     Ok(())
 }
 
+fn refresh_mailbox_metadata(mailbox: &mut CachedMailbox) {
+    mailbox
+        .messages
+        .sort_by_key(|message| std::cmp::Reverse(message.uid));
+    mailbox.oldest_uid = mailbox.messages.iter().map(|message| message.uid).min();
+    mailbox.synced_at = now_stamp();
+}
+
+/// Move a cached message between folder caches immediately. The provider operation may still be
+/// queued, but the local UI must reflect the user's action while offline.
+pub fn update_cached_move(
+    cache_root: &Path,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    target_folder: &str,
+) -> Result<()> {
+    if folder.eq_ignore_ascii_case(target_folder) {
+        return Ok(());
+    }
+    let Some(mut source) = load_mailbox_for_folder(cache_root, account_id, folder)? else {
+        return Ok(());
+    };
+    let Some(mut message) = source
+        .messages
+        .iter()
+        .find(|message| message.uid == uid && message.folder.eq_ignore_ascii_case(folder))
+        .cloned()
+    else {
+        return Ok(());
+    };
+    source
+        .messages
+        .retain(|item| !(item.uid == uid && item.folder.eq_ignore_ascii_case(folder)));
+    refresh_mailbox_metadata(&mut source);
+
+    let mut target = load_mailbox_for_folder(cache_root, account_id, target_folder)?
+        .unwrap_or_else(|| CachedMailbox::empty(account_id, target_folder));
+    message.folder = target_folder.to_string();
+    target.messages.retain(|item| item.uid != uid);
+    target.messages.push(message);
+    refresh_mailbox_metadata(&mut target);
+    save_mailbox(cache_root, account_id, &target)?;
+    save_mailbox(cache_root, account_id, &source)?;
+    Ok(())
+}
+
+pub fn remove_cached_message(
+    cache_root: &Path,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+) -> Result<()> {
+    let Some(mut mailbox) = load_mailbox_for_folder(cache_root, account_id, folder)? else {
+        return Ok(());
+    };
+    mailbox
+        .messages
+        .retain(|message| !(message.uid == uid && message.folder.eq_ignore_ascii_case(folder)));
+    refresh_mailbox_metadata(&mut mailbox);
+    save_mailbox(cache_root, account_id, &mailbox).map(|_| ())
+}
+
+fn validate_mailbox_name(name: &str) -> Result<()> {
+    if name.trim().is_empty()
+        || name.len() > 512
+        || name
+            .chars()
+            .any(|character| matches!(character, '\r' | '\n'))
+    {
+        return Err(anyhow!("invalid destination mailbox"));
+    }
+    Ok(())
+}
+
+fn quoted_mailbox_name(name: &str) -> String {
+    format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn move_uid(
+    session: &mut imap::Session<imap::Connection>,
+    uid: u32,
+    target_folder: &str,
+) -> Result<()> {
+    validate_mailbox_name(target_folder)?;
+    let capabilities = session
+        .capabilities()
+        .map_err(|error| anyhow!("read IMAP capabilities: {error}"))?;
+    let supports_move = capabilities.has_str("MOVE");
+    if supports_move {
+        return session
+            .uid_mv(uid.to_string(), target_folder)
+            .map_err(|error| anyhow!("IMAP UID MOVE failed: {error}"));
+    }
+    if !capabilities.has_str("UIDPLUS") {
+        return Err(anyhow!(
+            "IMAP server supports neither MOVE nor UIDPLUS; refusing an unsafe move fallback"
+        ));
+    }
+    session
+        .uid_copy(uid.to_string(), quoted_mailbox_name(target_folder))
+        .map_err(|error| anyhow!("IMAP UID COPY failed: {error}"))?;
+    session
+        .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
+        .map_err(|error| anyhow!("IMAP delete source failed: {error}"))?;
+    session
+        .uid_expunge(uid.to_string())
+        .map_err(|error| anyhow!("IMAP UID EXPUNGE failed: {error}"))?;
+    Ok(())
+}
+
+fn archive_uid(
+    session: &mut imap::Session<imap::Connection>,
+    provider: crate::providers::ProviderKind,
+    folder: &str,
+    uid: u32,
+    target_folder: &str,
+) -> Result<()> {
+    if provider == crate::providers::ProviderKind::Google && folder.eq_ignore_ascii_case("INBOX") {
+        session
+            .uid_store(uid.to_string(), "-X-GM-LABELS (\\Inbox)")
+            .map(|_| ())
+            .map_err(|error| anyhow!("Gmail archive failed: {error}"))
+    } else {
+        move_uid(session, uid, target_folder)
+    }
+}
+
+fn delete_uid(session: &mut imap::Session<imap::Connection>, uid: u32) -> Result<()> {
+    let capabilities = session
+        .capabilities()
+        .map_err(|error| anyhow!("read IMAP capabilities: {error}"))?;
+    if !capabilities.has_str("UIDPLUS") {
+        return Err(anyhow!(
+            "IMAP server does not support UIDPLUS; refusing an unsafe permanent delete"
+        ));
+    }
+    session
+        .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
+        .map_err(|error| anyhow!("IMAP delete failed: {error}"))?;
+    session
+        .uid_expunge(uid.to_string())
+        .map_err(|error| anyhow!("IMAP UID EXPUNGE failed: {error}"))?;
+    Ok(())
+}
+
+pub fn move_message(
+    profile: ProviderProfile,
+    email: &str,
+    credential: &str,
+    folder: &str,
+    uid: u32,
+    target_folder: &str,
+) -> Result<()> {
+    validate_mailbox_name(folder)?;
+    validate_mailbox_name(target_folder)?;
+    let mut session = authenticate(&profile, email, credential)?;
+    session.select(folder)?;
+    let result = move_uid(&mut session, uid, target_folder);
+    session.logout().ok();
+    result
+}
+
+pub fn archive_message(
+    profile: ProviderProfile,
+    email: &str,
+    credential: &str,
+    folder: &str,
+    uid: u32,
+    target_folder: &str,
+) -> Result<()> {
+    validate_mailbox_name(folder)?;
+    validate_mailbox_name(target_folder)?;
+    let mut session = authenticate(&profile, email, credential)?;
+    session.select(folder)?;
+    let result = archive_uid(&mut session, profile.provider, folder, uid, target_folder);
+    session.logout().ok();
+    result
+}
+
+pub fn delete_message(
+    profile: ProviderProfile,
+    email: &str,
+    credential: &str,
+    folder: &str,
+    uid: u32,
+    trash_folder: &str,
+) -> Result<()> {
+    validate_mailbox_name(folder)?;
+    validate_mailbox_name(trash_folder)?;
+    let mut session = authenticate(&profile, email, credential)?;
+    session.select(folder)?;
+    let result = if folder.eq_ignore_ascii_case(trash_folder) {
+        delete_uid(&mut session, uid)
+    } else {
+        move_uid(&mut session, uid, trash_folder)
+    };
+    session.logout().ok();
+    result
+}
+
+pub fn queue_move_mutation(
+    cache_root: &Path,
+    account_id: &str,
+    operation: &str,
+    folder: &str,
+    uid: u32,
+    target_folder: Option<&str>,
+) -> Result<()> {
+    if !matches!(operation, "move" | "archive" | "delete") {
+        return Err(anyhow!("unsupported queued mail operation"));
+    }
+    validate_mailbox_name(folder)?;
+    if let Some(target) = target_folder {
+        validate_mailbox_name(target)?;
+    }
+    let directory = cache_root.join(safe_component(account_id));
+    fs::create_dir_all(&directory).with_context(|| format!("create {}", directory.display()))?;
+    let path = directory.join(MOVE_MUTATION_FILE);
+    let mut mutations = load_move_mutations(&path)?;
+    mutations.retain(|mutation| {
+        !(mutation.folder.eq_ignore_ascii_case(folder)
+            && mutation.uid == uid
+            && mutation.operation == operation)
+    });
+    mutations.push(PendingMoveMutation {
+        operation: operation.to_string(),
+        folder: folder.to_string(),
+        uid,
+        target_folder: target_folder.map(ToOwned::to_owned),
+    });
+    save_move_mutations(&path, &mutations)
+}
+
+pub fn remove_queued_move(
+    cache_root: &Path,
+    account_id: &str,
+    operation: &str,
+    folder: &str,
+    uid: u32,
+) -> Result<()> {
+    let path = cache_root
+        .join(safe_component(account_id))
+        .join(MOVE_MUTATION_FILE);
+    let mut mutations = load_move_mutations(&path)?;
+    let original_len = mutations.len();
+    mutations.retain(|mutation| {
+        !(mutation.folder.eq_ignore_ascii_case(folder)
+            && mutation.uid == uid
+            && mutation.operation == operation)
+    });
+    if mutations.len() != original_len {
+        save_move_mutations(&path, &mutations)?;
+    }
+    Ok(())
+}
+
+fn flush_queued_moves(
+    session: &mut imap::Session<imap::Connection>,
+    cache_root: &Path,
+    account_id: &str,
+    provider: crate::providers::ProviderKind,
+) {
+    let path = cache_root
+        .join(safe_component(account_id))
+        .join(MOVE_MUTATION_FILE);
+    let Ok(mutations) = load_move_mutations(&path) else {
+        return;
+    };
+    if mutations.is_empty() {
+        return;
+    }
+    let mut remaining = Vec::new();
+    for mutation in mutations {
+        let applied = session
+            .select(&mutation.folder)
+            .and_then(|_| match mutation.operation.as_str() {
+                "archive" => mutation
+                    .target_folder
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("queued archive has no target folder"))
+                    .and_then(|target| {
+                        archive_uid(session, provider, &mutation.folder, mutation.uid, target)
+                    }),
+                "delete"
+                    if mutation.target_folder.is_none()
+                        || mutation.target_folder.as_deref().is_some_and(|target| {
+                            target.eq_ignore_ascii_case(&mutation.folder)
+                        }) =>
+                {
+                    delete_uid(session, mutation.uid)
+                }
+                "delete" => mutation
+                    .target_folder
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("queued delete has no trash folder"))
+                    .and_then(|target| move_uid(session, mutation.uid, target)),
+                "move" => mutation
+                    .target_folder
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("queued move has no target folder"))
+                    .and_then(|target| move_uid(session, mutation.uid, target)),
+                _ => Err(anyhow!("unsupported queued mail operation")),
+            })
+            .is_ok();
+        if applied {
+            let cache_result = if mutation.operation == "delete"
+                && (mutation.target_folder.is_none()
+                    || mutation
+                        .target_folder
+                        .as_deref()
+                        .is_some_and(|target| target.eq_ignore_ascii_case(&mutation.folder)))
+            {
+                remove_cached_message(cache_root, account_id, &mutation.folder, mutation.uid)
+            } else if let Some(target) = mutation.target_folder.as_deref() {
+                update_cached_move(
+                    cache_root,
+                    account_id,
+                    &mutation.folder,
+                    mutation.uid,
+                    target,
+                )
+            } else {
+                Ok(())
+            };
+            if let Err(error) = cache_result {
+                tracing::warn!(account_id = %account_id, uid = mutation.uid, "update cached queued mail operation failed: {error}");
+            }
+        } else {
+            remaining.push(mutation);
+        }
+    }
+    if let Err(error) = save_move_mutations(&path, &remaining) {
+        tracing::warn!(account_id = %account_id, "save pending mail moves failed: {error}");
+    }
+}
+
 /// Apply a flag mutation with UID semantics. This is used by read/star/archive actions so local
 /// UI state and provider state share the same identifier and do not depend on sequence numbers.
 pub fn set_flag(
@@ -837,6 +1189,7 @@ pub fn set_flag(
     flag: &str,
     enabled: bool,
 ) -> Result<()> {
+    validate_mailbox_name(folder)?;
     let mut session = authenticate(&profile, email, credential)?;
     session.select(folder)?;
     let operation = if enabled {
@@ -857,6 +1210,7 @@ pub fn queue_flag_mutation(
     flag: &str,
     enabled: bool,
 ) -> Result<()> {
+    validate_mailbox_name(folder)?;
     let directory = cache_root.join(safe_component(account_id));
     fs::create_dir_all(&directory).with_context(|| format!("create {}", directory.display()))?;
     let path = directory.join(MUTATION_FILE);
@@ -950,6 +1304,17 @@ fn load_mutations(path: &Path) -> Result<Vec<PendingFlagMutation>> {
     }
 }
 
+fn load_move_mutations(path: &Path) -> Result<Vec<PendingMoveMutation>> {
+    match fs::read(path) {
+        Ok(contents) => {
+            let decoded = unprotect_cache(&contents)?;
+            serde_json::from_slice(&decoded).context("parse pending mail moves")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
 fn save_mutations(path: &Path, mutations: &[PendingFlagMutation]) -> Result<()> {
     let temporary = path.with_extension("bin.tmp");
     let payload = protect_cache(&serde_json::to_vec(mutations)?)?;
@@ -958,6 +1323,17 @@ fn save_mutations(path: &Path, mutations: &[PendingFlagMutation]) -> Result<()> 
         fs::remove_file(path).context("replace pending mail mutations")?;
     }
     fs::rename(temporary, path).context("commit pending mail mutations")?;
+    Ok(())
+}
+
+fn save_move_mutations(path: &Path, mutations: &[PendingMoveMutation]) -> Result<()> {
+    let temporary = path.with_extension("bin.tmp");
+    let payload = protect_cache(&serde_json::to_vec(mutations)?)?;
+    fs::write(&temporary, payload).context("write pending mail moves")?;
+    if path.exists() {
+        fs::remove_file(path).context("replace pending mail moves")?;
+    }
+    fs::rename(temporary, path).context("commit pending mail moves")?;
     Ok(())
 }
 
@@ -1243,5 +1619,26 @@ mod tests {
         assert!(is_likely_mail_folder("Archive 2026"));
         assert!(is_likely_mail_folder("Junk Email"));
         assert!(!is_likely_mail_folder("Contacts"));
+    }
+
+    #[test]
+    fn mailbox_names_reject_command_delimiters() {
+        assert!(validate_mailbox_name("INBOX").is_ok());
+        assert!(validate_mailbox_name("Sent Items").is_ok());
+        assert!(validate_mailbox_name("INBOX\r\nUID FETCH 1 ALL").is_err());
+        assert!(validate_mailbox_name("").is_err());
+    }
+
+    #[test]
+    fn queued_mail_operations_are_explicit_and_serializable() {
+        let mutation = PendingMoveMutation {
+            operation: "archive".into(),
+            folder: "INBOX".into(),
+            uid: 42,
+            target_folder: Some("[Gmail]/All Mail".into()),
+        };
+        let value = serde_json::to_value(mutation).unwrap();
+        assert_eq!(value["operation"], "archive");
+        assert_eq!(value["targetFolder"], "[Gmail]/All Mail");
     }
 }

@@ -131,6 +131,20 @@ export interface NativeAttachmentChunkResponse {
   dataBase64: string
 }
 
+export interface NativeAttachmentUploadStartResponse {
+  uploadId: string
+  chunkSize: number
+  size: number
+  done: boolean
+}
+
+export interface NativeAttachmentUploadChunkResponse {
+  uploadId: string
+  offset: number
+  nextOffset: number
+  done: boolean
+}
+
 export interface NativeDeviceStartResponse {
   sessionId: string
   userCode: string

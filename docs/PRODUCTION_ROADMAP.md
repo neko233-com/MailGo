@@ -20,6 +20,8 @@ The repository is deliberately split into a real desktop UI foundation and provi
 14. Background sync can emit a Windows tray notification for newly observed unread mail, with a persisted user-controlled notification policy.
 15. Attachment downloads use a bounded chunked IPC protocol with explicit start/chunk/cancel commands; encrypted cache bytes never cross the WebView in one unbounded payload.
 16. Warm IMAP syncs fetch only UIDs newer than the cached high-water mark, refresh a bounded recent flag window, preserve paged history, and remove messages deleted remotely; UIDVALIDITY changes still force a safe cache reset.
+17. Batch selection, mark-read, archive, and delete actions use UID-based native IPC; folder mutations update encrypted local caches immediately and replay through a separate encrypted queue when the provider is unavailable. Gmail archive removes the Inbox label through `X-GM-LABELS`.
+18. Compose attachments use bounded chunked upload IPC with per-file/total/count limits, expiry and cancellation; Rust builds multipart MIME messages without persisting outgoing file bytes.
 
 ## Remaining production acceptance work
 

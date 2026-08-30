@@ -143,6 +143,7 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .filter-button:hover, .filter-button.is-active { border-color: rgba(119, 129, 255, .55); color: #d9dcff; background: var(--accent-soft); }
 .filter-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
 .list-toolbar { height: 45px; display: flex; align-items: center; gap: 4px; padding: 0 13px 0 22px; border-bottom: 1px solid var(--line); color: var(--muted); }
+.selection-count { margin: 0 4px 0 2px; color: var(--accent); font-size: 11px; font-weight: 600; white-space: nowrap; }
 .toolbar-action { height: 32px; display: inline-flex; align-items: center; gap: 7px; padding: 0 8px; border-radius: 6px; color: var(--muted-strong); background: transparent; font-size: 11px; }
 .toolbar-action:hover { color: var(--text); background: var(--surface-hover); }
 .list-toolbar .icon-button { margin-left: auto; }
@@ -348,6 +349,13 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .compose-modal > label input { height: 30px; padding: 0; border: 0; background: transparent; box-shadow: none; font-size: 12px; }
 .compose-body { width: 100%; min-height: 245px; display: block; resize: vertical; padding: 17px; border: 0; outline: 0; color: var(--text); background: transparent; font-size: 13px; line-height: 1.7; }
 .compose-body::placeholder { color: var(--muted); }
+.compose-attachments { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 17px 10px; }
+.compose-attachment { min-width: 0; display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: 7px; color: var(--muted-strong); background: var(--surface-strong); font-size: 11px; }
+.compose-attachment span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.compose-attachment small { flex: 0 0 auto; color: var(--muted); font-size: 10px; }
+.compose-attachment button { flex: 0 0 auto; width: 18px; height: 18px; border-radius: 50%; color: var(--muted); background: transparent; font-size: 15px; line-height: 16px; }
+.compose-attachment button:hover { color: var(--text); background: var(--surface-hover); }
+.compose-uploading { display: flex; align-items: center; gap: 6px; padding: 0 17px 10px; color: var(--accent); font-size: 11px; }
 .compose-footer { display: flex; align-items: center; justify-content: space-between; padding: 9px 12px; border-top: 1px solid var(--line); }
 .compose-footer > div { display: flex; gap: 3px; }
 .compose-footer .gradient-button { min-width: 82px; min-height: 37px; }

@@ -29,6 +29,11 @@ const MAX_ATTACHMENT_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
 const MAX_LEGACY_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_ATTACHMENT_DOWNLOADS: usize = 2;
 const ATTACHMENT_DOWNLOAD_TTL: Duration = Duration::from_secs(10 * 60);
+const MAX_OUTGOING_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+const MAX_OUTGOING_ATTACHMENT_TOTAL_BYTES: usize = 50 * 1024 * 1024;
+const MAX_OUTGOING_ATTACHMENTS: usize = 10;
+const MAX_ACTIVE_ATTACHMENT_UPLOADS: usize = 4;
+const ATTACHMENT_UPLOAD_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_IMPORTED_ACCOUNTS: usize = 64;
 const MAX_ACCOUNT_ID_LENGTH: usize = 128;
 const MAX_ACCOUNT_LABEL_LENGTH: usize = 128;
@@ -87,9 +92,18 @@ struct MailGoState {
     auth_sessions: HashMap<String, oauth::PendingSession>,
     ready_oauth_credentials: HashMap<String, String>,
     attachment_downloads: HashMap<String, AttachmentDownloadSession>,
+    attachment_uploads: HashMap<String, AttachmentUploadSession>,
 }
 
 struct AttachmentDownloadSession {
+    bytes: Vec<u8>,
+    created_at: Instant,
+}
+
+struct AttachmentUploadSession {
+    file_name: String,
+    content_type: String,
+    expected_size: usize,
     bytes: Vec<u8>,
     created_at: Instant,
 }
@@ -138,6 +152,7 @@ impl MailGoState {
             auth_sessions: HashMap::new(),
             ready_oauth_credentials: HashMap::new(),
             attachment_downloads: HashMap::new(),
+            attachment_uploads: HashMap::new(),
         })
     }
 
@@ -303,6 +318,47 @@ fn valid_account_id(value: &str) -> bool {
 fn purge_expired_attachment_downloads(app: &mut MailGoState) {
     app.attachment_downloads
         .retain(|_, download| download.created_at.elapsed() < ATTACHMENT_DOWNLOAD_TTL);
+}
+
+fn purge_expired_attachment_uploads(app: &mut MailGoState) {
+    app.attachment_uploads
+        .retain(|_, upload| upload.created_at.elapsed() < ATTACHMENT_UPLOAD_TTL);
+}
+
+fn outgoing_upload_bytes(app: &MailGoState) -> usize {
+    app.attachment_uploads
+        .values()
+        .map(|upload| upload.expected_size)
+        .sum()
+}
+
+fn valid_upload_file_name(value: &str) -> Result<String> {
+    let name = value.trim();
+    if name.is_empty()
+        || name.len() > 255
+        || name == "."
+        || name == ".."
+        || name
+            .chars()
+            .any(|character| matches!(character, '\r' | '\n' | '/' | '\\'))
+    {
+        return Err(anyhow!("invalid attachment file name"));
+    }
+    Ok(name.to_string())
+}
+
+fn valid_upload_content_type(value: Option<String>) -> Result<String> {
+    let content_type = value
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    if content_type.len() > 128
+        || content_type
+            .chars()
+            .any(|character| matches!(character, '\r' | '\n'))
+    {
+        return Err(anyhow!("invalid attachment content type"));
+    }
+    Ok(content_type)
 }
 
 fn purge_expired_auth_sessions(app: &mut MailGoState) {
@@ -802,6 +858,104 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 }
                 Ok(json!({ "offline": false, "message": detail.message }))
             }
+            "mail.attachment.upload.start" => {
+                let file_name =
+                    valid_upload_file_name(&string_field(&message.payload, "fileName")?)?;
+                let content_type = valid_upload_content_type(optional_string_field(
+                    &message.payload,
+                    "contentType",
+                ))?;
+                let size = message
+                    .payload
+                    .get("size")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| anyhow!("missing or invalid field: size"))?;
+                if size > MAX_OUTGOING_ATTACHMENT_BYTES {
+                    return Err(anyhow!(
+                        "attachment exceeds the {} MiB per-file limit",
+                        MAX_OUTGOING_ATTACHMENT_BYTES / (1024 * 1024)
+                    ));
+                }
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                purge_expired_attachment_uploads(&mut app);
+                if app.attachment_uploads.len() >= MAX_ACTIVE_ATTACHMENT_UPLOADS {
+                    return Err(anyhow!(
+                        "too many active attachment uploads; finish or cancel one first"
+                    ));
+                }
+                if outgoing_upload_bytes(&app).saturating_add(size)
+                    > MAX_OUTGOING_ATTACHMENT_TOTAL_BYTES
+                {
+                    return Err(anyhow!(
+                        "attachments exceed the {} MiB total limit",
+                        MAX_OUTGOING_ATTACHMENT_TOTAL_BYTES / (1024 * 1024)
+                    ));
+                }
+                let upload_id = format!("mailgo-upload-{:016x}", rand::random::<u64>());
+                app.attachment_uploads.insert(
+                    upload_id.clone(),
+                    AttachmentUploadSession {
+                        file_name,
+                        content_type,
+                        expected_size: size,
+                        bytes: Vec::with_capacity(size),
+                        created_at: Instant::now(),
+                    },
+                );
+                Ok(json!({
+                    "uploadId": upload_id,
+                    "chunkSize": ATTACHMENT_CHUNK_BYTES,
+                    "size": size,
+                    "done": size == 0,
+                }))
+            }
+            "mail.attachment.upload.chunk" => {
+                let upload_id = string_field(&message.payload, "uploadId")?;
+                let offset = message
+                    .payload
+                    .get("offset")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| anyhow!("missing or invalid field: offset"))?;
+                let data_base64 = string_field(&message.payload, "dataBase64")?;
+                let bytes = STANDARD
+                    .decode(data_base64)
+                    .map_err(|_| anyhow!("attachment chunk is not valid base64"))?;
+                if bytes.len() > ATTACHMENT_CHUNK_BYTES {
+                    return Err(anyhow!("attachment chunk is too large"));
+                }
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                purge_expired_attachment_uploads(&mut app);
+                let upload = app
+                    .attachment_uploads
+                    .get_mut(&upload_id)
+                    .ok_or_else(|| anyhow!("attachment upload is missing or expired"))?;
+                if offset != upload.bytes.len() {
+                    return Err(anyhow!("attachment upload offset is invalid"));
+                }
+                let next_size = upload.bytes.len().saturating_add(bytes.len());
+                if next_size > upload.expected_size {
+                    return Err(anyhow!("attachment upload exceeds declared size"));
+                }
+                if bytes.is_empty() && next_size < upload.expected_size {
+                    return Err(anyhow!("empty attachment chunk cannot advance upload"));
+                }
+                upload.bytes.extend_from_slice(&bytes);
+                let done = upload.bytes.len() == upload.expected_size;
+                Ok(json!({
+                    "uploadId": upload_id,
+                    "offset": offset,
+                    "nextOffset": upload.bytes.len(),
+                    "done": done,
+                }))
+            }
+            "mail.attachment.upload.cancel" => {
+                let upload_id = string_field(&message.payload, "uploadId")?;
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                let cancelled = app.attachment_uploads.remove(&upload_id).is_some();
+                Ok(json!({ "uploadId": upload_id, "cancelled": cancelled }))
+            }
             "mail.attachment.start" => {
                 let account_id = string_field(&message.payload, "accountId")?;
                 let uid = u32_field(&message.payload, "uid")?;
@@ -918,6 +1072,97 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     "dataBase64": STANDARD.encode(attachment.bytes),
                 }))
             }
+            "mail.move" | "mail.archive" | "mail.delete" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                let uid = u32_field(&message.payload, "uid")?;
+                let folder = optional_string_field(&message.payload, "folder")
+                    .unwrap_or_else(|| "INBOX".to_string());
+                let target_folder = optional_string_field(&message.payload, "targetFolder");
+                let account = account_for(shared, &account_id)?;
+                let profile = profile_for_account(&account)?;
+                let credential = load_credential(&account)?;
+                let operation = match message.cmd.as_str() {
+                    "mail.move" => "move",
+                    "mail.archive" => "archive",
+                    "mail.delete" => "delete",
+                    _ => unreachable!("matched mail mutation command"),
+                };
+                let result = match operation {
+                    "move" => target_folder
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("move destination is required"))
+                        .and_then(|target| {
+                            sync::move_message(
+                                profile,
+                                &account.email,
+                                &credential,
+                                &folder,
+                                uid,
+                                target,
+                            )
+                        }),
+                    "archive" => target_folder
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("archive destination is required"))
+                        .and_then(|target| {
+                            sync::archive_message(
+                                profile,
+                                &account.email,
+                                &credential,
+                                &folder,
+                                uid,
+                                target,
+                            )
+                        }),
+                    "delete" => sync::delete_message(
+                        profile,
+                        &account.email,
+                        &credential,
+                        &folder,
+                        uid,
+                        target_folder.as_deref().unwrap_or(&folder),
+                    ),
+                    _ => unreachable!("matched mail mutation command"),
+                };
+                let queued = if let Err(error) = result {
+                    sync::queue_move_mutation(
+                        &cache_dir(),
+                        &account_id,
+                        operation,
+                        &folder,
+                        uid,
+                        target_folder.as_deref(),
+                    )
+                    .with_context(|| {
+                        format!("queue mail operation after provider failure: {error}")
+                    })?;
+                    true
+                } else {
+                    sync::remove_queued_move(&cache_dir(), &account_id, operation, &folder, uid)?;
+                    false
+                };
+                let cache_result = if operation == "delete"
+                    && (target_folder.is_none()
+                        || target_folder
+                            .as_deref()
+                            .is_some_and(|target| target.eq_ignore_ascii_case(&folder)))
+                {
+                    sync::remove_cached_message(&cache_dir(), &account_id, &folder, uid)
+                } else if let Some(target) = target_folder.as_deref() {
+                    sync::update_cached_move(&cache_dir(), &account_id, &folder, uid, target)
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = cache_result {
+                    tracing::warn!(account_id = %account_id, uid, "update local mail operation failed: {error}");
+                }
+                Ok(json!({
+                    "accountId": account_id,
+                    "uid": uid,
+                    "operation": operation,
+                    "queued": queued,
+                }))
+            }
             "mail.mark_read" | "mail.star" => {
                 let account_id = string_field(&message.payload, "accountId")?;
                 let uid = u32_field(&message.payload, "uid")?;
@@ -979,6 +1224,55 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 let subject = string_field(&message.payload, "subject")?;
                 let text_body = string_field(&message.payload, "textBody")?;
                 let html_body = optional_string_field(&message.payload, "htmlBody");
+                let attachment_ids = match message.payload.get("attachmentIds") {
+                    None => Vec::new(),
+                    Some(value) => value
+                        .as_array()
+                        .ok_or_else(|| anyhow!("attachmentIds must be an array"))?
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(str::to_string)
+                                .ok_or_else(|| anyhow!("attachment id must be a string"))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                };
+                if attachment_ids.len() > MAX_OUTGOING_ATTACHMENTS {
+                    return Err(anyhow!(
+                        "a message can contain at most {} attachments",
+                        MAX_OUTGOING_ATTACHMENTS
+                    ));
+                }
+                let attachments = {
+                    let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                    purge_expired_attachment_uploads(&mut app);
+                    let mut seen = HashSet::new();
+                    let mut total = 0usize;
+                    let mut attachments = Vec::with_capacity(attachment_ids.len());
+                    for upload_id in &attachment_ids {
+                        if !seen.insert(upload_id) {
+                            return Err(anyhow!("duplicate attachment upload id"));
+                        }
+                        let upload = app
+                            .attachment_uploads
+                            .get(upload_id)
+                            .ok_or_else(|| anyhow!("attachment upload is missing or expired"))?;
+                        if upload.bytes.len() != upload.expected_size {
+                            return Err(anyhow!("attachment upload is incomplete"));
+                        }
+                        total = total.saturating_add(upload.bytes.len());
+                        if total > MAX_OUTGOING_ATTACHMENT_TOTAL_BYTES {
+                            return Err(anyhow!("attachments exceed the total size limit"));
+                        }
+                        attachments.push(send::OutgoingAttachment {
+                            file_name: upload.file_name.clone(),
+                            content_type: upload.content_type.clone(),
+                            bytes: upload.bytes.clone(),
+                        });
+                    }
+                    attachments
+                };
                 let account = account_for(shared, &account_id)?;
                 let profile = profile_for_account(&account)?;
                 let credential = load_credential(&account)?;
@@ -990,7 +1284,13 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     &subject,
                     &text_body,
                     html_body.as_deref(),
+                    &attachments,
                 )?;
+                if let Ok(mut app) = shared.lock() {
+                    for upload_id in &attachment_ids {
+                        app.attachment_uploads.remove(upload_id);
+                    }
+                }
                 Ok(json!({ "sent": true, "accountId": account_id }))
             }
             _ => Err(anyhow!("unknown command: {}", message.cmd)),
