@@ -465,6 +465,8 @@ fn optional_u16_field(payload: &Value, name: &str) -> Option<u16> {
 
 fn valid_account_id(value: &str) -> bool {
     !value.is_empty()
+        && value != "."
+        && value != ".."
         && value.len() <= MAX_ACCOUNT_ID_LENGTH
         && value.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
@@ -735,10 +737,9 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 let profile = profile_for_account(&new_account)?;
 
                 let oauth_session_id = optional_string_field(&message.payload, "oauthSessionId");
-                let credential = if profile.authentication == providers::Authentication::OAuth2
-                    && oauth_session_id.is_some()
+                let credential = if let Some(session_id) = oauth_session_id
+                    .filter(|_| profile.authentication == providers::Authentication::OAuth2)
                 {
-                    let session_id = oauth_session_id.expect("checked above");
                     let returned_state = optional_string_field(&message.payload, "oauthState");
                     let (pending, ready_credential) = {
                         let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
@@ -833,8 +834,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     if let Ok(entry) = credential_entry(id) {
                         let _ = entry.delete_credential();
                     }
-                    app.state.accounts.retain(|account| account.id != id);
-                    app.state.accounts.push(PersistedAccount {
+                    let imported_account = PersistedAccount {
                         id: id.to_string(),
                         provider: provider_kind.as_str().to_string(),
                         label: label.to_string(),
@@ -871,7 +871,12 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                             .get("authentication")
                             .and_then(Value::as_str)
                             .map(ToOwned::to_owned),
-                    });
+                    };
+                    if profile_for_account(&imported_account).is_err() {
+                        continue;
+                    }
+                    app.state.accounts.retain(|account| account.id != id);
+                    app.state.accounts.push(imported_account);
                     imported += 1;
                 }
                 app.save()?;
@@ -1213,6 +1218,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
             }
             "mail.list" => {
                 let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
                 let folder = optional_string_field(&message.payload, "folder")
                     .unwrap_or_else(|| "INBOX".to_string());
                 let mailbox = sync::load_mailbox_for_folder(&cache_dir(), &account_id, &folder)?;
@@ -1226,6 +1232,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 let uid = u32_field(&message.payload, "uid")?;
                 let folder = optional_string_field(&message.payload, "folder")
                     .unwrap_or_else(|| "INBOX".to_string());
+                let account = account_for(shared, &account_id)?;
                 if let Some(message) =
                     sync::load_cached_message(&cache_dir(), &account_id, &folder, uid)?
                 {
@@ -1233,7 +1240,6 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                         return Ok(json!({ "offline": true, "message": message }));
                     }
                 }
-                let account = account_for(shared, &account_id)?;
                 let profile = profile_for_account(&account)?;
                 let credential = load_credential(&account)?;
                 let detail = sync::fetch_message(
@@ -1352,6 +1358,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
             }
             "mail.attachment.start" => {
                 let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
                 let uid = u32_field(&message.payload, "uid")?;
                 let folder = optional_string_field(&message.payload, "folder")
                     .unwrap_or_else(|| "INBOX".to_string());
@@ -1443,6 +1450,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 // Keep the original one-shot command for older clients. New clients use the
                 // chunked start/chunk/cancel protocol to cap IPC payload size and support cancel.
                 let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
                 let uid = u32_field(&message.payload, "uid")?;
                 let folder = optional_string_field(&message.payload, "folder")
                     .unwrap_or_else(|| "INBOX".to_string());
@@ -1615,6 +1623,10 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
             "mail.send" => {
                 let account_id = string_field(&message.payload, "accountId")?;
                 let to = bounded_string_field(&message.payload, "to", MAX_RECIPIENT_BYTES)?;
+                let cc =
+                    optional_bounded_string_field(&message.payload, "cc", MAX_RECIPIENT_BYTES)?;
+                let bcc =
+                    optional_bounded_string_field(&message.payload, "bcc", MAX_RECIPIENT_BYTES)?;
                 let subject = bounded_string_field(&message.payload, "subject", MAX_SUBJECT_BYTES)?;
                 let text_body =
                     bounded_string_field(&message.payload, "textBody", MAX_MESSAGE_BODY_BYTES)?;
@@ -1676,16 +1688,17 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     let account = account_for(shared, &account_id)?;
                     let profile = profile_for_account(&account)?;
                     let credential = load_credential(&account)?;
-                    send::send_message(
-                        profile,
-                        &account.email,
-                        &credential,
-                        &to,
-                        &subject,
-                        &text_body,
-                        html_body.as_deref(),
-                        &attachments,
-                    )?;
+                    let outgoing = send::OutgoingMessage {
+                        from: &account.email,
+                        credential: &credential,
+                        to: &to,
+                        cc: cc.as_deref(),
+                        bcc: bcc.as_deref(),
+                        subject: &subject,
+                        text_body: &text_body,
+                        html_body: html_body.as_deref(),
+                    };
+                    send::send_message(profile, &outgoing, &attachments)?;
                     Ok(())
                 })();
                 if let Ok(mut app) = shared.lock() {
@@ -1707,6 +1720,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -1786,6 +1800,13 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("newer than supported"));
+    }
+
+    #[test]
+    fn account_ids_cannot_escape_the_cache_root() {
+        assert!(!valid_account_id("."));
+        assert!(!valid_account_id(".."));
+        assert!(valid_account_id("qq-account-1"));
     }
 }
 

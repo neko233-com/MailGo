@@ -19,7 +19,7 @@ The current foundation includes:
 - Mail actions use UID semantics end-to-end: batch selection supports mark-read, archive, and delete; archive/trash operations update encrypted local folder caches immediately and queue provider mutations when offline. Gmail archive removes the Inbox label instead of copying the message into a duplicate folder.
 - The desktop cache footer reports the number of encrypted flag/move mutations still waiting for provider replay across all accounts; the renderer receives counts only, never queue contents.
 - Native SMTP sending supports plain text and HTML alternatives through provider-specific TLS/STARTTLS defaults.
-- Compose supports bounded multi-file attachments through chunked IPC; Rust assembles MIME attachments only for the send operation and releases the in-memory upload after success.
+- Compose supports bounded To/CC/BCC recipient lists, safe HTML alternatives, and chunked multi-file attachments without putting attachment bytes in a single IPC request.
 - Windows tray lifecycle is implemented with the generated `resources/icons/mailgo.ico`: close-to-tray, restore on click, deliberate quit, and a five-minute background sync scheduler.
 - Custom IMAP/SMTP onboarding accepts host, port, TLS mode, and password/app-password/OAuth2 settings without putting credentials in metadata.
 

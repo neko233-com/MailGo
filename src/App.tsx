@@ -67,6 +67,15 @@ function sanitizeHtml(input: string, allowRemoteImages = false) {
   return documentParser.body.innerHTML
 }
 
+function escapeHtml(input: string) {
+  return input
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
 function bytesToBase64(bytes: Uint8Array) {
   let binary = ''
   const blockSize = 0x8000
@@ -1414,8 +1423,12 @@ function AccountModal({ editingAccountId, provider, setProvider, providerDefinit
 
 function ComposeModal({ accountId, onClose, onSent, onError }: { accountId?: string; onClose: () => void; onSent: () => void; onError: (message: string) => void }) {
   const [to, setTo] = useState('')
+  const [cc, setCc] = useState('')
+  const [bcc, setBcc] = useState('')
+  const [showCopyFields, setShowCopyFields] = useState(false)
   const [subject, setSubject] = useState('')
   const [body, setBody] = useState('')
+  const [htmlMode, setHtmlMode] = useState(false)
   const [attachments, setAttachments] = useState<File[]>([])
   const [isSending, setSending] = useState(false)
   const [uploadingName, setUploadingName] = useState('')
@@ -1500,8 +1513,11 @@ function ComposeModal({ accountId, onClose, onSent, onError }: { accountId?: str
         await invoke('mail.send', {
           accountId,
           to: to.trim(),
+          ...(cc.trim() ? { cc: cc.trim() } : {}),
+          ...(bcc.trim() ? { bcc: bcc.trim() } : {}),
           subject: subject.trim() || '(无主题)',
           textBody: body,
+          ...(htmlMode && body.trim() ? { htmlBody: `<div>${escapeHtml(body).replace(/\r?\n/g, '<br>')}</div>` } : {}),
           ...(uploadIds.length ? { attachmentIds: uploadIds } : {}),
         })
       } else {
@@ -1517,7 +1533,7 @@ function ComposeModal({ accountId, onClose, onSent, onError }: { accountId?: str
     }
   }
 
-  return <motion.div className="modal-backdrop compose-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="compose-modal" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1 }} exit={{ opacity: 0, y: 20 }}><div className="compose-header"><strong>新邮件</strong><div><TooltipButton label="最小化撰写窗口"><span className="window-minimize" /></TooltipButton><TooltipButton label="关闭撰写窗口" onClick={onClose}><Icon name="close" size={17} /></TooltipButton></div></div><label>收件人<input autoFocus value={to} onChange={(event) => setTo(event.target.value)} placeholder="name@example.com" /></label><label>主题<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="主题" /></label><textarea className="compose-body" value={body} onChange={(event) => setBody(event.target.value)} placeholder="写下你的邮件…" />{attachments.length > 0 && <div className="compose-attachments" aria-label="待发送附件">{attachments.map((file, index) => <div className="compose-attachment" key={file.name + '-' + file.size + '-' + index}><span>{file.name}</span><small>{Math.max(1, Math.round(file.size / 1024))} KB</small><button type="button" onClick={() => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))} aria-label={'移除附件 ' + file.name}>×</button></div>)}</div>}{uploadingName && <div className="compose-uploading" aria-live="polite"><Icon name="rotate" size={14} />{uploadingName}</div>}<div className="compose-footer"><div><TooltipButton label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={19} /></TooltipButton><input ref={fileInputRef} type="file" multiple hidden onChange={addFiles} /><TooltipButton label="插入图片" onClick={() => fileInputRef.current?.click()}><Icon name="image" size={19} /></TooltipButton><TooltipButton label="格式"><span className="reply-a">A</span></TooltipButton></div><button type="button" className="gradient-button" onClick={send} disabled={isSending}>{isSending ? (uploadingName || '发送中…') : '发送'}<Icon name="send" size={17} /></button></div></motion.div></motion.div>
+  return <motion.div className="modal-backdrop compose-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="compose-modal" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1 }} exit={{ opacity: 0, y: 20 }}><div className="compose-header"><strong>新邮件</strong><div><TooltipButton label="最小化撰写窗口"><span className="window-minimize" /></TooltipButton><TooltipButton label="关闭撰写窗口" onClick={onClose}><Icon name="close" size={17} /></TooltipButton></div></div><div className="compose-recipient-row"><label>收件人<input autoFocus value={to} onChange={(event) => setTo(event.target.value)} placeholder="name@example.com，可用逗号分隔多个地址" /></label><button type="button" className="copy-fields-button" onClick={() => setShowCopyFields((value) => !value)} aria-expanded={showCopyFields}>{showCopyFields ? '隐藏抄送' : '抄送 / 密送'}</button></div>{showCopyFields && <><label>抄送<input value={cc} onChange={(event) => setCc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label><label>密送<input value={bcc} onChange={(event) => setBcc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label></>}<label>主题<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="主题" /></label><textarea className="compose-body" value={body} onChange={(event) => setBody(event.target.value)} placeholder={htmlMode ? '输入内容，将以 HTML + 纯文本双格式发送…' : '写下你的邮件…'} />{htmlMode && <div className="compose-format-note"><Icon name="grid" size={14} />此邮件将附带安全的 HTML 版本，同时保留纯文本版本</div>}{attachments.length > 0 && <div className="compose-attachments" aria-label="待发送附件">{attachments.map((file, index) => <div className="compose-attachment" key={file.name + '-' + file.size + '-' + index}><span>{file.name}</span><small>{Math.max(1, Math.round(file.size / 1024))} KB</small><button type="button" onClick={() => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))} aria-label={'移除附件 ' + file.name}>×</button></div>)}</div>}{uploadingName && <div className="compose-uploading" aria-live="polite"><Icon name="rotate" size={14} />{uploadingName}</div>}<div className="compose-footer"><div><TooltipButton label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={19} /></TooltipButton><input ref={fileInputRef} type="file" multiple hidden onChange={addFiles} /><TooltipButton label="插入图片" onClick={() => fileInputRef.current?.click()}><Icon name="image" size={19} /></TooltipButton><TooltipButton label={htmlMode ? '关闭 HTML 格式' : '启用 HTML 格式'} active={htmlMode} onClick={() => setHtmlMode((value) => !value)}><span className="reply-a">A</span></TooltipButton></div><button type="button" className="gradient-button" onClick={send} disabled={isSending}>{isSending ? (uploadingName || '发送中…') : '发送'}<Icon name="send" size={17} /></button></div></motion.div></motion.div>
 }
 
 export default App

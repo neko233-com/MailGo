@@ -418,6 +418,7 @@ fn sync_folder_latest(
 /// Fetch one older page for a folder and merge it into the encrypted local cache. The cursor is
 /// the oldest cached UID; using UID ranges keeps pagination stable when new mail arrives while a
 /// user is scrolling through a mailbox.
+#[allow(clippy::too_many_arguments)]
 pub fn sync_folder_page(
     account_id: &str,
     profile: ProviderProfile,
@@ -455,6 +456,7 @@ pub fn sync_folder_page(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_folder_page_once(
     account_id: &str,
     profile: ProviderProfile,
@@ -805,6 +807,7 @@ pub fn load_mailbox_for_folder(
     account_id: &str,
     folder: &str,
 ) -> Result<Option<CachedMailbox>> {
+    validate_mailbox_name(folder)?;
     let directory = cache_root.join(safe_component(account_id));
     let encrypted_path = directory.join(cache_file_name(folder));
     let legacy_path = directory.join("inbox.json");
@@ -1532,6 +1535,8 @@ fn safe_component(value: &str) -> String {
         .collect::<String>();
     if safe.is_empty() {
         "account".into()
+    } else if safe == "." || safe == ".." {
+        "_reserved_".into()
     } else {
         safe
     }
@@ -1676,6 +1681,8 @@ mod tests {
     fn cache_component_cannot_escape_account_directory() {
         assert_eq!(safe_component("../../secret"), ".._.._secret");
         assert_eq!(safe_component("account-1"), "account-1");
+        assert_ne!(safe_component("."), ".");
+        assert_ne!(safe_component(".."), "..");
     }
 
     #[test]

@@ -39,6 +39,10 @@ The repository is deliberately split into a real desktop UI foundation and provi
 33. Credential, configuration, and IMAP failures now persist an offline or reauthorization-needed account status across manual sync, first sync, background sync, and restart; the desktop renderer refreshes those statuses while the tray scheduler continues running.
 34. Advertising classification now has a persisted user-controlled suppression mode: normal lists can hide classified ads while Apple Connect security mail remains visible and Apple/other advertising remains reachable through smart categories.
 
+35. Outgoing mail now accepts bounded To/CC/BCC recipient lists and can send an escaped HTML alternative alongside the plain-text body; native recipient parsing rejects empty or malformed addresses before SMTP transport.
+
+36. Cache-reading IPC now verifies account ownership, account IDs reject filesystem traversal segments, custom IMAP/SMTP hosts reject control characters and path separators, and mailbox cache reads validate folder names before deriving paths.
+
 ## Remaining production acceptance work
 
 - Provider-specific incremental delta sync beyond the resumable UID-page path.

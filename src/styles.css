@@ -383,10 +383,16 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .compose-modal { width: min(600px, calc(100vw - 60px)); overflow: hidden; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
 .compose-header { height: 48px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px 0 17px; border-bottom: 1px solid var(--line); color: var(--text); background: var(--surface-strong); }
 .compose-header > div { display: flex; }
+.compose-recipient-row { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--line); }
+.compose-recipient-row > label { flex: 1; }
+.copy-fields-button { flex: 0 0 auto; margin-right: 14px; color: var(--accent); background: transparent; font-size: 11px; white-space: nowrap; }
 .compose-modal > label { display: flex; align-items: center; gap: 9px; height: 48px; padding: 0 17px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11px; }
+.compose-recipient-row > label { display: flex; align-items: center; gap: 9px; height: 48px; padding: 0 0 0 17px; color: var(--muted); font-size: 11px; }
 .compose-modal > label input { height: 30px; padding: 0; border: 0; background: transparent; box-shadow: none; font-size: 12px; }
+.compose-recipient-row input { height: 30px; padding: 0; border: 0; background: transparent; box-shadow: none; font-size: 12px; }
 .compose-body { width: 100%; min-height: 245px; display: block; resize: vertical; padding: 17px; border: 0; outline: 0; color: var(--text); background: transparent; font-size: 13px; line-height: 1.7; }
 .compose-body::placeholder { color: var(--muted); }
+.compose-format-note { display: flex; align-items: center; gap: 6px; padding: 0 17px 10px; color: var(--accent); font-size: 11px; }
 .compose-attachments { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 17px 10px; }
 .compose-attachment { min-width: 0; display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: 7px; color: var(--muted-strong); background: var(--surface-strong); font-size: 11px; }
 .compose-attachment span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

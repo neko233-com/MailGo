@@ -155,6 +155,8 @@ pub fn profile_for(provider: ProviderKind) -> Result<ProviderProfile> {
 }
 
 pub fn profile_for_custom(settings: &CustomConnectionSettings) -> Result<ProviderProfile> {
+    validate_host(&settings.imap_host, "IMAP")?;
+    validate_host(&settings.smtp_host, "SMTP")?;
     if settings.imap_host.trim().is_empty() || settings.smtp_host.trim().is_empty() {
         return Err(anyhow!("custom IMAP/SMTP hosts are required"));
     }
@@ -176,6 +178,21 @@ pub fn profile_for_custom(settings: &CustomConnectionSettings) -> Result<Provide
         authentication: settings.authentication,
         supports_oauth: settings.authentication == Authentication::OAuth2,
     })
+}
+
+fn validate_host(host: &str, protocol: &str) -> Result<()> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err(anyhow!("custom {protocol} host is required"));
+    }
+    if host.len() > 255
+        || host.chars().any(|character| {
+            character.is_control() || character.is_whitespace() || character == '/'
+        })
+    {
+        return Err(anyhow!("custom {protocol} host is invalid"));
+    }
+    Ok(())
 }
 
 pub fn validate_email(email: &str) -> Result<()> {
@@ -231,5 +248,19 @@ mod tests {
         assert_eq!(profile.imap.port, 143);
         assert_eq!(profile.imap.security, TransportSecurity::StartTls);
         assert_eq!(profile.smtp.port, 587);
+    }
+
+    #[test]
+    fn custom_profile_rejects_unsafe_hosts() {
+        let settings = CustomConnectionSettings {
+            imap_host: "imap.example.com\r\nX-Injected: value".into(),
+            imap_port: 993,
+            imap_security: TransportSecurity::Tls,
+            smtp_host: "smtp.example.com".into(),
+            smtp_port: 465,
+            smtp_security: TransportSecurity::Tls,
+            authentication: Authentication::Password,
+        };
+        assert!(profile_for_custom(&settings).is_err());
     }
 }
