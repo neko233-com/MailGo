@@ -42,8 +42,15 @@ function sanitizeHtml(input: string) {
   documentParser.querySelectorAll('script, iframe, object, embed, form, link, meta, style').forEach((node) => node.remove())
   documentParser.querySelectorAll('*').forEach((node) => {
     Array.from(node.attributes).forEach((attribute) => {
-      if (attribute.name.toLowerCase().startsWith('on')) node.removeAttribute(attribute.name)
-      if (['href', 'src', 'action'].includes(attribute.name.toLowerCase()) && attribute.value.toLowerCase().startsWith('javascript:')) {
+      const name = attribute.name.toLowerCase()
+      const value = attribute.value.trim().replace(/[\u0000-\u0020]+/g, '')
+      const isSafeUrl = name === 'href'
+        ? /^(https:\/\/|mailto:|#)/i.test(value)
+        : name === 'src'
+          ? /^(https:\/\/|cid:|data:image\/(?:png|gif|jpe?g|webp);base64,)/i.test(value)
+          : false
+      if (name.startsWith('on') || ['style', 'srcdoc', 'srcset', 'ping', 'formaction', 'xlink:href'].includes(name)) node.removeAttribute(attribute.name)
+      if (['href', 'src', 'action'].includes(name) && !isSafeUrl) {
         node.removeAttribute(attribute.name)
       }
     })
