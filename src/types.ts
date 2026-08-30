@@ -115,6 +115,31 @@ export interface NativeAttachmentResponse {
   dataBase64: string
 }
 
+export interface NativeAttachmentStartResponse {
+  downloadId: string
+  fileName: string
+  contentType: string
+  size: number
+  chunkSize: number
+}
+
+export interface NativeAttachmentChunkResponse {
+  downloadId: string
+  offset: number
+  nextOffset: number
+  done: boolean
+  dataBase64: string
+}
+
+export interface NativeDeviceStartResponse {
+  sessionId: string
+  userCode: string
+  verificationUri: string
+  message?: string
+  expiresIn: number
+  interval: number
+}
+
 export interface NativeCachedMessage {
   id: string
   accountId: string

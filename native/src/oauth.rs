@@ -28,6 +28,9 @@ pub struct PendingSession {
     pub redirect_uri: String,
     pub token_endpoint: String,
     pub created_at: u64,
+    pub device_code: Option<String>,
+    pub device_expires_at: Option<u64>,
+    pub device_interval: u64,
     callback: Arc<Mutex<Option<CallbackResult>>>,
 }
 
@@ -44,6 +47,30 @@ pub struct StartResponse {
     pub authorization_url: String,
     pub redirect_uri: String,
     pub expires_in: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceStartResponse {
+    pub session_id: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub message: Option<String>,
+    pub expires_in: u64,
+    pub interval: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum DevicePollResult {
+    Pending { retry_after: u64 },
+    Complete { credential: String },
+}
+
+pub fn is_expired(session: &PendingSession) -> bool {
+    let expires_at = session
+        .device_expires_at
+        .unwrap_or_else(|| session.created_at.saturating_add(SESSION_TTL_SECONDS));
+    now_seconds() >= expires_at
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +97,7 @@ struct ProviderOAuthConfig {
     authorization_endpoint: &'static str,
     token_endpoint: &'static str,
     scopes: &'static str,
+    device_authorization_endpoint: Option<&'static str>,
 }
 
 pub fn start(provider: ProviderKind, email: &str) -> Result<(PendingSession, StartResponse)> {
@@ -102,6 +130,9 @@ pub fn start(provider: ProviderKind, email: &str) -> Result<(PendingSession, Sta
         token_endpoint: config.token_endpoint.to_string(),
         created_at: now,
         callback,
+        device_code: None,
+        device_expires_at: None,
+        device_interval: 0,
     };
     Ok((
         session,
@@ -112,6 +143,170 @@ pub fn start(provider: ProviderKind, email: &str) -> Result<(PendingSession, Sta
             expires_in: SESSION_TTL_SECONDS,
         },
     ))
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceAuthorizationResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: Option<String>,
+    verification_uri_complete: Option<String>,
+    expires_in: u64,
+    interval: Option<u64>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceTokenError {
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+pub fn start_device(
+    provider: ProviderKind,
+    email: &str,
+) -> Result<(PendingSession, DeviceStartResponse)> {
+    let config = provider_config(provider)?;
+    let endpoint = config
+        .device_authorization_endpoint
+        .ok_or_else(|| anyhow!("this provider does not expose a device authorization flow"))?;
+    let mut form = Serializer::new(String::new());
+    form.append_pair("client_id", &config.client_id)
+        .append_pair("scope", config.scopes);
+    let response = ureq::post(endpoint)
+        .set("Accept", "application/json")
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .send_string(&form.finish())
+        .map_err(|error| match error {
+            ureq::Error::Status(429, _) => anyhow!("OAuth device authorization is rate limited"),
+            ureq::Error::Status(code, _) => {
+                anyhow!("OAuth device authorization endpoint returned HTTP {code}")
+            }
+            ureq::Error::Transport(_) => {
+                anyhow!("OAuth device authorization endpoint is unavailable")
+            }
+        })?;
+    let device: DeviceAuthorizationResponse = response
+        .into_json()
+        .context("OAuth device response was not valid JSON")?;
+    if device.device_code.trim().is_empty() || device.user_code.trim().is_empty() {
+        return Err(anyhow!(
+            "OAuth device response did not contain a usable code"
+        ));
+    }
+    let expires_in = device.expires_in.max(60);
+    let interval = device.interval.unwrap_or(5).max(5);
+    let session_id = random_string(24);
+    let now = now_seconds();
+    let verification_uri = device
+        .verification_uri_complete
+        .or(device.verification_uri)
+        .ok_or_else(|| anyhow!("OAuth device response did not contain a verification URL"))?;
+    let session = PendingSession {
+        id: session_id.clone(),
+        provider,
+        email: email.trim().to_string(),
+        state: String::new(),
+        code_verifier: String::new(),
+        client_id: config.client_id,
+        client_secret: config.client_secret,
+        redirect_uri: String::new(),
+        token_endpoint: config.token_endpoint.to_string(),
+        created_at: now,
+        device_code: Some(device.device_code),
+        device_expires_at: Some(now.saturating_add(expires_in)),
+        device_interval: interval,
+        callback: Arc::new(Mutex::new(None)),
+    };
+    Ok((
+        session,
+        DeviceStartResponse {
+            session_id,
+            user_code: device.user_code,
+            verification_uri,
+            message: device.message,
+            expires_in,
+            interval,
+        },
+    ))
+}
+
+pub fn poll_device(session: &PendingSession) -> Result<DevicePollResult> {
+    let device_code = session
+        .device_code
+        .as_deref()
+        .ok_or_else(|| anyhow!("OAuth session is not a device flow"))?;
+    if session
+        .device_expires_at
+        .map(|expires_at| now_seconds() >= expires_at)
+        .unwrap_or(true)
+    {
+        return Err(anyhow!("OAuth device authorization expired; start again"));
+    }
+    let mut form = Serializer::new(String::new());
+    form.append_pair("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
+        .append_pair("device_code", device_code)
+        .append_pair("client_id", &session.client_id);
+    if let Some(client_secret) = &session.client_secret {
+        form.append_pair("client_secret", client_secret);
+    }
+    let response = match ureq::post(&session.token_endpoint)
+        .set("Accept", "application/json")
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .send_string(&form.finish())
+    {
+        Ok(response) => response,
+        Err(ureq::Error::Status(400, response)) => {
+            let error = response.into_json::<DeviceTokenError>().ok();
+            let error_code = error.as_ref().and_then(|error| error.error.clone());
+            let description = error.and_then(|error| error.error_description);
+            match error_code {
+                Some(error) if error == "authorization_pending" => {
+                    return Ok(DevicePollResult::Pending {
+                        retry_after: session.device_interval,
+                    })
+                }
+                Some(error) if error == "slow_down" => {
+                    return Ok(DevicePollResult::Pending {
+                        retry_after: session.device_interval.saturating_add(5),
+                    })
+                }
+                Some(error) if error == "expired_token" => {
+                    return Err(anyhow!("OAuth device authorization expired; start again"))
+                }
+                Some(error) if error == "access_denied" => {
+                    return Err(anyhow!("OAuth device authorization was denied"))
+                }
+                Some(error) => {
+                    return Err(anyhow!(
+                        "OAuth device authorization failed: {}",
+                        description.unwrap_or(error)
+                    ))
+                }
+                None => return Err(anyhow!("OAuth device authorization was rejected")),
+            }
+        }
+        Err(ureq::Error::Status(429, response)) => {
+            return Ok(DevicePollResult::Pending {
+                retry_after: parse_retry_after(
+                    response.header("Retry-After"),
+                    session.device_interval.saturating_add(15),
+                ),
+            })
+        }
+        Err(ureq::Error::Status(code, _)) => {
+            return Err(anyhow!("OAuth device token endpoint returned HTTP {code}"))
+        }
+        Err(ureq::Error::Transport(_)) => {
+            return Err(anyhow!("OAuth device token endpoint is unavailable"))
+        }
+    };
+    let token: TokenResponse = response
+        .into_json()
+        .context("OAuth device token response was not valid JSON")?;
+    Ok(DevicePollResult::Complete {
+        credential: serialize_token(token)?,
+    })
 }
 
 pub fn take_callback(session: &PendingSession) -> Result<Option<(String, Option<String>)>> {
@@ -170,16 +365,25 @@ pub fn exchange_code(
             "OAuth token response did not contain an access token"
         ));
     }
+    serialize_token(token)
+}
+
+fn serialize_token(token: TokenResponse) -> Result<String> {
+    if token.access_token.trim().is_empty() {
+        return Err(anyhow!(
+            "OAuth token response did not contain an access token"
+        ));
+    }
     let expires_at = token
         .expires_in
         .map(|seconds| now_seconds().saturating_add(seconds));
-    let credential = StoredCredential {
+    serde_json::to_string(&StoredCredential {
         access_token: token.access_token,
         refresh_token: token.refresh_token,
         token_type: token.token_type.unwrap_or_else(|| "Bearer".into()),
         expires_at,
-    };
-    serde_json::to_string(&credential).context("serialize OAuth credential")
+    })
+    .context("serialize OAuth credential")
 }
 
 pub fn access_token(raw: &str) -> String {
@@ -249,6 +453,7 @@ fn provider_config(provider: ProviderKind) -> Result<ProviderOAuthConfig> {
             authorization_endpoint: "https://accounts.google.com/o/oauth2/v2/auth",
             token_endpoint: "https://oauth2.googleapis.com/token",
             scopes: "openid email https://mail.google.com/",
+            device_authorization_endpoint: None,
         }),
         ProviderKind::Outlook => Ok(ProviderOAuthConfig {
             client_id: required_env("MAILGO_OUTLOOK_CLIENT_ID")?,
@@ -258,6 +463,7 @@ fn provider_config(provider: ProviderKind) -> Result<ProviderOAuthConfig> {
             authorization_endpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
             token_endpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
             scopes: "openid email offline_access https://outlook.office365.com/IMAP.AccessAsUser.All https://outlook.office365.com/SMTP.Send",
+            device_authorization_endpoint: Some("https://login.microsoftonline.com/common/oauth2/v2.0/devicecode"),
         }),
         _ => Err(anyhow!("this provider does not expose a MailGo OAuth flow")),
     }
@@ -276,6 +482,13 @@ fn optional_env(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn parse_retry_after(value: Option<&str>, fallback: u64) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| seconds.clamp(5, 3600))
+        .unwrap_or(fallback.clamp(5, 3600))
 }
 
 fn spawn_loopback_listener(redirect_uri: &str, callback: Arc<Mutex<Option<CallbackResult>>>) {
@@ -413,5 +626,13 @@ mod tests {
             parse_callback("/wrong?code=abc&state=xyz", "/oauth/callback"),
             CallbackResult::Error(_)
         ));
+    }
+
+    #[test]
+    fn retry_after_is_bounded_and_has_a_safe_fallback() {
+        assert_eq!(parse_retry_after(Some("12"), 5), 12);
+        assert_eq!(parse_retry_after(Some("1"), 5), 5);
+        assert_eq!(parse_retry_after(Some("99999"), 5), 3600);
+        assert_eq!(parse_retry_after(Some("invalid"), 15), 15);
     }
 }

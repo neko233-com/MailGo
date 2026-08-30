@@ -195,8 +195,8 @@ fn build_message(
         text_body,
         html_body,
         attachments,
-        // Raw MIME and attachment bytes are intentionally not claimed as cached until the
-        // streaming attachment store is enabled. The sanitized body remains offline-readable.
+        // Raw MIME is never exposed to the renderer; attachment bytes are stored separately in
+        // the encrypted cache when a full message fetch populates them.
         raw_path: None,
     })
 }

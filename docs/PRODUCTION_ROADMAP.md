@@ -13,16 +13,18 @@ The repository is deliberately split into a real desktop UI foundation and provi
 7. Windows mailbox caches are protected with DPAPI, account credentials use Windows Credential Manager, and metadata exports stay redacted.
 8. Windows tray lifecycle, single-instance activation, crash-safe state recovery, and a five-minute background sync scheduler are implemented without blocking the rdesktop event loop.
 9. Native OAuth2 + PKCE exchange and refresh-token rotation are available when registered client IDs are provided through environment configuration; codes and tokens remain outside metadata.
-10. Provider folder mappings, DPAPI-protected attachment storage, inline CID image embedding, and an offline flag-mutation queue are implemented.
-11. Bounded exponential retry is applied to transient IMAP synchronization failures while authentication/configuration failures fail fast.
-12. Mailbox caches retain `UIDVALIDITY`, the oldest UID, and a continuation marker; `sync.page` fetches older UID ranges, merges them idempotently, and resets the affected cache when the server UID space changes.
-13. Background sync can emit a Windows tray notification for newly observed unread mail, with a persisted user-controlled notification policy.
+10. Outlook Device Flow is available in the account assistant with verification-page launch, user-code display, bounded polling, expiry handling, and in-memory handoff to the Windows credential store.
+11. Provider folder mappings, DPAPI-protected attachment storage, inline CID image embedding, and an offline flag-mutation queue are implemented.
+12. Bounded exponential retry is applied to transient and rate-limited IMAP synchronization failures while authentication/configuration failures fail fast.
+13. Mailbox caches retain `UIDVALIDITY`, the oldest UID, and a continuation marker; `sync.page` fetches older UID ranges, merges them idempotently, and resets the affected cache when the server UID space changes.
+14. Background sync can emit a Windows tray notification for newly observed unread mail, with a persisted user-controlled notification policy.
+15. Attachment downloads use a bounded chunked IPC protocol with explicit start/chunk/cancel commands; encrypted cache bytes never cross the WebView in one unbounded payload.
 
 ## Remaining production acceptance work
 
-- Device-flow UX, server rate-limit handling, and provider-specific incremental delta sync beyond the resumable UID-page path.
-- Attachment download progress/cancellation and richer MIME regression fixtures; the current path is bounded and encrypted but intentionally returns a single IPC payload.
-- Notification policy and tray integration tests on supported Windows versions.
+- Provider-specific incremental delta sync beyond the resumable UID-page path.
+- Provider-specific rate-limit headers/backoff and richer MIME regression fixtures.
+- Tray integration tests on supported Windows versions.
 - Encrypted, user-confirmed portable secret transfer if MailGo ever adds credential migration.
 
 Production acceptance requires integration tests against disposable provider fixtures, a Windows WebView2 smoke test, migration tests for every persisted-state schema, and a security review of HTML/MIME parsing before shipping.

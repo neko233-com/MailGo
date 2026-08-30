@@ -3,10 +3,11 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Icon, type IconName } from './components/Icon'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
 import { invoke, readNativeState } from './lib/ipc'
-import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentResponse, NativeCachedMessage, NativeMailboxResponse, NativeMessageResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
+import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeMailboxResponse, NativeMessageResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 type ToastTone = 'info' | 'success' | 'error'
 type Toast = { id: number; message: string; tone: ToastTone }
+type DeviceFlowState = { sessionId: string; userCode: string; verificationUri: string; message?: string; retryAfter: number; status: 'pending' | 'complete' | 'error' }
 
 const smartCategories: { id: SmartCategory; label: string; icon: IconName; color: string }[] = [
   { id: 'apple-connect', label: 'Apple Connect', icon: 'shieldCheck', color: '#9ca6ba' },
@@ -183,6 +184,7 @@ function App() {
   const [accountEmail, setAccountEmail] = useState('')
   const [authorizationCode, setAuthorizationCode] = useState('')
   const [oauthSessionId, setOauthSessionId] = useState('')
+  const [deviceFlow, setDeviceFlow] = useState<DeviceFlowState | null>(null)
   const [showAuthorizationCode, setShowAuthorizationCode] = useState(false)
   const [customCss, setCustomCss] = useState(() => window.localStorage.getItem('mailgo-custom-css') ?? '')
   const [customImapHost, setCustomImapHost] = useState('imap.example.com')
@@ -192,8 +194,15 @@ function App() {
   const [customSmtpPort, setCustomSmtpPort] = useState('465')
   const [customSmtpSecurity, setCustomSmtpSecurity] = useState('tls')
   const [customAuthentication, setCustomAuthentication] = useState('password')
+  const [attachmentProgress, setAttachmentProgress] = useState<Record<string, number>>({})
   const importInputRef = useRef<HTMLInputElement>(null)
+  const attachmentCancelsRef = useRef(new Map<string, () => void>())
   const isNativeRuntime = Boolean(window.ipc?.postMessage)
+
+  useEffect(() => () => {
+    attachmentCancelsRef.current.forEach((cancel) => cancel())
+    attachmentCancelsRef.current.clear()
+  }, [])
 
   const pushToast = (message: string, tone: ToastTone = 'info') => {
     const id = Date.now() + Math.random()
@@ -205,7 +214,40 @@ function App() {
     setProvider(nextProvider)
     setCustomAuthentication(nextProvider === 'outlook' ? 'oauth2' : nextProvider === 'other' ? 'password' : 'app-password')
     setOauthSessionId('')
+    setDeviceFlow(null)
   }
+
+  useEffect(() => {
+    if (!isNativeRuntime || !deviceFlow || deviceFlow.status !== 'pending') return
+    let cancelled = false
+    let timer: number | undefined
+    const poll = async () => {
+      try {
+        const result = await invoke<{ status: 'pending' | 'complete'; retryAfter?: number }>('auth.device.poll', { sessionId: deviceFlow.sessionId }, 30_000)
+        if (cancelled) return
+        if (result.status === 'complete') {
+          setDeviceFlow((current) => current?.sessionId === deviceFlow.sessionId ? { ...current, status: 'complete' } : current)
+          pushToast('Outlook 设备授权已完成，可以开始同步', 'success')
+          return
+        }
+        timer = window.setTimeout(poll, Math.max(5, result.retryAfter ?? deviceFlow.retryAfter) * 1000)
+      } catch (error) {
+        if (cancelled) return
+        const message = error instanceof Error ? error.message : ''
+        if (/expired|denied|missing|rejected/i.test(message)) {
+          setDeviceFlow((current) => current?.sessionId === deviceFlow.sessionId ? { ...current, status: 'error', message: message || '设备授权已失效，请重新开始。' } : current)
+          pushToast(message || '设备授权已失效，请重新开始', 'error')
+          return
+        }
+        timer = window.setTimeout(poll, 10_000)
+      }
+    }
+    timer = window.setTimeout(poll, Math.max(5, deviceFlow.retryAfter) * 1000)
+    return () => {
+      cancelled = true
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [deviceFlow?.sessionId, deviceFlow?.status, isNativeRuntime])
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme
@@ -320,28 +362,82 @@ function App() {
     pushToast(nextStarred ? '已添加到星标' : '已移出星标', 'success')
   }
 
+  const cancelAttachment = (attachmentId: string) => {
+    attachmentCancelsRef.current.get(attachmentId)?.()
+  }
+
   const downloadAttachment = async (attachment: MailAttachment) => {
     if (!isNativeRuntime || selectedMail.nativeUid == null || attachment.nativeIndex == null) {
       pushToast(`${attachment.name} 已加入下载队列`, 'success')
       return
     }
+    if (attachmentCancelsRef.current.has(attachment.id)) {
+      cancelAttachment(attachment.id)
+      return
+    }
+    const controller = new AbortController()
+    let downloadId: string | undefined
+    const cancel = () => {
+      controller.abort()
+      if (downloadId) void invoke('mail.attachment.cancel', { downloadId }).catch(() => undefined)
+    }
+    attachmentCancelsRef.current.set(attachment.id, cancel)
+    setAttachmentProgress((current) => ({ ...current, [attachment.id]: 0 }))
     try {
-      const response = await invoke<NativeAttachmentResponse>('mail.attachment', {
+      const start = await invoke<NativeAttachmentStartResponse>('mail.attachment.start', {
         accountId: selectedMail.accountId,
         folder: selectedMail.nativeFolder ?? 'INBOX',
         uid: selectedMail.nativeUid,
         index: attachment.nativeIndex,
       }, 60_000)
-      const binary = Uint8Array.from(atob(response.dataBase64), (character) => character.charCodeAt(0))
-      const url = URL.createObjectURL(new Blob([binary], { type: response.contentType }))
+      downloadId = start.downloadId
+      if (controller.signal.aborted) {
+        void invoke('mail.attachment.cancel', { downloadId }).catch(() => undefined)
+        throw new Error('下载已取消')
+      }
+      let offset = 0
+      let total = 0
+      const parts: Uint8Array[] = []
+      while (true) {
+        if (controller.signal.aborted) throw new Error('下载已取消')
+        const chunk = await invoke<NativeAttachmentChunkResponse>('mail.attachment.chunk', { downloadId, offset }, 60_000)
+        if (chunk.downloadId !== start.downloadId || chunk.offset !== offset || chunk.nextOffset < offset || chunk.nextOffset > start.size || (!chunk.done && chunk.nextOffset === offset)) {
+          throw new Error('附件传输响应无效')
+        }
+        const bytes = Uint8Array.from(atob(chunk.dataBase64), (character) => character.charCodeAt(0))
+        parts.push(bytes)
+        total += bytes.length
+        if (total > start.size || chunk.nextOffset - offset !== bytes.length) {
+          throw new Error('附件传输大小校验失败')
+        }
+        offset = chunk.nextOffset
+        setAttachmentProgress((current) => ({ ...current, [attachment.id]: start.size ? Math.min(100, Math.round((offset / start.size) * 100)) : 100 }))
+        if (chunk.done) break
+      }
+      const binary = new Uint8Array(total)
+      let writeOffset = 0
+      for (const part of parts) {
+        binary.set(part, writeOffset)
+        writeOffset += part.length
+      }
+      const url = URL.createObjectURL(new Blob([binary], { type: start.contentType }))
       const anchor = document.createElement('a')
       anchor.href = url
-      anchor.download = response.fileName
+      anchor.download = start.fileName
       anchor.click()
       URL.revokeObjectURL(url)
-      pushToast(`${response.fileName} 下载完成`, 'success')
+      pushToast(`${start.fileName} 下载完成`, 'success')
     } catch (error) {
-      pushToast(error instanceof Error ? error.message : '附件读取失败，请先打开邮件正文', 'error')
+      if (downloadId) void invoke('mail.attachment.cancel', { downloadId }).catch(() => undefined)
+      if (controller.signal.aborted) pushToast(`${attachment.name} 下载已取消`, 'info')
+      else pushToast(error instanceof Error ? error.message : '附件读取失败，请先打开邮件正文', 'error')
+    } finally {
+      attachmentCancelsRef.current.delete(attachment.id)
+      setAttachmentProgress((current) => {
+        const next = { ...current }
+        delete next[attachment.id]
+        return next
+      })
     }
   }
 
@@ -454,6 +550,24 @@ function App() {
   const handleOpenProvider = async () => {
     if (isNativeRuntime && customAuthentication === 'oauth2' && accountEmail.trim()) {
       try {
+        if (provider === 'outlook') {
+          const flow = await invoke<NativeDeviceStartResponse>('auth.device.start', {
+            provider,
+            email: accountEmail.trim(),
+          })
+          setOauthSessionId(flow.sessionId)
+          setDeviceFlow({
+            sessionId: flow.sessionId,
+            userCode: flow.userCode,
+            verificationUri: flow.verificationUri,
+            message: flow.message,
+            retryAfter: flow.interval,
+            status: 'pending',
+          })
+          window.open(flow.verificationUri, '_blank', 'noopener,noreferrer')
+          pushToast(`Outlook 设备码 ${flow.userCode} 已生成，完成验证后会自动检测`, 'info')
+          return
+        }
         const flow = await invoke<{ sessionId: string; authorizationUrl: string }>('auth.start', {
           provider,
           email: accountEmail.trim(),
@@ -490,6 +604,10 @@ function App() {
     }
     if (!authorizationCode.trim() && (customAuthentication !== 'oauth2' || !oauthSessionId)) {
       pushToast('请输入授权码，凭据只会交给本地安全存储', 'error')
+      return
+    }
+    if (customAuthentication === 'oauth2' && deviceFlow && deviceFlow.status !== 'complete' && !authorizationCode.trim()) {
+      pushToast('请先完成 Outlook 设备验证，完成后再开始同步', 'info')
       return
     }
     const id = `${provider}-${Date.now()}`
@@ -541,6 +659,7 @@ function App() {
     }
     setAuthorizationCode('')
     setOauthSessionId('')
+    setDeviceFlow(null)
     setAccountEmail('')
     setAccountModalOpen(false)
     setSelectedAccountId(id)
@@ -722,7 +841,7 @@ function App() {
               {selectedMail.hasHtml && <div className="content-mode-row"><span>此邮件包含富文本内容</span><button type="button" className="text-action" onClick={() => setHtmlMode((value) => !value)}>{isHtmlMode ? '查看纯文本' : '渲染 HTML'} <Icon name="grid" size={14} /></button></div>}
               {isHtmlMode && selectedMail.hasHtml ? <div className="html-rendered" dangerouslySetInnerHTML={{ __html: sanitizeHtml(selectedMail.htmlBody ?? initialHtml) }} /> : selectedMail.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
             </div>
-            {selectedMail.attachments && <div className="attachments"><div className="attachments-heading"><span><Icon name="paperclip" size={20} /> {selectedMail.attachments.length} 个附件</span><div><button type="button" onClick={() => { void Promise.all(selectedMail.attachments?.map(downloadAttachment) ?? []) }}><Icon name="download" size={17} /> 全部下载</button><button type="button" onClick={() => pushToast('正在保存到本地缓存', 'success')}><Icon name="cloud" size={17} /> 保存到云盘</button></div></div><div className="attachment-grid">{selectedMail.attachments.map((attachment) => <button type="button" className="attachment-card" key={attachment.id} onClick={() => { void downloadAttachment(attachment) }}><span className={`file-glyph file-${attachment.kind}`}>{attachment.kind === 'pdf' ? 'PDF' : attachment.kind === 'sheet' ? 'X' : 'FILE'}</span><span className="attachment-copy"><strong>{attachment.name}</strong><small>{attachment.size}</small></span><Icon name="download" size={17} /></button>)}</div></div>}
+            {selectedMail.attachments && <div className="attachments"><div className="attachments-heading"><span><Icon name="paperclip" size={20} /> {selectedMail.attachments.length} 个附件</span><div><button type="button" onClick={() => { void Promise.all(selectedMail.attachments?.map(downloadAttachment) ?? []) }}><Icon name="download" size={17} /> 全部下载</button><button type="button" onClick={() => pushToast('正在保存到本地缓存', 'success')}><Icon name="cloud" size={17} /> 保存到云盘</button></div></div><div className="attachment-grid">{selectedMail.attachments.map((attachment) => { const progress = attachmentProgress[attachment.id]; return <button type="button" className="attachment-card" key={attachment.id} onClick={() => { if (progress != null) cancelAttachment(attachment.id); else void downloadAttachment(attachment) }}><span className={`file-glyph file-${attachment.kind}`}>{attachment.kind === 'pdf' ? 'PDF' : attachment.kind === 'sheet' ? 'X' : 'FILE'}</span><span className="attachment-copy"><strong>{attachment.name}</strong><small>{progress != null ? `${progress}% · 点击取消` : attachment.size}</small></span><Icon name={progress != null ? 'close' : 'download'} size={17} /></button> })}</div></div>}
             <div className="reply-composer"><Avatar message={{ ...selectedMail, avatar: 'OC', accent: '#2a5596' }} size="sm" /><div className="reply-input" onClick={() => setComposeOpen(true)}>点击回复，或按 R 快速回复<div className="reply-tools"><span><Icon name="paperclip" size={19} /></span><span><Icon name="image" size={19} /></span><span className="reply-emoji">☺</span><span className="reply-a">A</span><button type="button" onClick={(event) => { event.stopPropagation(); setComposeOpen(true) }}>回复 <span>⌄</span></button></div></div></div>
           </div>
         </section>
@@ -745,14 +864,14 @@ function App() {
       </AnimatePresence>
 
       <AnimatePresence>{isComposeOpen && <ComposeModal accountId={selectedAccountId ?? accounts[0]?.id} onClose={() => setComposeOpen(false)} onSent={() => { setComposeOpen(false); pushToast('邮件已发送', 'success') }} onError={(message) => pushToast(message, 'error')} />}</AnimatePresence>
-      <AnimatePresence>{isAccountModalOpen && <AccountModal provider={provider} setProvider={changeProvider} providerDefinition={selectedProvider} accountEmail={accountEmail} setAccountEmail={setAccountEmail} authorizationCode={authorizationCode} setAuthorizationCode={setAuthorizationCode} showAuthorizationCode={showAuthorizationCode} setShowAuthorizationCode={setShowAuthorizationCode} customImapHost={customImapHost} setCustomImapHost={setCustomImapHost} customImapPort={customImapPort} setCustomImapPort={setCustomImapPort} customImapSecurity={customImapSecurity} setCustomImapSecurity={setCustomImapSecurity} customSmtpHost={customSmtpHost} setCustomSmtpHost={setCustomSmtpHost} customSmtpPort={customSmtpPort} setCustomSmtpPort={setCustomSmtpPort} customSmtpSecurity={customSmtpSecurity} setCustomSmtpSecurity={setCustomSmtpSecurity} customAuthentication={customAuthentication} setCustomAuthentication={setCustomAuthentication} onClose={() => setAccountModalOpen(false)} onOpenProvider={() => { void handleOpenProvider() }} onCopy={handleCopy} onAdd={handleAddAccount} />}</AnimatePresence>
+      <AnimatePresence>{isAccountModalOpen && <AccountModal provider={provider} setProvider={changeProvider} providerDefinition={selectedProvider} accountEmail={accountEmail} setAccountEmail={setAccountEmail} authorizationCode={authorizationCode} setAuthorizationCode={setAuthorizationCode} showAuthorizationCode={showAuthorizationCode} setShowAuthorizationCode={setShowAuthorizationCode} customImapHost={customImapHost} setCustomImapHost={setCustomImapHost} customImapPort={customImapPort} setCustomImapPort={setCustomImapPort} customImapSecurity={customImapSecurity} setCustomImapSecurity={setCustomImapSecurity} customSmtpHost={customSmtpHost} setCustomSmtpHost={setCustomSmtpHost} customSmtpPort={customSmtpPort} setCustomSmtpPort={setCustomSmtpPort} customSmtpSecurity={customSmtpSecurity} setCustomSmtpSecurity={setCustomSmtpSecurity} customAuthentication={customAuthentication} setCustomAuthentication={setCustomAuthentication} deviceFlow={deviceFlow} onClose={() => setAccountModalOpen(false)} onOpenProvider={() => { void handleOpenProvider() }} onCopy={handleCopy} onAdd={handleAddAccount} />}</AnimatePresence>
       <div className="toast-stack" aria-live="polite">{toasts.map((toast) => <motion.div key={toast.id} className={`toast toast-${toast.tone}`} initial={{ opacity: 0, y: 12, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 12 }}><Icon name={toast.tone === 'success' ? 'checkCircle' : toast.tone === 'error' ? 'info' : 'bell'} size={17} /><span>{toast.message}</span></motion.div>)}</div>
     </div>
   )
 }
 
-function AccountModal({ provider, setProvider, providerDefinition, accountEmail, setAccountEmail, authorizationCode, setAuthorizationCode, showAuthorizationCode, setShowAuthorizationCode, customImapHost, setCustomImapHost, customImapPort, setCustomImapPort, customImapSecurity, setCustomImapSecurity, customSmtpHost, setCustomSmtpHost, customSmtpPort, setCustomSmtpPort, customSmtpSecurity, setCustomSmtpSecurity, customAuthentication, setCustomAuthentication, onClose, onOpenProvider, onCopy, onAdd }: { provider: Provider; setProvider: (provider: Provider) => void; providerDefinition: ReturnType<typeof providerFor>; accountEmail: string; setAccountEmail: (value: string) => void; authorizationCode: string; setAuthorizationCode: (value: string) => void; showAuthorizationCode: boolean; setShowAuthorizationCode: (value: boolean) => void; customImapHost: string; setCustomImapHost: (value: string) => void; customImapPort: string; setCustomImapPort: (value: string) => void; customImapSecurity: string; setCustomImapSecurity: (value: string) => void; customSmtpHost: string; setCustomSmtpHost: (value: string) => void; customSmtpPort: string; setCustomSmtpPort: (value: string) => void; customSmtpSecurity: string; setCustomSmtpSecurity: (value: string) => void; customAuthentication: string; setCustomAuthentication: (value: string) => void; onClose: () => void; onOpenProvider: () => void; onCopy: () => void; onAdd: () => void }) {
-  return <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="account-modal" initial={{ opacity: 0, y: 14, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 8, scale: 0.98 }} role="dialog" aria-modal="true" aria-labelledby="add-account-title"><div className="modal-header"><div><Icon name="user" size={21} /><h2 id="add-account-title">添加账户</h2></div><TooltipButton label="关闭" onClick={onClose}><Icon name="close" size={19} /></TooltipButton></div><div className="account-modal-body"><div className="provider-chooser">{providerDefinitions.map((item) => <button key={item.id} type="button" className={`provider-option ${provider === item.id ? 'is-selected' : ''}`} onClick={() => setProvider(item.id)}><ProviderMark provider={item.id} size="md" /><span><strong>{item.label}</strong><small>{item.description}</small></span>{provider === item.id && <Icon name="checkCircle" size={19} />}</button>)}</div><div className="account-form"><label>邮箱地址<input type="email" value={accountEmail} onChange={(event) => setAccountEmail(event.target.value)} placeholder={provider === 'qq' ? 'yourname@qq.com' : 'name@example.com'} autoFocus /></label><label><span className="label-with-action">授权码<button type="button" onClick={onOpenProvider}>如何获取授权码？ <Icon name="link" size={13} /></button></span><span className="secret-input"><input type={showAuthorizationCode ? 'text' : 'password'} value={authorizationCode} onChange={(event) => setAuthorizationCode(event.target.value)} placeholder="粘贴邮箱授权码" /><button type="button" onClick={() => setShowAuthorizationCode(!showAuthorizationCode)} aria-label={showAuthorizationCode ? '隐藏授权码' : '显示授权码'}><Icon name={showAuthorizationCode ? 'eyeSlash' : 'eye'} size={17} /></button><button type="button" onClick={onCopy} aria-label="复制授权码"><Icon name="copy" size={17} /></button></span></label>{provider === 'other' && <div className="custom-transport-fields"><div className="transport-heading"><Icon name="settings" size={15} />自定义服务器</div><div className="transport-row"><label>IMAP 主机<input value={customImapHost} onChange={(event) => setCustomImapHost(event.target.value)} placeholder="imap.example.com" /></label><label>端口<input type="number" min="1" max="65535" value={customImapPort} onChange={(event) => setCustomImapPort(event.target.value)} /></label><label>安全<input value={customImapSecurity} onChange={(event) => setCustomImapSecurity(event.target.value)} placeholder="tls / starttls" /></label></div><div className="transport-row"><label>SMTP 主机<input value={customSmtpHost} onChange={(event) => setCustomSmtpHost(event.target.value)} placeholder="smtp.example.com" /></label><label>端口<input type="number" min="1" max="65535" value={customSmtpPort} onChange={(event) => setCustomSmtpPort(event.target.value)} /></label><label>安全<input value={customSmtpSecurity} onChange={(event) => setCustomSmtpSecurity(event.target.value)} placeholder="tls / starttls" /></label></div><label>认证方式<select value={customAuthentication} onChange={(event) => setCustomAuthentication(event.target.value)}><option value="password">密码 / 授权码</option><option value="app-password">应用专用密码</option><option value="oauth2">OAuth2 Bearer Token</option></select></label></div>}<div className="guide-box"><div className="guide-heading"><span><Icon name="key" size={17} />如何获取授权码？</span><em>{providerDefinition.label}</em></div>{providerDefinition.guide.map((step, index) => <div className="guide-step" key={step}><span className="step-number">{index + 1}</span><span><strong>{step}</strong><small>{index === 0 ? `登录 ${providerDefinition.label}，打开设置页面` : index === 1 ? '找到第三方客户端或账户安全选项' : '复制生成的授权凭据，返回此处粘贴'}</small></span>{index === 0 && <button type="button" onClick={onOpenProvider}>前往设置 <Icon name="link" size={13} /></button>}</div>)}</div></div></div><div className="modal-footer"><span><Icon name="shieldCheck" size={17} />凭据只保存在本机，不会上传到第三方</span><div><button className="secondary-button" type="button" onClick={onClose}>取消</button><button className="gradient-button" type="button" onClick={onAdd}><Icon name="rotate" size={17} />开始同步</button></div></div></motion.div></motion.div>
+function AccountModal({ provider, setProvider, providerDefinition, accountEmail, setAccountEmail, authorizationCode, setAuthorizationCode, showAuthorizationCode, setShowAuthorizationCode, customImapHost, setCustomImapHost, customImapPort, setCustomImapPort, customImapSecurity, setCustomImapSecurity, customSmtpHost, setCustomSmtpHost, customSmtpPort, setCustomSmtpPort, customSmtpSecurity, setCustomSmtpSecurity, customAuthentication, setCustomAuthentication, deviceFlow, onClose, onOpenProvider, onCopy, onAdd }: { provider: Provider; setProvider: (provider: Provider) => void; providerDefinition: ReturnType<typeof providerFor>; accountEmail: string; setAccountEmail: (value: string) => void; authorizationCode: string; setAuthorizationCode: (value: string) => void; showAuthorizationCode: boolean; setShowAuthorizationCode: (value: boolean) => void; customImapHost: string; setCustomImapHost: (value: string) => void; customImapPort: string; setCustomImapPort: (value: string) => void; customImapSecurity: string; setCustomImapSecurity: (value: string) => void; customSmtpHost: string; setCustomSmtpHost: (value: string) => void; customSmtpPort: string; setCustomSmtpPort: (value: string) => void; customSmtpSecurity: string; setCustomSmtpSecurity: (value: string) => void; customAuthentication: string; setCustomAuthentication: (value: string) => void; deviceFlow: DeviceFlowState | null; onClose: () => void; onOpenProvider: () => void; onCopy: () => void; onAdd: () => void }) {
+  return <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="account-modal" initial={{ opacity: 0, y: 14, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 8, scale: 0.98 }} role="dialog" aria-modal="true" aria-labelledby="add-account-title"><div className="modal-header"><div><Icon name="user" size={21} /><h2 id="add-account-title">添加账户</h2></div><TooltipButton label="关闭" onClick={onClose}><Icon name="close" size={19} /></TooltipButton></div><div className="account-modal-body"><div className="provider-chooser">{providerDefinitions.map((item) => <button key={item.id} type="button" className={`provider-option ${provider === item.id ? 'is-selected' : ''}`} onClick={() => setProvider(item.id)}><ProviderMark provider={item.id} size="md" /><span><strong>{item.label}</strong><small>{item.description}</small></span>{provider === item.id && <Icon name="checkCircle" size={19} />}</button>)}</div><div className="account-form"><label>邮箱地址<input type="email" value={accountEmail} onChange={(event) => setAccountEmail(event.target.value)} placeholder={provider === 'qq' ? 'yourname@qq.com' : 'name@example.com'} autoFocus /></label><label><span className="label-with-action">授权码<button type="button" onClick={onOpenProvider}>如何获取授权码？ <Icon name="link" size={13} /></button></span><span className="secret-input"><input type={showAuthorizationCode ? 'text' : 'password'} value={authorizationCode} onChange={(event) => setAuthorizationCode(event.target.value)} placeholder="粘贴邮箱授权码" /><button type="button" onClick={() => setShowAuthorizationCode(!showAuthorizationCode)} aria-label={showAuthorizationCode ? '隐藏授权码' : '显示授权码'}><Icon name={showAuthorizationCode ? 'eyeSlash' : 'eye'} size={17} /></button><button type="button" onClick={onCopy} aria-label="复制授权码"><Icon name="copy" size={17} /></button></span></label>{deviceFlow && <div className="device-flow-box"><div className="device-flow-heading"><span><Icon name="shieldCheck" size={16} />Outlook 设备授权</span><strong>{deviceFlow.status === 'complete' ? '已完成' : deviceFlow.status === 'error' ? '需要重试' : '等待验证'}</strong></div><code>{deviceFlow.userCode}</code><p>{deviceFlow.status === 'complete' ? '设备验证已完成，可以开始同步。' : (deviceFlow.message || '请打开验证页完成 Microsoft 账户授权。')}</p><small>{deviceFlow.verificationUri}</small>{deviceFlow.status !== 'complete' && <button type="button" onClick={onOpenProvider}>{deviceFlow.status === 'error' ? '重新开始授权' : '重新打开验证页'} <Icon name="link" size={13} /></button>}</div>}{provider === 'other' && <div className="custom-transport-fields"><div className="transport-heading"><Icon name="settings" size={15} />自定义服务器</div><div className="transport-row"><label>IMAP 主机<input value={customImapHost} onChange={(event) => setCustomImapHost(event.target.value)} placeholder="imap.example.com" /></label><label>端口<input type="number" min="1" max="65535" value={customImapPort} onChange={(event) => setCustomImapPort(event.target.value)} /></label><label>安全<input value={customImapSecurity} onChange={(event) => setCustomImapSecurity(event.target.value)} placeholder="tls / starttls" /></label></div><div className="transport-row"><label>SMTP 主机<input value={customSmtpHost} onChange={(event) => setCustomSmtpHost(event.target.value)} placeholder="smtp.example.com" /></label><label>端口<input type="number" min="1" max="65535" value={customSmtpPort} onChange={(event) => setCustomSmtpPort(event.target.value)} /></label><label>安全<input value={customSmtpSecurity} onChange={(event) => setCustomSmtpSecurity(event.target.value)} placeholder="tls / starttls" /></label></div><label>认证方式<select value={customAuthentication} onChange={(event) => setCustomAuthentication(event.target.value)}><option value="password">密码 / 授权码</option><option value="app-password">应用专用密码</option><option value="oauth2">OAuth2 Bearer Token</option></select></label></div>}<div className="guide-box"><div className="guide-heading"><span><Icon name="key" size={17} />如何获取授权码？</span><em>{providerDefinition.label}</em></div>{providerDefinition.guide.map((step, index) => <div className="guide-step" key={step}><span className="step-number">{index + 1}</span><span><strong>{step}</strong><small>{index === 0 ? `登录 ${providerDefinition.label}，打开设置页面` : index === 1 ? '找到第三方客户端或账户安全选项' : '复制生成的授权凭据，返回此处粘贴'}</small></span>{index === 0 && <button type="button" onClick={onOpenProvider}>前往设置 <Icon name="link" size={13} /></button>}</div>)}</div></div></div><div className="modal-footer"><span><Icon name="shieldCheck" size={17} />凭据只保存在本机，不会上传到第三方</span><div><button className="secondary-button" type="button" onClick={onClose}>取消</button><button className="gradient-button" type="button" onClick={onAdd}><Icon name="rotate" size={17} />开始同步</button></div></div></motion.div></motion.div>
 }
 
 function ComposeModal({ accountId, onClose, onSent, onError }: { accountId?: string; onClose: () => void; onSent: () => void; onError: (message: string) => void }) {

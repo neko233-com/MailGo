@@ -5,7 +5,6 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use imap::types::Flag;
 use serde::{Deserialize, Serialize};
 
@@ -45,12 +44,11 @@ pub struct MailDetail {
     pub message: CachedMessage,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AttachmentDownload {
+#[derive(Debug)]
+pub struct AttachmentData {
     pub file_name: String,
     pub content_type: String,
-    pub data_base64: String,
+    pub bytes: Vec<u8>,
 }
 
 fn connect(profile: &ProviderProfile) -> Result<imap::Client<imap::Connection>> {
@@ -180,11 +178,13 @@ pub fn sync_account(
     loop {
         match sync_account_once(account_id, profile.clone(), email, credential, cache_root) {
             Ok(result) => return Ok(result),
-            Err(error) if attempt < 2 && is_retryable_sync_error(&error) => {
-                let delay = 1u64 << attempt;
+            Err(error) if attempt < 2 => {
+                let Some(delay) = retry_delay(&error, attempt) else {
+                    return Err(error);
+                };
                 attempt += 1;
-                tracing::warn!(account_id = %account_id, attempt, delay, "transient IMAP sync failure; retrying");
-                thread::sleep(Duration::from_secs(delay));
+                tracing::warn!(account_id = %account_id, attempt, delay = delay.as_secs(), "recoverable IMAP sync failure; retrying");
+                thread::sleep(delay);
             }
             Err(error) => return Err(error),
         }
@@ -319,11 +319,13 @@ pub fn sync_folder_page(
             cache_root,
         ) {
             Ok(result) => return Ok(result),
-            Err(error) if attempt < 2 && is_retryable_sync_error(&error) => {
-                let delay = 1u64 << attempt;
+            Err(error) if attempt < 2 => {
+                let Some(delay) = retry_delay(&error, attempt) else {
+                    return Err(error);
+                };
                 attempt += 1;
-                tracing::warn!(account_id = %account_id, attempt, delay, "transient IMAP page failure; retrying");
-                thread::sleep(Duration::from_secs(delay));
+                tracing::warn!(account_id = %account_id, attempt, delay = delay.as_secs(), "recoverable IMAP page failure; retrying");
+                thread::sleep(delay);
             }
             Err(error) => return Err(error),
         }
@@ -480,17 +482,66 @@ fn sync_folder_page_once(
     })
 }
 
-fn is_retryable_sync_error(error: &anyhow::Error) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncErrorClass {
+    Authentication,
+    RateLimited,
+    Transport,
+    Permanent,
+}
+
+fn classify_sync_error(error: &anyhow::Error) -> SyncErrorClass {
     let message = error.to_string().to_ascii_lowercase();
-    ![
+    if [
         "authentication",
         "authorization",
         "invalid credential",
-        "unsupported",
         "requires authorization",
     ]
     .iter()
     .any(|marker| message.contains(marker))
+    {
+        return SyncErrorClass::Authentication;
+    }
+    if [
+        "rate limit",
+        "too many requests",
+        "too many connections",
+        "throttl",
+        "quota exceeded",
+        "try again later",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+    {
+        return SyncErrorClass::RateLimited;
+    }
+    if [
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection refused",
+        "connection aborted",
+        "broken pipe",
+        "temporarily unavailable",
+        "network is unreachable",
+        "eof",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+    {
+        return SyncErrorClass::Transport;
+    }
+    SyncErrorClass::Permanent
+}
+
+fn retry_delay(error: &anyhow::Error, attempt: u32) -> Option<Duration> {
+    let delay_seconds = match classify_sync_error(error) {
+        SyncErrorClass::Transport => 1u64 << attempt,
+        SyncErrorClass::RateLimited => 5u64.saturating_mul(1u64 << attempt),
+        SyncErrorClass::Authentication | SyncErrorClass::Permanent => return None,
+    };
+    Some(Duration::from_secs(delay_seconds.min(60)))
 }
 
 /// Download and parse one full message only when the reader asks for it. The raw message can be
@@ -563,13 +614,13 @@ fn store_attachment_payloads(
     Ok(())
 }
 
-pub fn load_attachment(
+pub fn load_attachment_data(
     cache_root: &Path,
     account_id: &str,
     folder: &str,
     uid: u32,
     index: usize,
-) -> Result<AttachmentDownload> {
+) -> Result<AttachmentData> {
     let mailbox = load_mailbox_for_folder(cache_root, account_id, folder)?
         .ok_or_else(|| anyhow!("message is not cached"))?;
     let message = mailbox
@@ -590,10 +641,10 @@ pub fn load_attachment(
     let encrypted =
         fs::read(&path).with_context(|| format!("read attachment {}", path.display()))?;
     let bytes = unprotect_cache(&encrypted).context("decrypt cached attachment")?;
-    Ok(AttachmentDownload {
+    Ok(AttachmentData {
         file_name: metadata.file_name.clone(),
         content_type: metadata.content_type.clone(),
-        data_base64: STANDARD.encode(bytes),
+        bytes,
     })
 }
 
@@ -1072,16 +1123,33 @@ mod tests {
     }
 
     #[test]
-    fn sync_retries_transport_failures_but_not_auth_failures() {
-        assert!(is_retryable_sync_error(&anyhow!(
-            "connect IMAP host timed out"
-        )));
-        assert!(!is_retryable_sync_error(&anyhow!(
-            "IMAP authentication failed"
-        )));
-        assert!(!is_retryable_sync_error(&anyhow!(
-            "unsupported mail provider"
-        )));
+    fn sync_retries_transport_and_rate_limits_but_not_auth_failures() {
+        assert_eq!(
+            retry_delay(&anyhow!("connect IMAP host timed out"), 0),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            retry_delay(&anyhow!("IMAP provider rate limit: too many requests"), 1),
+            Some(Duration::from_secs(10))
+        );
+        assert!(retry_delay(&anyhow!("IMAP authentication failed"), 0).is_none());
+        assert!(retry_delay(&anyhow!("unsupported mail provider"), 0).is_none());
+        assert_eq!(
+            classify_sync_error(&anyhow!("IMAP authentication failed")),
+            SyncErrorClass::Authentication
+        );
+        assert_eq!(
+            classify_sync_error(&anyhow!("too many connections")),
+            SyncErrorClass::RateLimited
+        );
+        assert_eq!(
+            classify_sync_error(&anyhow!("connection reset by peer")),
+            SyncErrorClass::Transport
+        );
+        assert_eq!(
+            classify_sync_error(&anyhow!("message headers could not be parsed")),
+            SyncErrorClass::Permanent
+        );
     }
 
     #[test]

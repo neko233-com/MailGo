@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rdesktop_core::config::{AppConfig, RendererConfig, WindowConfig};
 use rdesktop_core::ipc::{FnIpcHandler, IpcMessage, IpcResponse};
 use rdesktop_core::renderer::Renderer;
@@ -22,6 +24,11 @@ mod tray;
 
 const APP_SERVICE: &str = "MailGo";
 const STATE_SCHEMA_VERSION: u32 = 1;
+const ATTACHMENT_CHUNK_BYTES: usize = 192 * 1024;
+const MAX_ATTACHMENT_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
+const MAX_LEGACY_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ACTIVE_ATTACHMENT_DOWNLOADS: usize = 2;
+const ATTACHMENT_DOWNLOAD_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,6 +82,13 @@ struct MailGoState {
     state_path: PathBuf,
     state: PersistedState,
     auth_sessions: HashMap<String, oauth::PendingSession>,
+    ready_oauth_credentials: HashMap<String, String>,
+    attachment_downloads: HashMap<String, AttachmentDownloadSession>,
+}
+
+struct AttachmentDownloadSession {
+    bytes: Vec<u8>,
+    created_at: Instant,
 }
 
 impl MailGoState {
@@ -119,6 +133,8 @@ impl MailGoState {
             state_path,
             state,
             auth_sessions: HashMap::new(),
+            ready_oauth_credentials: HashMap::new(),
+            attachment_downloads: HashMap::new(),
         })
     }
 
@@ -273,6 +289,26 @@ fn optional_u16_field(payload: &Value, name: &str) -> Option<u16> {
         .and_then(|value| u16::try_from(value).ok())
 }
 
+fn purge_expired_attachment_downloads(app: &mut MailGoState) {
+    app.attachment_downloads
+        .retain(|_, download| download.created_at.elapsed() < ATTACHMENT_DOWNLOAD_TTL);
+}
+
+fn purge_expired_auth_sessions(app: &mut MailGoState) {
+    app.auth_sessions
+        .retain(|_, session| !oauth::is_expired(session));
+    app.ready_oauth_credentials
+        .retain(|session_id, _| app.auth_sessions.contains_key(session_id));
+}
+
+fn attachment_chunk_bounds(total: usize, offset: usize) -> Result<(usize, bool)> {
+    if offset > total {
+        return Err(anyhow!("attachment download offset is invalid"));
+    }
+    let next_offset = offset.saturating_add(ATTACHMENT_CHUNK_BYTES).min(total);
+    Ok((next_offset, next_offset == total))
+}
+
 fn response(message: &IpcMessage, success: bool, data: Value) -> IpcResponse {
     IpcResponse {
         id: message.id.clone(),
@@ -332,8 +368,49 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 providers::validate_email(&email)?;
                 let (session, response) = oauth::start(provider, &email)?;
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                purge_expired_auth_sessions(&mut app);
                 app.auth_sessions.insert(session.id.clone(), session);
                 Ok(serde_json::to_value(response)?)
+            }
+            "auth.device.start" => {
+                let provider =
+                    providers::ProviderKind::parse(&string_field(&message.payload, "provider")?)?;
+                let email = string_field(&message.payload, "email")?;
+                providers::validate_email(&email)?;
+                let (session, response) = oauth::start_device(provider, &email)?;
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                purge_expired_auth_sessions(&mut app);
+                app.auth_sessions.insert(session.id.clone(), session);
+                Ok(serde_json::to_value(response)?)
+            }
+            "auth.device.poll" => {
+                let session_id = string_field(&message.payload, "sessionId")?;
+                let (pending, ready) = {
+                    let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                    purge_expired_auth_sessions(&mut app);
+                    (
+                        app.auth_sessions.get(&session_id).cloned(),
+                        app.ready_oauth_credentials.contains_key(&session_id),
+                    )
+                };
+                if ready {
+                    return Ok(json!({ "sessionId": session_id, "status": "complete" }));
+                }
+                let pending =
+                    pending.ok_or_else(|| anyhow!("OAuth device session is missing or expired"))?;
+                match oauth::poll_device(&pending)? {
+                    oauth::DevicePollResult::Pending { retry_after } => Ok(json!({
+                        "sessionId": session_id,
+                        "status": "pending",
+                        "retryAfter": retry_after,
+                    })),
+                    oauth::DevicePollResult::Complete { credential } => {
+                        let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                        app.ready_oauth_credentials
+                            .insert(session_id.clone(), credential);
+                        Ok(json!({ "sessionId": session_id, "status": "complete" }))
+                    }
+                }
             }
             "accounts.add" => {
                 let id = string_field(&message.payload, "id")?;
@@ -370,25 +447,33 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 {
                     let session_id = oauth_session_id.expect("checked above");
                     let returned_state = optional_string_field(&message.payload, "oauthState");
-                    let pending = shared
-                        .lock()
-                        .map_err(|_| anyhow!("state lock poisoned"))?
-                        .auth_sessions
-                        .remove(&session_id)
-                        .ok_or_else(|| anyhow!("OAuth sign-in session is missing or expired"))?;
+                    let (pending, ready_credential) = {
+                        let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                        purge_expired_auth_sessions(&mut app);
+                        let pending = app.auth_sessions.remove(&session_id).ok_or_else(|| {
+                            anyhow!("OAuth sign-in session is missing or expired")
+                        })?;
+                        (pending, app.ready_oauth_credentials.remove(&session_id))
+                    };
                     if pending.provider != provider_kind
                         || !pending.email.eq_ignore_ascii_case(&new_account.email)
                     {
                         return Err(anyhow!("OAuth sign-in session does not match this account"));
                     }
-                    let (code, callback_state) = if supplied_credential.is_empty() {
-                        oauth::take_callback(&pending)?.ok_or_else(|| {
-                            anyhow!("OAuth callback is not ready; finish sign-in or paste the code")
-                        })?
+                    if let Some(credential) = ready_credential {
+                        credential
                     } else {
-                        (supplied_credential, returned_state)
-                    };
-                    oauth::exchange_code(&pending, &code, callback_state.as_deref())?
+                        let (code, callback_state) = if supplied_credential.is_empty() {
+                            oauth::take_callback(&pending)?.ok_or_else(|| {
+                                anyhow!(
+                                    "OAuth callback is not ready; finish sign-in or paste the code"
+                                )
+                            })?
+                        } else {
+                            (supplied_credential, returned_state)
+                        };
+                        oauth::exchange_code(&pending, &code, callback_state.as_deref())?
+                    }
                 } else {
                     if supplied_credential.is_empty() {
                         return Err(anyhow!("account authorization is required"));
@@ -689,7 +774,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 }
                 Ok(json!({ "offline": false, "message": detail.message }))
             }
-            "mail.attachment" => {
+            "mail.attachment.start" => {
                 let account_id = string_field(&message.payload, "accountId")?;
                 let uid = u32_field(&message.payload, "uid")?;
                 let folder = optional_string_field(&message.payload, "folder")
@@ -700,13 +785,110 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     .and_then(Value::as_u64)
                     .and_then(|value| usize::try_from(value).ok())
                     .ok_or_else(|| anyhow!("missing or invalid field: index"))?;
-                Ok(serde_json::to_value(sync::load_attachment(
-                    &cache_dir(),
-                    &account_id,
-                    &folder,
-                    uid,
-                    index,
-                )?)?)
+                let attachment =
+                    sync::load_attachment_data(&cache_dir(), &account_id, &folder, uid, index)?;
+                if attachment.bytes.len() > MAX_ATTACHMENT_DOWNLOAD_BYTES {
+                    return Err(anyhow!(
+                        "attachment exceeds the {} MiB download limit",
+                        MAX_ATTACHMENT_DOWNLOAD_BYTES / (1024 * 1024)
+                    ));
+                }
+                let download_id = format!(
+                    "mailgo-attachment-{}-{:016x}",
+                    account_id,
+                    rand::random::<u64>()
+                );
+                let file_name = attachment.file_name;
+                let content_type = attachment.content_type;
+                let size = attachment.bytes.len();
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                purge_expired_attachment_downloads(&mut app);
+                if app.attachment_downloads.len() >= MAX_ACTIVE_ATTACHMENT_DOWNLOADS {
+                    return Err(anyhow!(
+                        "too many active attachment downloads; finish or cancel one first"
+                    ));
+                }
+                app.attachment_downloads.insert(
+                    download_id.clone(),
+                    AttachmentDownloadSession {
+                        bytes: attachment.bytes,
+                        created_at: Instant::now(),
+                    },
+                );
+                Ok(json!({
+                    "downloadId": download_id,
+                    "fileName": file_name,
+                    "contentType": content_type,
+                    "size": size,
+                    "chunkSize": ATTACHMENT_CHUNK_BYTES,
+                }))
+            }
+            "mail.attachment.chunk" => {
+                let download_id = string_field(&message.payload, "downloadId")?;
+                let offset = message
+                    .payload
+                    .get("offset")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or_default();
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                purge_expired_attachment_downloads(&mut app);
+                let (chunk, next_offset, done) = {
+                    let download = app
+                        .attachment_downloads
+                        .get(&download_id)
+                        .ok_or_else(|| anyhow!("attachment download is missing or expired"))?;
+                    let (next_offset, done) =
+                        attachment_chunk_bounds(download.bytes.len(), offset)?;
+                    (
+                        STANDARD.encode(&download.bytes[offset..next_offset]),
+                        next_offset,
+                        done,
+                    )
+                };
+                if done {
+                    app.attachment_downloads.remove(&download_id);
+                }
+                Ok(json!({
+                    "downloadId": download_id,
+                    "offset": offset,
+                    "nextOffset": next_offset,
+                    "done": done,
+                    "dataBase64": chunk,
+                }))
+            }
+            "mail.attachment.cancel" => {
+                let download_id = string_field(&message.payload, "downloadId")?;
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                let cancelled = app.attachment_downloads.remove(&download_id).is_some();
+                Ok(json!({ "downloadId": download_id, "cancelled": cancelled }))
+            }
+            "mail.attachment" => {
+                // Keep the original one-shot command for older clients. New clients use the
+                // chunked start/chunk/cancel protocol to cap IPC payload size and support cancel.
+                let account_id = string_field(&message.payload, "accountId")?;
+                let uid = u32_field(&message.payload, "uid")?;
+                let folder = optional_string_field(&message.payload, "folder")
+                    .unwrap_or_else(|| "INBOX".to_string());
+                let index = message
+                    .payload
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| anyhow!("missing or invalid field: index"))?;
+                let attachment =
+                    sync::load_attachment_data(&cache_dir(), &account_id, &folder, uid, index)?;
+                if attachment.bytes.len() > MAX_LEGACY_ATTACHMENT_BYTES {
+                    return Err(anyhow!(
+                        "legacy attachment transfer is limited to {} MiB; use the chunked client",
+                        MAX_LEGACY_ATTACHMENT_BYTES / (1024 * 1024)
+                    ));
+                }
+                Ok(json!({
+                    "fileName": attachment.file_name,
+                    "contentType": attachment.content_type,
+                    "dataBase64": STANDARD.encode(attachment.bytes),
+                }))
             }
             "mail.mark_read" | "mail.star" => {
                 let account_id = string_field(&message.payload, "accountId")?;
@@ -790,6 +972,22 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
     match result {
         Ok(data) => response(&message, true, data),
         Err(error) => response(&message, false, json!({ "message": error.to_string() })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachment_chunks_are_bounded_and_resumable() {
+        let (next, done) = attachment_chunk_bounds(ATTACHMENT_CHUNK_BYTES + 10, 0).unwrap();
+        assert_eq!(next, ATTACHMENT_CHUNK_BYTES);
+        assert!(!done);
+        let (next, done) = attachment_chunk_bounds(ATTACHMENT_CHUNK_BYTES + 10, next).unwrap();
+        assert_eq!(next, ATTACHMENT_CHUNK_BYTES + 10);
+        assert!(done);
+        assert!(attachment_chunk_bounds(10, 11).is_err());
     }
 }
 
