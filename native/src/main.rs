@@ -39,6 +39,10 @@ const ATTACHMENT_UPLOAD_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_IMPORTED_ACCOUNTS: usize = 64;
 const MAX_ACCOUNT_ID_LENGTH: usize = 128;
 const MAX_ACCOUNT_LABEL_LENGTH: usize = 128;
+const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
+const MAX_RECIPIENT_BYTES: usize = 320;
+const MAX_SUBJECT_BYTES: usize = 998;
+const MAX_MESSAGE_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -368,6 +372,14 @@ fn string_field(payload: &Value, name: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("missing or empty field: {name}"))
 }
 
+fn bounded_string_field(payload: &Value, name: &str, max_bytes: usize) -> Result<String> {
+    let value = string_field(payload, name)?;
+    if value.len() > max_bytes {
+        return Err(anyhow!("field {name} exceeds the safe size limit"));
+    }
+    Ok(value)
+}
+
 fn u32_field(payload: &Value, name: &str) -> Result<u32> {
     payload
         .get(name)
@@ -383,6 +395,20 @@ fn optional_string_field(payload: &Value, name: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn optional_bounded_string_field(
+    payload: &Value,
+    name: &str,
+    max_bytes: usize,
+) -> Result<Option<String>> {
+    let Some(value) = optional_string_field(payload, name) else {
+        return Ok(None);
+    };
+    if value.len() > max_bytes {
+        return Err(anyhow!("field {name} exceeds the safe size limit"));
+    }
+    Ok(Some(value))
 }
 
 fn optional_u16_field(payload: &Value, name: &str) -> Option<u16> {
@@ -625,9 +651,12 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     return Err(anyhow!("account label is too long"));
                 }
                 let email = string_field(&message.payload, "email")?;
-                let supplied_credential =
-                    optional_string_field(&message.payload, "authorizationCode")
-                        .unwrap_or_default();
+                let supplied_credential = optional_bounded_string_field(
+                    &message.payload,
+                    "authorizationCode",
+                    MAX_CREDENTIAL_BYTES,
+                )?
+                .unwrap_or_default();
                 let provider_kind = providers::ProviderKind::parse(&provider)?;
                 providers::validate_email(&email)?;
                 let new_account = PersistedAccount {
@@ -1465,10 +1494,15 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
             }
             "mail.send" => {
                 let account_id = string_field(&message.payload, "accountId")?;
-                let to = string_field(&message.payload, "to")?;
-                let subject = string_field(&message.payload, "subject")?;
-                let text_body = string_field(&message.payload, "textBody")?;
-                let html_body = optional_string_field(&message.payload, "htmlBody");
+                let to = bounded_string_field(&message.payload, "to", MAX_RECIPIENT_BYTES)?;
+                let subject = bounded_string_field(&message.payload, "subject", MAX_SUBJECT_BYTES)?;
+                let text_body =
+                    bounded_string_field(&message.payload, "textBody", MAX_MESSAGE_BODY_BYTES)?;
+                let html_body = optional_bounded_string_field(
+                    &message.payload,
+                    "htmlBody",
+                    MAX_MESSAGE_BODY_BYTES,
+                )?;
                 let attachment_ids = match message.payload.get("attachmentIds") {
                     None => Vec::new(),
                     Some(value) => value
@@ -1565,6 +1599,19 @@ mod tests {
         assert_eq!(next, ATTACHMENT_CHUNK_BYTES + 10);
         assert!(done);
         assert!(attachment_chunk_bounds(10, 11).is_err());
+    }
+
+    #[test]
+    fn ipc_text_fields_have_explicit_size_boundaries() {
+        let payload = json!({ "subject": "12345" });
+        assert!(bounded_string_field(&payload, "subject", 5).is_ok());
+        assert!(bounded_string_field(&payload, "subject", 4).is_err());
+
+        let optional = json!({ "htmlBody": "123456" });
+        assert!(optional_bounded_string_field(&optional, "htmlBody", 5).is_err());
+        assert!(optional_bounded_string_field(&json!({}), "htmlBody", 5)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

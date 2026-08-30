@@ -35,6 +35,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 29. Account onboarding distinguishes credential-save failure from first-sync failure, preserving a successfully stored account as offline/reauthorization-needed instead of rolling back only the renderer state.
 30. Full MIME parsing is bounded to 64 MiB, attachments are capped by count and aggregate size, and untrusted attachment names are normalized before they enter cache metadata or download flows.
 31. Native attachment upload sessions are cleared after every send attempt, and OAuth pending/callback secrets are zeroized when their in-memory session values are released.
+32. Native IPC validates bounded recipient, subject, body, HTML, and manual-credential fields before any SMTP, OAuth, or keyring operation.
 
 ## Remaining production acceptance work
 
