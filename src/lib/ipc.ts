@@ -23,11 +23,15 @@ if (typeof window !== 'undefined') {
     if (!request) return
     pending.delete(response.id)
     if (response.success) request.resolve(response.data)
-    else request.reject(new Error(String(response.data ?? 'Native request failed')))
+    else {
+      const data = response.data as { message?: unknown } | string | null | undefined
+      const message = typeof data === 'string' ? data : typeof data?.message === 'string' ? data.message : 'Native request failed'
+      request.reject(new Error(message))
+    }
   }
 }
 
-export async function invoke<T>(cmd: string, payload: Record<string, unknown> = {}): Promise<T> {
+export async function invoke<T>(cmd: string, payload: Record<string, unknown> = {}, timeoutMs = 12_000): Promise<T> {
   const id = `mailgo-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
   if (window.ipc?.postMessage) {
@@ -38,7 +42,7 @@ export async function invoke<T>(cmd: string, payload: Record<string, unknown> = 
         if (!pending.has(id)) return
         pending.delete(id)
         reject(new Error(`Native request timed out: ${cmd}`))
-      }, 12_000)
+      }, timeoutMs)
     })
   }
 
@@ -49,7 +53,11 @@ export async function invoke<T>(cmd: string, payload: Record<string, unknown> = 
   })
   if (!response.ok) throw new Error(`Dev bridge request failed: ${response.status}`)
   const envelope = (await response.json()) as IpcResponse<T>
-  if (!envelope.success) throw new Error(String(envelope.data ?? 'Dev bridge request failed'))
+  if (!envelope.success) {
+    const data = envelope.data as { message?: unknown } | string | null | undefined
+    const message = typeof data === 'string' ? data : typeof data?.message === 'string' ? data.message : 'Dev bridge request failed'
+    throw new Error(message)
+  }
   return envelope.data
 }
 

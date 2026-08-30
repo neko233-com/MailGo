@@ -288,6 +288,15 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 :root[data-theme='light'] .account-form input, :root[data-theme='light'] .compose-modal input { background: #f8faff; }
 .account-form input::placeholder, .compose-modal input::placeholder { color: #7787a3; }
 .account-form input:focus, .compose-modal input:focus { border-color: #758aff; box-shadow: 0 0 0 3px rgba(91, 111, 246, .13); }
+.custom-transport-fields { display: grid; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: rgba(27, 42, 70, .35); }
+:root[data-theme='light'] .custom-transport-fields { background: #f5f7fe; }
+.transport-heading { display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 11px; }
+.transport-heading svg { color: #8d9cff; }
+.transport-row { display: grid; grid-template-columns: minmax(0, 1fr) 74px 92px; gap: 8px; }
+.custom-transport-fields label { gap: 5px; color: var(--muted); font-size: 10px; }
+.custom-transport-fields input, .custom-transport-fields select { height: 34px; padding: 0 8px; border-radius: 6px; font-size: 11px; }
+.custom-transport-fields select { width: 100%; border: 1px solid var(--line-strong); outline: 0; color: var(--text); background: rgba(21, 33, 56, .82); }
+:root[data-theme='light'] .custom-transport-fields select { background: #f8faff; }
 .label-with-action { display: flex; align-items: center; justify-content: space-between; }
 .label-with-action button { display: inline-flex; align-items: center; gap: 5px; color: #7fa0ff; background: transparent; font-size: 11px; font-weight: 500; }
 .secret-input { position: relative; display: flex; align-items: center; }
