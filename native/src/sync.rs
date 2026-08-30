@@ -1600,6 +1600,29 @@ fn folders_for(provider: crate::providers::ProviderKind) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::classifier::SmartCategory;
+
+    fn fixture_message(uid: u32, folder: &str) -> CachedMessage {
+        CachedMessage {
+            id: format!("fixture-{uid}"),
+            account_id: "fixture-account".into(),
+            folder: folder.into(),
+            uid,
+            subject: "Offline fixture".into(),
+            sender_name: "Fixture Sender".into(),
+            sender_email: "sender@example.invalid".into(),
+            received_at: None,
+            unread: true,
+            starred: false,
+            category: SmartCategory::Inbox,
+            is_ad: false,
+            preview: "Offline preview".into(),
+            text_body: "Offline body".into(),
+            html_body: None,
+            attachments: Vec::new(),
+            raw_path: None,
+        }
+    }
     use imap::Authenticator;
 
     #[test]
@@ -1698,5 +1721,94 @@ mod tests {
         let value = serde_json::to_value(mutation).unwrap();
         assert_eq!(value["operation"], "archive");
         assert_eq!(value["targetFolder"], "[Gmail]/All Mail");
+    }
+
+    #[test]
+    fn offline_flag_queue_coalesces_and_updates_local_cache() {
+        let root =
+            std::env::temp_dir().join(format!("mailgo-offline-flag-test-{}", std::process::id()));
+        let mailbox = CachedMailbox {
+            schema_version: 1,
+            account_id: "fixture-account".into(),
+            folder: "INBOX".into(),
+            uid_validity: Some(1),
+            synced_at: now_stamp(),
+            messages: vec![fixture_message(7, "INBOX")],
+            oldest_uid: Some(7),
+            has_more: false,
+        };
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        queue_flag_mutation(&root, "fixture-account", "INBOX", 7, "\\Seen", false).unwrap();
+        queue_flag_mutation(&root, "fixture-account", "INBOX", 7, "\\Seen", true).unwrap();
+        let queued = load_mutations(
+            &root
+                .join(safe_component("fixture-account"))
+                .join(MUTATION_FILE),
+        )
+        .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0].enabled);
+
+        update_cached_flags(&root, "fixture-account", "INBOX", 7, "\\Seen", true).unwrap();
+        let updated = load_mailbox_for_folder(&root, "fixture-account", "INBOX")
+            .unwrap()
+            .unwrap();
+        assert!(!updated.messages[0].unread);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_move_queue_coalesces_and_moves_local_message() {
+        let root =
+            std::env::temp_dir().join(format!("mailgo-offline-move-test-{}", std::process::id()));
+        let mailbox = CachedMailbox {
+            schema_version: 1,
+            account_id: "fixture-account".into(),
+            folder: "INBOX".into(),
+            uid_validity: Some(1),
+            synced_at: now_stamp(),
+            messages: vec![fixture_message(8, "INBOX")],
+            oldest_uid: Some(8),
+            has_more: false,
+        };
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        queue_move_mutation(
+            &root,
+            "fixture-account",
+            "archive",
+            "INBOX",
+            8,
+            Some("Archive"),
+        )
+        .unwrap();
+        queue_move_mutation(
+            &root,
+            "fixture-account",
+            "archive",
+            "INBOX",
+            8,
+            Some("[Gmail]/All Mail"),
+        )
+        .unwrap();
+        let queued = load_move_mutations(
+            &root
+                .join(safe_component("fixture-account"))
+                .join(MOVE_MUTATION_FILE),
+        )
+        .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].target_folder.as_deref(), Some("[Gmail]/All Mail"));
+
+        update_cached_move(&root, "fixture-account", "INBOX", 8, "[Gmail]/All Mail").unwrap();
+        assert!(load_mailbox_for_folder(&root, "fixture-account", "INBOX")
+            .unwrap()
+            .unwrap()
+            .messages
+            .is_empty());
+        let moved = load_mailbox_for_folder(&root, "fixture-account", "[Gmail]/All Mail")
+            .unwrap()
+            .unwrap();
+        assert_eq!(moved.messages[0].folder, "[Gmail]/All Mail");
+        let _ = fs::remove_dir_all(root);
     }
 }

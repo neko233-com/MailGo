@@ -30,11 +30,13 @@ The repository is deliberately split into a real desktop UI foundation and provi
 24. Persisted state loading explicitly migrates legacy missing fields and both snake_case/camelCase spellings, normalizes the current schema version, and rejects future unsupported versions before touching the backup state.
 25. Native MIME sanitization now removes remote image sources and tracking-related attributes before caching while preserving safe HTTPS/mailto links and inline CID images.
 26. Sync retry handling honors numeric `Retry-After` hints that survive transport errors, with a bounded 1–300 second cap and exponential fallback for providers that omit the hint.
+27. Offline flag and move queues are covered by executable regression tests for coalescing semantics and immediate encrypted-cache consistency; temporary test state is process-scoped and cleaned up after each case.
 
 ## Remaining production acceptance work
 
 - Provider-specific incremental delta sync beyond the resumable UID-page path.
 - Provider-specific rate-limit headers/backoff and richer MIME regression fixtures.
+- Disposable-provider acceptance tests for OAuth/IMAP/SMTP, including reconnect, UIDVALIDITY changes, folder mappings, and server-side mutation conflicts.
 - Tray integration tests on supported Windows versions.
 - Signed installer generation on a trusted Windows release host; the current rdesktop NSIS command is still an upstream placeholder.
 

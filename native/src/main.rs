@@ -12,6 +12,7 @@ use rdesktop_core::renderer::Renderer;
 use rdesktop_webview::WebViewRenderer;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use zeroize::{Zeroize, Zeroizing};
 
 mod classifier;
 mod instance;
@@ -151,7 +152,7 @@ struct MailGoState {
     state_path: PathBuf,
     state: PersistedState,
     auth_sessions: HashMap<String, oauth::PendingSession>,
-    ready_oauth_credentials: HashMap<String, String>,
+    ready_oauth_credentials: HashMap<String, Zeroizing<String>>,
     attachment_downloads: HashMap<String, AttachmentDownloadSession>,
     attachment_uploads: HashMap<String, AttachmentUploadSession>,
 }
@@ -413,8 +414,16 @@ fn validate_transfer_account(account: &transfer::TransferAccount) -> Result<()> 
     Ok(())
 }
 
-fn restore_credentials(previous: &[(String, Option<String>)]) {
-    for (id, credential) in previous {
+fn clear_credential_snapshots(previous: &mut [(String, Option<String>)]) {
+    for (_, credential) in previous {
+        if let Some(value) = credential {
+            value.zeroize();
+        }
+    }
+}
+
+fn restore_credentials(previous: &mut [(String, Option<String>)]) {
+    for (id, credential) in &mut *previous {
         if let Ok(entry) = credential_entry(id) {
             match credential {
                 Some(value) => {
@@ -426,6 +435,7 @@ fn restore_credentials(previous: &[(String, Option<String>)]) {
             }
         }
     }
+    clear_credential_snapshots(previous);
 }
 
 fn purge_expired_attachment_downloads(app: &mut MailGoState) {
@@ -599,7 +609,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     oauth::DevicePollResult::Complete { credential } => {
                         let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                         app.ready_oauth_credentials
-                            .insert(session_id.clone(), credential);
+                            .insert(session_id.clone(), Zeroizing::new(credential));
                         Ok(json!({ "sessionId": session_id, "status": "complete" }))
                     }
                 }
@@ -670,20 +680,24 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                         } else {
                             (supplied_credential, returned_state)
                         };
-                        oauth::exchange_code(&pending, &code, callback_state.as_deref())?
+                        Zeroizing::new(oauth::exchange_code(
+                            &pending,
+                            &code,
+                            callback_state.as_deref(),
+                        )?)
                     }
                 } else {
                     if supplied_credential.is_empty() {
                         return Err(anyhow!("account authorization is required"));
                     }
-                    supplied_credential
+                    Zeroizing::new(supplied_credential)
                 };
 
                 // Authorization codes and access tokens never enter PersistedState or logs. The
                 // resulting provider credential is kept in the OS credential store. OAuth flows
                 // retain refresh tokens only inside this same protected entry.
                 credential_entry(&id)?
-                    .set_password(&credential)
+                    .set_password(credential.as_str())
                     .map_err(|error| anyhow!("save credential: {error}"))?;
 
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
@@ -852,7 +866,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                         }
                     }
 
-                    let previous = records
+                    let mut previous = records
                         .iter()
                         .map(|record| {
                             let existing = credential_entry(&record.account.id)
@@ -867,7 +881,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                                 .set_password(&record.credential)
                                 .map_err(anyhow::Error::from)
                         }) {
-                            restore_credentials(&previous);
+                            restore_credentials(&mut previous);
                             return Err(error).context("save imported account credential");
                         }
                     }
@@ -889,7 +903,9 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                         Ok(records.len() as u32)
                     })();
                     if state_result.is_err() {
-                        restore_credentials(&previous);
+                        restore_credentials(&mut previous);
+                    } else {
+                        clear_credential_snapshots(&mut previous);
                     }
                     state_result
                 })();
