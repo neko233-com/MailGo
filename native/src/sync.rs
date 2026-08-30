@@ -1689,6 +1689,8 @@ mod tests {
             subject: "Offline fixture".into(),
             sender_name: "Fixture Sender".into(),
             sender_email: "sender@example.invalid".into(),
+            to: Vec::new(),
+            cc: Vec::new(),
             received_at: None,
             unread: true,
             starred: false,

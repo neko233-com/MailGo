@@ -21,6 +21,8 @@ The current foundation includes:
 - The desktop cache footer reports the number of encrypted flag/move mutations still waiting for provider replay across all accounts; the renderer receives counts only, never queue contents.
 - Native SMTP sending supports plain text and HTML alternatives through provider-specific TLS/STARTTLS defaults.
 - Compose supports bounded To/CC/BCC recipient lists, safe HTML alternatives, and chunked multi-file attachments without putting attachment bytes in a single IPC request.
+- Reply, reply-all, and forward preserve the active account, prefill recipients from MIME To/CC headers, add safe subject prefixes, and quote the original message without restoring an unrelated draft.
+- The desktop keyboard flow includes `C` for compose, `R` for replying to the selected message, `Ctrl/Cmd+K` for search, and `Esc` for closing transient UI.
 - Native mode automatically saves and restores the latest text draft per account in a DPAPI-protected local store; sending removes the draft, while attachments remain intentionally session-scoped.
 - Native mode also surfaces those encrypted local drafts in the 草稿箱 list, with per-account counts, draft-specific continue-editing actions, and an explicit discard action.
 - Windows tray lifecycle is implemented with the generated `resources/icons/mailgo.ico`: close-to-tray, restore on click, deliberate quit, and a five-minute background sync scheduler.

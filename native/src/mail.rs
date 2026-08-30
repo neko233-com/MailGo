@@ -16,6 +16,8 @@ const MAX_ATTACHMENTS_PER_MESSAGE: usize = 64;
 const MAX_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ATTACHMENT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ATTACHMENT_NAME_CHARS: usize = 255;
+const MAX_RECIPIENTS_PER_MESSAGE: usize = 128;
+const MAX_RECIPIENT_CHARS: usize = 320;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,6 +48,10 @@ pub struct CachedMessage {
     pub subject: String,
     pub sender_name: String,
     pub sender_email: String,
+    #[serde(default)]
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub cc: Vec<String>,
     pub received_at: Option<String>,
     pub unread: bool,
     pub starred: bool,
@@ -134,6 +140,8 @@ fn build_message(
 ) -> Result<CachedMessage> {
     let (sender_name, sender_email) = address_parts(parsed.from());
     let subject = parsed.subject().unwrap_or("(无主题)").trim().to_string();
+    let to = address_list(parsed.to());
+    let cc = address_list(parsed.cc());
     let text_body = parsed.body_text(0).map(Cow::into_owned).unwrap_or_default();
     let html_body = parsed
         .body_html(0)
@@ -185,6 +193,8 @@ fn build_message(
         subject,
         sender_name,
         sender_email,
+        to,
+        cc,
         received_at: parsed.date().map(|date| date.to_rfc3339()),
         unread,
         starred,
@@ -260,6 +270,27 @@ fn address_parts(address: Option<&Address<'_>>) -> (String, String) {
         first.name().unwrap_or_default().to_string(),
         first.address().unwrap_or_default().to_string(),
     )
+}
+
+fn address_list(address: Option<&Address<'_>>) -> Vec<String> {
+    let Some(address) = address else {
+        return Vec::new();
+    };
+    address
+        .iter()
+        .filter_map(|entry| {
+            let value = entry.address()?.trim();
+            if value.is_empty() || value.len() > MAX_RECIPIENT_CHARS {
+                return None;
+            }
+            let sanitized = value
+                .chars()
+                .filter(|character| !character.is_control())
+                .collect::<String>();
+            (sanitized.contains('@') && !sanitized.is_empty()).then_some(sanitized)
+        })
+        .take(MAX_RECIPIENTS_PER_MESSAGE)
+        .collect()
 }
 
 fn part_size(part: &mail_parser::MessagePart<'_>) -> usize {
@@ -359,7 +390,7 @@ pub fn sanitize_html(input: &str) -> String {
 mod tests {
     use super::*;
 
-    const RAW: &str = "From: no-reply@apple.com\r\nSubject: Your Apple Account was used to sign in\r\nMessage-ID: <mailgo-test@example.com>\r\nDate: Tue, 01 Jan 2026 12:00:00 +0000\r\nList-Unsubscribe: <https://example.com/unsubscribe>\r\nContent-Type: multipart/alternative; boundary=mailgo\r\n\r\n--mailgo\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nSecurity notice\r\n--mailgo\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Safe <strong>notice</strong></p><script>alert(1)</script>\r\n--mailgo--\r\n";
+    const RAW: &str = "From: no-reply@apple.com\r\nTo: teammate@example.com, owner@example.com\r\nCc: reviewer@example.com\r\nSubject: Your Apple Account was used to sign in\r\nMessage-ID: <mailgo-test@example.com>\r\nDate: Tue, 01 Jan 2026 12:00:00 +0000\r\nList-Unsubscribe: <https://example.com/unsubscribe>\r\nContent-Type: multipart/alternative; boundary=mailgo\r\n\r\n--mailgo\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nSecurity notice\r\n--mailgo\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Safe <strong>notice</strong></p><script>alert(1)</script>\r\n--mailgo--\r\n";
 
     #[test]
     fn parses_and_sanitizes_full_message() {
@@ -367,6 +398,8 @@ mod tests {
         assert_eq!(message.id, "mailgo-test@example.com");
         assert_eq!(message.category, SmartCategory::AppleConnect);
         assert_eq!(message.sender_email, "no-reply@apple.com");
+        assert_eq!(message.to, ["teammate@example.com", "owner@example.com"]);
+        assert_eq!(message.cc, ["reviewer@example.com"]);
         let html = message.html_body.unwrap();
         assert!(html.contains("<strong>notice</strong>"));
         assert!(!html.contains("script"));

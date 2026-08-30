@@ -46,6 +46,8 @@ The repository is deliberately split into a real desktop UI foundation and provi
 37. Native mode stores up to 100 bounded per-account drafts in a DPAPI-protected cache, restores the most recent draft when composing, debounces saves, and removes the draft after a successful send; attachments remain session-scoped by design.
 38. Native mode aggregates encrypted local drafts into the desktop 草稿箱 view, keeps its count current, opens the selected draft by ID, and exposes an explicit discard action so multiple accounts cannot restore or delete the wrong draft.
 39. IMAP sync now adopts all bounded selectable mailboxes returned by `LIST`, persists a sanitized per-account folder index, and lets the renderer browse custom server folders offline with account-scoped UID pagination.
+40. Reply, reply-all, and forward now carry the active account context, preserve parsed To/CC recipients, add idempotent subject prefixes, and quote bounded original content while keeping unrelated local drafts isolated.
+41. The documented desktop shortcuts now match the implementation: compose, reply, search focus, and transient UI dismissal are keyboard-accessible.
 
 ## Remaining production acceptance work
 

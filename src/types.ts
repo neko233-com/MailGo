@@ -22,6 +22,8 @@ export interface MailMessage {
   from: string
   senderName: string
   subject: string
+  to?: string[]
+  cc?: string[]
   preview: string
   timestamp: string
   dateGroup: string
@@ -192,6 +194,8 @@ export interface NativeCachedMessage {
   subject: string
   senderName: string
   senderEmail: string
+  to?: string[]
+  cc?: string[]
   receivedAt?: string
   unread: boolean
   starred: boolean

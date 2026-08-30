@@ -159,6 +159,8 @@ function nativeMessageToUi(message: NativeCachedMessage, account: MailAccount): 
     from: message.senderEmail || 'unknown@example.com',
     senderName,
     subject: message.subject || '(无主题)',
+    to: message.to,
+    cc: message.cc,
     preview: message.preview || message.textBody.slice(0, 240),
     timestamp,
     dateGroup,
@@ -200,6 +202,45 @@ function draftToUi(draft: NativeDraft, account: MailAccount): MailMessage {
     accent: account.accent,
     avatar: '草',
     body: draft.body ? draft.body.split(/\r?\n\s*\r?\n/).filter(Boolean) : ['这是一封尚未完成的本地草稿。'],
+  }
+}
+
+type ComposeMode = 'new' | 'reply' | 'reply-all' | 'forward'
+
+function composeSubject(mode: ComposeMode, subject: string) {
+  const trimmed = subject.trim() || '(无主题)'
+  if (mode === 'reply' || mode === 'reply-all') return /^(re\s*:\s*)/i.test(trimmed) ? trimmed : `Re: ${trimmed}`
+  if (mode === 'forward') return /^(fwd\s*:\s*)/i.test(trimmed) ? trimmed : `Fwd: ${trimmed}`
+  return trimmed
+}
+
+function uniqueRecipients(values: string[], ownEmail?: string) {
+  const seen = new Set<string>()
+  return values.filter((value) => {
+    const normalized = value.trim().toLowerCase()
+    if (!normalized || normalized === ownEmail?.trim().toLowerCase() || seen.has(normalized)) return false
+    seen.add(normalized)
+    return true
+  })
+}
+
+function quoteMail(source: MailMessage, mode: ComposeMode) {
+  const body = source.body.join('\n\n').slice(0, 20_000)
+  if (mode === 'forward') {
+    return `\n\n---------- 转发邮件 ----------\n发件人：${source.senderName} <${source.from}>\n主题：${source.subject}\n日期：${source.timestamp}\n\n${body}`
+  }
+  return `\n\n---------- 原始邮件 ----------\n${source.senderName} <${source.from}> 在 ${source.timestamp} 写道：\n${body.split(/\r?\n/).map((line) => `> ${line}`).join('\n')}`
+}
+
+function composeSeed(mode: ComposeMode, source: MailMessage | undefined, ownEmail?: string) {
+  if (!source || mode === 'new') return { to: '', cc: '', subject: '', body: '' }
+  const replyAllCc = uniqueRecipients([...(source.to ?? []), ...(source.cc ?? [])], ownEmail)
+    .filter((recipient) => recipient.toLowerCase() !== source.from.trim().toLowerCase())
+  return {
+    to: source.from,
+    cc: mode === 'reply-all' ? replyAllCc.join(', ') : '',
+    subject: composeSubject(mode, source.subject),
+    body: quoteMail(source, mode),
   }
 }
 
@@ -261,6 +302,8 @@ function App() {
   const [filterUnread, setFilterUnread] = useState(false)
   const [isComposeOpen, setComposeOpen] = useState(false)
   const [composeDraftId, setComposeDraftId] = useState<string | undefined>()
+  const [composeMode, setComposeMode] = useState<ComposeMode>('new')
+  const [composeSource, setComposeSource] = useState<MailMessage | undefined>()
   const [isAccountModalOpen, setAccountModalOpen] = useState(false)
   const [isAuthPanelOpen, setAuthPanelOpen] = useState(true)
   const [isSettingsOpen, setSettingsOpen] = useState(false)
@@ -302,6 +345,7 @@ function App() {
   const importInputRef = useRef<HTMLInputElement>(null)
   const encryptedTransferInputRef = useRef<HTMLInputElement>(null)
   const accountPrefillRef = useRef<string | null>(null)
+  const selectedMailRef = useRef<MailMessage | undefined>(undefined)
   const attachmentCancelsRef = useRef(new Map<string, () => void>())
   const isNativeRuntime = Boolean(window.ipc?.postMessage)
 
@@ -342,8 +386,10 @@ function App() {
     }
   }
 
-  const openCompose = (draftId?: string) => {
+  const openCompose = (draftId?: string, mode: ComposeMode = 'new', source?: MailMessage) => {
     setComposeDraftId(draftId)
+    setComposeMode(mode)
+    setComposeSource(source)
     setComposeOpen(true)
   }
 
@@ -517,6 +563,8 @@ function App() {
       if (event.key === 'Escape') {
         setComposeOpen(false)
         setComposeDraftId(undefined)
+        setComposeMode('new')
+        setComposeSource(undefined)
         setAccountModalOpen(false)
         setSettingsOpen(false)
         setOpenMenu(null)
@@ -525,6 +573,10 @@ function App() {
       if (!event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 'c' && !(event.target as HTMLElement).matches('input, textarea, select')) {
         event.preventDefault()
         openCompose()
+      }
+      if (!event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 'r' && !(event.target as HTMLElement).matches('input, textarea, select') && selectedMailRef.current?.id !== 'empty-mail') {
+        event.preventDefault()
+        if (selectedMailRef.current) openCompose(undefined, 'reply', selectedMailRef.current)
       }
     }
     window.addEventListener('keydown', handleShortcut)
@@ -592,6 +644,7 @@ function App() {
     avatar: 'M',
     body: ['当前文件夹没有可显示的邮件。'],
   } satisfies MailMessage
+  selectedMailRef.current = selectedMail
   const selectedMailAccount = accounts.find((account) => account.id === selectedMail.accountId)
 
   const groupedMails = useMemo(() => {
@@ -1533,7 +1586,7 @@ function App() {
 
         <section className="reading-panel" aria-label="邮件阅读区">
           <div className="reading-toolbar">
-            <div className="reading-actions"><TooltipButton label="回复" onClick={() => openCompose()}><Icon name="reply" size={18} /></TooltipButton><span>回复</span><TooltipButton label="回复全部" onClick={() => openCompose()}><Icon name="reply" size={18} /></TooltipButton><span>回复全部</span><TooltipButton label="转发" onClick={() => openCompose()}><Icon name="forward" size={18} /></TooltipButton><span>转发</span><TooltipButton label="归档" onClick={() => { void runMove(selectedMail, 'archive') }}><Icon name="archive" size={18} /></TooltipButton><span>归档</span><TooltipButton label="删除" onClick={() => { void runMove(selectedMail, 'delete') }}><Icon name="trash" size={18} /></TooltipButton><span>删除</span></div>
+            <div className="reading-actions"><TooltipButton label="回复" onClick={() => openCompose(undefined, 'reply', selectedMail)}><Icon name="reply" size={18} /></TooltipButton><span>回复</span><TooltipButton label="回复全部" onClick={() => openCompose(undefined, 'reply-all', selectedMail)}><Icon name="reply" size={18} /></TooltipButton><span>回复全部</span><TooltipButton label="转发" onClick={() => openCompose(undefined, 'forward', selectedMail)}><Icon name="forward" size={18} /></TooltipButton><span>转发</span><TooltipButton label="归档" onClick={() => { void runMove(selectedMail, 'archive') }}><Icon name="archive" size={18} /></TooltipButton><span>归档</span><TooltipButton label="删除" onClick={() => { void runMove(selectedMail, 'delete') }}><Icon name="trash" size={18} /></TooltipButton><span>删除</span></div>
             <div className="menu-anchor">
               <TooltipButton label="更多邮件操作" active={openMenu === 'message'} ariaExpanded={openMenu === 'message'} onClick={() => setOpenMenu((current) => current === 'message' ? null : 'message')}><Icon name="more" size={19} /></TooltipButton>
               {openMenu === 'message' && <div className="action-menu" role="menu" aria-label="更多邮件操作">
@@ -1551,7 +1604,7 @@ function App() {
               {isHtmlMode && selectedMail.hasHtml ? <div className="html-rendered" dangerouslySetInnerHTML={{ __html: sanitizeHtml(selectedMail.htmlBody ?? initialHtml, remoteImagesEnabled) }} /> : selectedMail.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
             </div>
             {selectedMail.attachments && <div className="attachments"><div className="attachments-heading"><span><Icon name="paperclip" size={20} /> {selectedMail.attachments.length} 个附件</span><div><button type="button" onClick={() => { void Promise.all(selectedMail.attachments?.map(downloadAttachment) ?? []) }}><Icon name="download" size={17} /> 全部下载</button><button type="button" onClick={() => pushToast('正在保存到本地缓存', 'success')}><Icon name="cloud" size={17} /> 保存到云盘</button></div></div><div className="attachment-grid">{selectedMail.attachments.map((attachment) => { const progress = attachmentProgress[attachment.id]; return <button type="button" className="attachment-card" key={attachment.id} onClick={() => { if (progress != null) cancelAttachment(attachment.id); else void downloadAttachment(attachment) }}><span className={`file-glyph file-${attachment.kind}`}>{attachment.kind === 'pdf' ? 'PDF' : attachment.kind === 'sheet' ? 'X' : 'FILE'}</span><span className="attachment-copy"><strong>{attachment.name}</strong><small>{progress != null ? `${progress}% · 点击取消` : attachment.size}</small></span><Icon name={progress != null ? 'close' : 'download'} size={17} /></button> })}</div></div>}
-            <div className="reply-composer"><Avatar message={{ ...selectedMail, avatar: 'OC', accent: '#2a5596' }} size="sm" /><div className="reply-input" onClick={() => openCompose()}>点击回复，或按 R 快速回复<div className="reply-tools"><span><Icon name="paperclip" size={19} /></span><span><Icon name="image" size={19} /></span><span className="reply-emoji">☺</span><span className="reply-a">A</span><button type="button" onClick={(event) => { event.stopPropagation(); openCompose() }}>回复 <span>⌄</span></button></div></div></div>
+            <div className="reply-composer"><Avatar message={{ ...selectedMail, avatar: 'OC', accent: '#2a5596' }} size="sm" /><div className="reply-input" onClick={() => openCompose(undefined, 'reply', selectedMail)}>点击回复，或按 R 快速回复<div className="reply-tools"><span><Icon name="paperclip" size={19} /></span><span><Icon name="image" size={19} /></span><span className="reply-emoji">☺</span><span className="reply-a">A</span><button type="button" onClick={(event) => { event.stopPropagation(); openCompose(undefined, 'reply', selectedMail) }}>回复 <span>⌄</span></button></div></div></div>
           </div>
         </section>
 
@@ -1573,7 +1626,7 @@ function App() {
       </AnimatePresence>
 
       <AnimatePresence>{isHelpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}</AnimatePresence>
-      <AnimatePresence>{isComposeOpen && <ComposeModal accountId={selectedAccountId ?? accounts[0]?.id} draftId={composeDraftId} onDraftChanged={handleDraftChanged} onDraftRemoved={handleDraftRemoved} onClose={() => { setComposeOpen(false); setComposeDraftId(undefined); void refreshNativeDrafts() }} onSent={() => { setComposeOpen(false); setComposeDraftId(undefined); void refreshNativeDrafts(); pushToast('邮件已发送', 'success') }} onError={(message) => pushToast(message, 'error')} />}</AnimatePresence>
+      <AnimatePresence>{isComposeOpen && <ComposeModal mode={composeMode} source={composeSource} accountId={composeSource?.accountId ?? selectedAccountId ?? accounts[0]?.id} senderEmail={accounts.find((account) => account.id === (composeSource?.accountId ?? selectedAccountId))?.email ?? accounts[0]?.email} draftId={composeDraftId} onDraftChanged={handleDraftChanged} onDraftRemoved={handleDraftRemoved} onClose={() => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts() }} onSent={() => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts(); pushToast('邮件已发送', 'success') }} onError={(message) => pushToast(message, 'error')} />}</AnimatePresence>
       <AnimatePresence>{isAccountModalOpen && <AccountModal editingAccountId={editingAccountId} provider={provider} setProvider={changeProvider} providerDefinition={selectedProvider} accountEmail={accountEmail} setAccountEmail={setAccountEmail} authorizationCode={authorizationCode} setAuthorizationCode={setAuthorizationCode} showAuthorizationCode={showAuthorizationCode} setShowAuthorizationCode={setShowAuthorizationCode} customImapHost={customImapHost} setCustomImapHost={setCustomImapHost} customImapPort={customImapPort} setCustomImapPort={setCustomImapPort} customImapSecurity={customImapSecurity} setCustomImapSecurity={setCustomImapSecurity} customSmtpHost={customSmtpHost} setCustomSmtpHost={setCustomSmtpHost} customSmtpPort={customSmtpPort} setCustomSmtpPort={setCustomSmtpPort} customSmtpSecurity={customSmtpSecurity} setCustomSmtpSecurity={setCustomSmtpSecurity} customAuthentication={customAuthentication} setCustomAuthentication={setCustomAuthentication} deviceFlow={deviceFlow} onClose={() => setAccountModalOpen(false)} onOpenProvider={() => { void handleOpenProvider() }} onCopy={handleCopy} onAdd={handleAddAccount} onRemove={handleRemoveAccount} />}</AnimatePresence>
       <AnimatePresence>{transferMode && <TransferModal mode={transferMode} fileName={transferFile?.name} isBusy={isImporting} onClose={() => { if (!isImporting) { setTransferMode(null); setTransferFile(null) } }} onSubmit={handleEncryptedTransfer} />}</AnimatePresence>
       <div className="toast-stack" aria-live="polite">{toasts.map((toast) => <motion.div key={toast.id} className={`toast toast-${toast.tone}`} initial={{ opacity: 0, y: 12, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 12 }}><Icon name={toast.tone === 'success' ? 'checkCircle' : toast.tone === 'error' ? 'info' : 'bell'} size={17} /><span>{toast.message}</span></motion.div>)}</div>
@@ -1616,7 +1669,7 @@ function AccountModal({ editingAccountId, provider, setProvider, providerDefinit
   return <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="account-modal" initial={{ opacity: 0, y: 14, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 8, scale: 0.98 }} role="dialog" aria-modal="true" aria-labelledby="account-modal-title"><div className="modal-header"><div><Icon name="user" size={21} /><h2 id="account-modal-title">{editingAccountId ? '重新授权账户' : '添加账户'}</h2></div><TooltipButton label="关闭" onClick={onClose}><Icon name="close" size={19} /></TooltipButton></div><div className="account-modal-body"><div className="provider-chooser">{providerDefinitions.map((item) => <button key={item.id} type="button" className={`provider-option ${provider === item.id ? 'is-selected' : ''}`} onClick={() => setProvider(item.id)}><ProviderMark provider={item.id} size="md" /><span><strong>{item.label}</strong><small>{item.description}</small></span>{provider === item.id && <Icon name="checkCircle" size={19} />}</button>)}</div><div className="account-form"><label>邮箱地址<input type="email" value={accountEmail} onChange={(event) => setAccountEmail(event.target.value)} placeholder={provider === 'qq' ? 'yourname@qq.com' : 'name@example.com'} autoFocus /></label>{(provider === 'google' || provider === 'outlook') && <label>认证方式<select value={customAuthentication} onChange={(event) => setCustomAuthentication(event.target.value)}><option value="oauth2">OAuth2 安全授权</option>{provider === 'google' && <option value="app-password">应用专用密码</option>}</select></label>}<label><span className="label-with-action">{credentialLabel}<button type="button" onClick={onOpenProvider}>{isOAuth ? '打开授权页面' : '如何获取授权码？'} <Icon name="link" size={13} /></button></span><span className="secret-input"><input type={showAuthorizationCode ? 'text' : 'password'} value={authorizationCode} onChange={(event) => setAuthorizationCode(event.target.value)} placeholder={isOAuth ? 'OAuth 授权完成后无需粘贴' : '粘贴邮箱授权码'} /><button type="button" onClick={() => setShowAuthorizationCode(!showAuthorizationCode)} aria-label={showAuthorizationCode ? '隐藏授权码' : '显示授权码'}><Icon name={showAuthorizationCode ? 'eyeSlash' : 'eye'} size={17} /></button><button type="button" onClick={onCopy} aria-label="复制授权码"><Icon name="copy" size={17} /></button></span></label>{deviceFlow && <div className="device-flow-box"><div className="device-flow-heading"><span><Icon name="shieldCheck" size={16} />Outlook 设备授权</span><strong>{deviceFlow.status === 'complete' ? '已完成' : deviceFlow.status === 'error' ? '需要重试' : '等待验证'}</strong></div><code>{deviceFlow.userCode}</code><p>{deviceFlow.status === 'complete' ? '设备验证已完成，可以开始同步。' : (deviceFlow.message || '请打开验证页完成 Microsoft 账户授权。')}</p><small>{deviceFlow.verificationUri}</small>{deviceFlow.status !== 'complete' && <button type="button" onClick={onOpenProvider}>{deviceFlow.status === 'error' ? '重新开始授权' : '重新打开验证页'} <Icon name="link" size={13} /></button>}</div>}{provider === 'other' && <div className="custom-transport-fields"><div className="transport-heading"><Icon name="settings" size={15} />自定义服务器</div><div className="transport-row"><label>IMAP 主机<input value={customImapHost} onChange={(event) => setCustomImapHost(event.target.value)} placeholder="imap.example.com" /></label><label>端口<input type="number" min="1" max="65535" value={customImapPort} onChange={(event) => setCustomImapPort(event.target.value)} /></label><label>安全<input value={customImapSecurity} onChange={(event) => setCustomImapSecurity(event.target.value)} placeholder="tls / starttls" /></label></div><div className="transport-row"><label>SMTP 主机<input value={customSmtpHost} onChange={(event) => setCustomSmtpHost(event.target.value)} placeholder="smtp.example.com" /></label><label>端口<input type="number" min="1" max="65535" value={customSmtpPort} onChange={(event) => setCustomSmtpPort(event.target.value)} /></label><label>安全<input value={customSmtpSecurity} onChange={(event) => setCustomSmtpSecurity(event.target.value)} placeholder="tls / starttls" /></label></div><label>认证方式<select value={customAuthentication} onChange={(event) => setCustomAuthentication(event.target.value)}><option value="password">密码 / 授权码</option><option value="app-password">应用专用密码</option><option value="oauth2">OAuth2 Bearer Token</option></select></label></div>}<div className="guide-box"><div className="guide-heading"><span><Icon name="key" size={17} />{guideTitle}</span><em>{providerDefinition.label}</em></div>{guide.map((step, index) => <div className="guide-step" key={step}><span className="step-number">{index + 1}</span><span><strong>{step}</strong><small>{isOAuth ? (index === 0 ? 'MailGo 会在本机发起安全授权流程' : index === 1 ? '只授予邮件同步所需的账户权限' : '令牌仅保存到本机系统安全存储') : (index === 0 ? `登录 ${providerDefinition.label}，打开设置页面` : index === 1 ? '找到第三方客户端或账户安全选项' : '复制生成的授权凭据，返回此处粘贴')}</small></span>{index === 0 && <button type="button" onClick={onOpenProvider}>{isOAuth ? '开始授权' : '前往设置'} <Icon name="link" size={13} /></button>}</div>)}</div></div></div><div className="modal-footer"><span><Icon name="shieldCheck" size={17} />凭据只保存在本机，不会上传到第三方</span><div>{editingAccountId && <button className="danger-button" type="button" onClick={onRemove}><Icon name="trash" size={16} />移除账户</button>}<button className="secondary-button" type="button" onClick={onClose}>取消</button><button className="gradient-button" type="button" onClick={onAdd}><Icon name="rotate" size={17} />{editingAccountId ? '保存并同步' : '开始同步'}</button></div></div></motion.div></motion.div>
 }
 
-function ComposeModal({ accountId, draftId: openDraftId, onClose, onSent, onError, onDraftChanged, onDraftRemoved }: { accountId?: string; draftId?: string; onClose: () => void; onSent: () => void; onError: (message: string) => void; onDraftChanged?: (draft: NativeDraft) => void; onDraftRemoved?: (draftId: string) => void }) {
+function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraftId, onClose, onSent, onError, onDraftChanged, onDraftRemoved }: { mode: ComposeMode; source?: MailMessage; accountId?: string; senderEmail?: string; draftId?: string; onClose: () => void; onSent: () => void; onError: (message: string) => void; onDraftChanged?: (draft: NativeDraft) => void; onDraftRemoved?: (draftId: string) => void }) {
   const [to, setTo] = useState('')
   const [cc, setCc] = useState('')
   const [bcc, setBcc] = useState('')
@@ -1637,9 +1690,18 @@ function ComposeModal({ accountId, draftId: openDraftId, onClose, onSent, onErro
 
   useEffect(() => {
     let cancelled = false
+    const seed = composeSeed(mode, source, senderEmail)
     setDraftReady(false)
     setDraftStatus('')
-    if (!isNativeRuntime || !accountId) {
+    setDraftId(openDraftId)
+    setTo(seed.to)
+    setCc(seed.cc)
+    setBcc('')
+    setShowCopyFields(Boolean(seed.cc))
+    setSubject(seed.subject)
+    setBody(seed.body)
+    setHtmlMode(false)
+    if (!isNativeRuntime || !accountId || (!openDraftId && mode !== 'new')) {
       setDraftReady(true)
       return () => { cancelled = true }
     }
@@ -1660,7 +1722,7 @@ function ComposeModal({ accountId, draftId: openDraftId, onClose, onSent, onErro
       if (!cancelled) setDraftReady(true)
     })
     return () => { cancelled = true }
-  }, [accountId, isNativeRuntime, onDraftChanged, openDraftId])
+  }, [accountId, isNativeRuntime, mode, onDraftChanged, openDraftId, senderEmail, source])
 
   useEffect(() => {
     if (!isNativeRuntime || !accountId || !draftReady || isSending) return
@@ -1678,10 +1740,11 @@ function ComposeModal({ accountId, draftId: openDraftId, onClose, onSent, onErro
       }, 30_000).then((draft) => {
         setDraftId(draft.id)
         setDraftStatus('草稿已自动保存')
+        onDraftChanged?.(draft)
       }).catch(() => setDraftStatus('草稿保存失败，将在下次输入时重试'))
     }, 700)
     return () => window.clearTimeout(timer)
-  }, [accountId, bcc, body, cc, draftId, draftReady, htmlMode, isNativeRuntime, isSending, subject, to])
+  }, [accountId, bcc, body, cc, draftId, draftReady, htmlMode, isNativeRuntime, isSending, onDraftChanged, subject, to])
 
   const addFiles = (event: React.ChangeEvent<HTMLInputElement>) => {
     const incoming = Array.from(event.target.files ?? [])
@@ -1802,7 +1865,8 @@ function ComposeModal({ accountId, draftId: openDraftId, onClose, onSent, onErro
     }
   }
 
-  return <motion.div className="modal-backdrop compose-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="compose-modal" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1 }} exit={{ opacity: 0, y: 20 }}><div className="compose-header"><strong>新邮件</strong><div><TooltipButton label="最小化撰写窗口"><span className="window-minimize" /></TooltipButton><TooltipButton label="关闭撰写窗口" onClick={onClose}><Icon name="close" size={17} /></TooltipButton></div></div><div className="compose-recipient-row"><label>收件人<input autoFocus value={to} onChange={(event) => setTo(event.target.value)} placeholder="name@example.com，可用逗号分隔多个地址" /></label><button type="button" className="copy-fields-button" onClick={() => setShowCopyFields((value) => !value)} aria-expanded={showCopyFields}>{showCopyFields ? '隐藏抄送' : '抄送 / 密送'}</button></div>{showCopyFields && <><label>抄送<input value={cc} onChange={(event) => setCc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label><label>密送<input value={bcc} onChange={(event) => setBcc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label></>}<label>主题<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="主题" /></label><textarea className="compose-body" value={body} onChange={(event) => setBody(event.target.value)} placeholder={htmlMode ? '输入内容，将以 HTML + 纯文本双格式发送…' : '写下你的邮件…'} />{draftStatus && <div className="compose-draft-status" aria-live="polite"><Icon name="cloud" size={14} />{draftStatus}</div>}{htmlMode && <div className="compose-format-note"><Icon name="grid" size={14} />此邮件将附带安全的 HTML 版本，同时保留纯文本版本</div>}{attachments.length > 0 && <div className="compose-attachments" aria-label="待发送附件">{attachments.map((file, index) => <div className="compose-attachment" key={file.name + '-' + file.size + '-' + index}><span>{file.name}</span><small>{Math.max(1, Math.round(file.size / 1024))} KB</small><button type="button" onClick={() => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))} aria-label={'移除附件 ' + file.name}>×</button></div>)}</div>}{uploadingName && <div className="compose-uploading" aria-live="polite"><Icon name="rotate" size={14} />{uploadingName}</div>}<div className="compose-footer"><div><TooltipButton label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={19} /></TooltipButton><input ref={fileInputRef} type="file" multiple hidden onChange={addFiles} /><TooltipButton label="插入图片" onClick={() => fileInputRef.current?.click()}><Icon name="image" size={19} /></TooltipButton><TooltipButton label={htmlMode ? '关闭 HTML 格式' : '启用 HTML 格式'} active={htmlMode} onClick={() => setHtmlMode((value) => !value)}><span className="reply-a">A</span></TooltipButton></div><div className="compose-send-actions">{draftId && <button type="button" className="danger-button" onClick={() => { void discard() }} disabled={isSending}><Icon name="trash" size={16} />丢弃草稿</button>}<button type="button" className="gradient-button" onClick={send} disabled={isSending}>{isSending ? (uploadingName || '发送中…') : '发送'}<Icon name="send" size={17} /></button></div></div></motion.div></motion.div>
+  const composeTitle = mode === 'reply' ? '回复邮件' : mode === 'reply-all' ? '回复全部' : mode === 'forward' ? '转发邮件' : '新邮件'
+  return <motion.div className="modal-backdrop compose-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="compose-modal" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1 }} exit={{ opacity: 0, y: 20 }}><div className="compose-header"><strong>{composeTitle}</strong><div><TooltipButton label="最小化撰写窗口"><span className="window-minimize" /></TooltipButton><TooltipButton label="关闭撰写窗口" onClick={onClose}><Icon name="close" size={17} /></TooltipButton></div></div><div className="compose-recipient-row"><label>收件人<input autoFocus value={to} onChange={(event) => setTo(event.target.value)} placeholder="name@example.com，可用逗号分隔多个地址" /></label><button type="button" className="copy-fields-button" onClick={() => setShowCopyFields((value) => !value)} aria-expanded={showCopyFields}>{showCopyFields ? '隐藏抄送' : '抄送 / 密送'}</button></div>{showCopyFields && <><label>抄送<input value={cc} onChange={(event) => setCc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label><label>密送<input value={bcc} onChange={(event) => setBcc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label></>}<label>主题<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="主题" /></label><textarea className="compose-body" value={body} onChange={(event) => setBody(event.target.value)} placeholder={htmlMode ? '输入内容，将以 HTML + 纯文本双格式发送…' : '写下你的邮件…'} />{draftStatus && <div className="compose-draft-status" aria-live="polite"><Icon name="cloud" size={14} />{draftStatus}</div>}{htmlMode && <div className="compose-format-note"><Icon name="grid" size={14} />此邮件将附带安全的 HTML 版本，同时保留纯文本版本</div>}{attachments.length > 0 && <div className="compose-attachments" aria-label="待发送附件">{attachments.map((file, index) => <div className="compose-attachment" key={file.name + '-' + file.size + '-' + index}><span>{file.name}</span><small>{Math.max(1, Math.round(file.size / 1024))} KB</small><button type="button" onClick={() => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))} aria-label={'移除附件 ' + file.name}>×</button></div>)}</div>}{uploadingName && <div className="compose-uploading" aria-live="polite"><Icon name="rotate" size={14} />{uploadingName}</div>}<div className="compose-footer"><div><TooltipButton label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={19} /></TooltipButton><input ref={fileInputRef} type="file" multiple hidden onChange={addFiles} /><TooltipButton label="插入图片" onClick={() => fileInputRef.current?.click()}><Icon name="image" size={19} /></TooltipButton><TooltipButton label={htmlMode ? '关闭 HTML 格式' : '启用 HTML 格式'} active={htmlMode} onClick={() => setHtmlMode((value) => !value)}><span className="reply-a">A</span></TooltipButton></div><div className="compose-send-actions">{draftId && <button type="button" className="danger-button" onClick={() => { void discard() }} disabled={isSending}><Icon name="trash" size={16} />丢弃草稿</button>}<button type="button" className="gradient-button" onClick={send} disabled={isSending}>{isSending ? (uploadingName || '发送中…') : '发送'}<Icon name="send" size={17} /></button></div></div></motion.div></motion.div>
 }
 
 export default App
