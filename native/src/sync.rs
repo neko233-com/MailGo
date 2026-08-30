@@ -633,12 +633,36 @@ fn classify_sync_error(error: &anyhow::Error) -> SyncErrorClass {
 }
 
 fn retry_delay(error: &anyhow::Error, attempt: u32) -> Option<Duration> {
+    if let Some(retry_after) = retry_after_seconds(error) {
+        return Some(Duration::from_secs(retry_after.clamp(1, 300)));
+    }
     let delay_seconds = match classify_sync_error(error) {
         SyncErrorClass::Transport => 1u64 << attempt,
         SyncErrorClass::RateLimited => 5u64.saturating_mul(1u64 << attempt),
         SyncErrorClass::Authentication | SyncErrorClass::Permanent => return None,
     };
     Some(Duration::from_secs(delay_seconds.min(60)))
+}
+
+/// Honor a provider's Retry-After hint when it survives the transport error text. The IMAP crate
+/// does not expose arbitrary response headers, so this parser is intentionally conservative and
+/// falls back to bounded exponential delays when no numeric hint is present.
+fn retry_after_seconds(error: &anyhow::Error) -> Option<u64> {
+    let message = error.to_string().to_ascii_lowercase();
+    for marker in ["retry-after", "retry after", "retry_after"] {
+        let Some(start) = message.find(marker) else {
+            continue;
+        };
+        let digits = message[start + marker.len()..]
+            .chars()
+            .skip_while(|character| !character.is_ascii_digit())
+            .take_while(|character| character.is_ascii_digit())
+            .collect::<String>();
+        if let Ok(seconds) = digits.parse::<u64>() {
+            return Some(seconds);
+        }
+    }
+    None
 }
 
 /// Download and parse one full message only when the reader asks for it. The raw message can be
@@ -1618,6 +1642,14 @@ mod tests {
         assert_eq!(
             retry_delay(&anyhow!("IMAP provider rate limit: too many requests"), 1),
             Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            retry_delay(&anyhow!("HTTP 429 Retry-After: 37"), 0),
+            Some(Duration::from_secs(37))
+        );
+        assert_eq!(
+            retry_delay(&anyhow!("retry_after=9999"), 0),
+            Some(Duration::from_secs(300))
         );
         assert!(retry_delay(&anyhow!("IMAP authentication failed"), 0).is_none());
         assert!(retry_delay(&anyhow!("unsupported mail provider"), 0).is_none());
