@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,9 +16,25 @@ const HEADER_FETCH_QUERY: &str = "UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]";
 const FULL_FETCH_QUERY: &str = "UID FLAGS RFC822";
 const MAX_HEADER_MESSAGES: usize = 100;
 const MAX_DISCOVERED_FOLDERS: usize = 64;
+const MAX_UIDS_PER_QUERY: usize = 100_000;
+const MAX_CACHED_MESSAGES_PER_FOLDER: usize = 5_000;
+const MAX_CACHE_FILE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_HEADER_BYTES: usize = 256 * 1024;
+const MAX_HEADER_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MUTATIONS: usize = 1_000;
+const MAX_MUTATION_FILE_BYTES: usize = 2 * 1024 * 1024;
 const CACHE_FILE: &str = "inbox.bin";
 const MUTATION_FILE: &str = "mutations.bin";
 const MOVE_MUTATION_FILE: &str = "moves.bin";
+
+static CACHE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn cache_write_guard() -> std::sync::MutexGuard<'static, ()> {
+    CACHE_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("MailGo cache write lock poisoned")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +43,8 @@ struct PendingFlagMutation {
     uid: u32,
     flag: String,
     enabled: bool,
+    #[serde(default)]
+    uid_validity: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +55,8 @@ struct PendingMoveMutation {
     uid: u32,
     #[serde(default)]
     target_folder: Option<String>,
+    #[serde(default)]
+    uid_validity: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +159,18 @@ pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathB
                         continue;
                     }
                 };
+                if let Err(error) = crate::outbox::flush_due(
+                    &cache_root,
+                    &account.id,
+                    profile.clone(),
+                    &account.email,
+                    &credential,
+                ) {
+                    tracing::warn!(
+                        account_id = %account.id,
+                        "background outbox flush failed: {error}"
+                    );
+                }
                 match sync_account(
                     &account.id,
                     profile,
@@ -311,6 +343,9 @@ fn sync_folder_latest(
         .into_iter()
         .collect::<Vec<_>>();
     all_uids.sort_unstable();
+    if all_uids.len() > MAX_UIDS_PER_QUERY {
+        all_uids.drain(..all_uids.len() - MAX_UIDS_PER_QUERY);
+    }
     let current_uids = all_uids.iter().copied().collect::<HashSet<_>>();
     let total_uids = all_uids.len();
     let mut cached = load_mailbox_for_folder(cache_root, account_id, folder)?
@@ -350,11 +385,19 @@ fn sync_folder_latest(
         let fetched = session
             .uid_fetch(uid_set, HEADER_FETCH_QUERY)
             .with_context(|| format!("fetch {folder} message headers"))?;
+        let mut header_bytes = 0usize;
         for item in fetched.iter() {
             let Some(uid) = item.uid else { continue };
             let Some(header) = item.header() else {
                 continue;
             };
+            if header.len() > MAX_HEADER_BYTES {
+                continue;
+            }
+            header_bytes = header_bytes.saturating_add(header.len());
+            if header_bytes > MAX_HEADER_TOTAL_BYTES {
+                break;
+            }
             let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
             let starred = item
                 .flags()
@@ -533,6 +576,9 @@ fn sync_folder_page_once(
         .into_iter()
         .collect::<Vec<_>>();
     uids.sort_unstable();
+    if uids.len() > MAX_UIDS_PER_QUERY {
+        uids.drain(..uids.len() - MAX_UIDS_PER_QUERY);
+    }
     let has_more = uids.len() > page_size;
     let selected_uids = uids
         .iter()
@@ -550,11 +596,19 @@ fn sync_folder_page_once(
         let fetched = session
             .uid_fetch(uid_set, HEADER_FETCH_QUERY)
             .with_context(|| format!("fetch {folder} message headers"))?;
+        let mut header_bytes = 0usize;
         for item in fetched.iter() {
             let Some(uid) = item.uid else { continue };
             let Some(header) = item.header() else {
                 continue;
             };
+            if header.len() > MAX_HEADER_BYTES {
+                continue;
+            }
+            header_bytes = header_bytes.saturating_add(header.len());
+            if header_bytes > MAX_HEADER_TOTAL_BYTES {
+                break;
+            }
             let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
             let starred = item
                 .flags()
@@ -855,15 +909,28 @@ fn load_mailbox_file(
     encrypted: bool,
 ) -> Result<CachedMailbox> {
     let contents = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    if contents.len() > MAX_CACHE_FILE_BYTES {
+        return Err(anyhow!("mailbox cache is too large"));
+    }
     let decoded = if encrypted {
         unprotect_cache(&contents).with_context(|| format!("decrypt {}", path.display()))?
     } else {
         contents
     };
+    if decoded.len() > MAX_CACHE_FILE_BYTES {
+        return Err(anyhow!("mailbox cache is too large"));
+    }
     let mailbox: CachedMailbox =
         serde_json::from_slice(&decoded).with_context(|| format!("parse {}", path.display()))?;
     if mailbox.account_id != account_id || !mailbox.folder.eq_ignore_ascii_case(folder) {
         return Err(anyhow!("cache identity mismatch in {}", path.display()));
+    }
+    if mailbox.messages.len() > MAX_CACHED_MESSAGES_PER_FOLDER {
+        return Err(anyhow!("mailbox cache contains too many messages"));
+    }
+    let mut mailbox = mailbox;
+    for message in &mut mailbox.messages {
+        crate::mail::bound_cached_message(message);
     }
     Ok(mailbox)
 }
@@ -900,6 +967,7 @@ pub fn save_cached_message(
     account_id: &str,
     message: &CachedMessage,
 ) -> Result<()> {
+    let _write_guard = cache_write_guard();
     let mut mailbox = load_mailbox_for_folder(cache_root, account_id, &message.folder)?
         .unwrap_or_else(|| CachedMailbox::empty(account_id, message.folder.as_str()));
     mailbox
@@ -911,7 +979,7 @@ pub fn save_cached_message(
         .sort_by_key(|cached| std::cmp::Reverse(cached.uid));
     mailbox.oldest_uid = mailbox.messages.iter().map(|cached| cached.uid).min();
     mailbox.synced_at = now_stamp();
-    save_mailbox(cache_root, account_id, &mailbox).map(|_| ())
+    save_mailbox_unlocked(cache_root, account_id, &mailbox).map(|_| ())
 }
 
 pub fn update_cached_flags(
@@ -922,6 +990,7 @@ pub fn update_cached_flags(
     flag: &str,
     enabled: bool,
 ) -> Result<()> {
+    let _write_guard = cache_write_guard();
     let Some(mut mailbox) = load_mailbox_for_folder(cache_root, account_id, folder)? else {
         return Ok(());
     };
@@ -935,7 +1004,7 @@ pub fn update_cached_flags(
             "\\Flagged" => message.starred = enabled,
             _ => return Ok(()),
         }
-        save_mailbox(cache_root, account_id, &mailbox)?;
+        save_mailbox_unlocked(cache_root, account_id, &mailbox)?;
     }
     Ok(())
 }
@@ -951,6 +1020,17 @@ fn refresh_mailbox_metadata(mailbox: &mut CachedMailbox) {
 /// Move a cached message between folder caches immediately. The provider operation may still be
 /// queued, but the local UI must reflect the user's action while offline.
 pub fn update_cached_move(
+    cache_root: &Path,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    target_folder: &str,
+) -> Result<()> {
+    let _write_guard = cache_write_guard();
+    update_cached_move_unlocked(cache_root, account_id, folder, uid, target_folder)
+}
+
+fn update_cached_move_unlocked(
     cache_root: &Path,
     account_id: &str,
     folder: &str,
@@ -982,12 +1062,22 @@ pub fn update_cached_move(
     target.messages.retain(|item| item.uid != uid);
     target.messages.push(message);
     refresh_mailbox_metadata(&mut target);
-    save_mailbox(cache_root, account_id, &target)?;
-    save_mailbox(cache_root, account_id, &source)?;
+    save_mailbox_unlocked(cache_root, account_id, &target)?;
+    save_mailbox_unlocked(cache_root, account_id, &source)?;
     Ok(())
 }
 
 pub fn remove_cached_message(
+    cache_root: &Path,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+) -> Result<()> {
+    let _write_guard = cache_write_guard();
+    remove_cached_message_unlocked(cache_root, account_id, folder, uid)
+}
+
+fn remove_cached_message_unlocked(
     cache_root: &Path,
     account_id: &str,
     folder: &str,
@@ -1000,7 +1090,7 @@ pub fn remove_cached_message(
         .messages
         .retain(|message| !(message.uid == uid && message.folder.eq_ignore_ascii_case(folder)));
     refresh_mailbox_metadata(&mut mailbox);
-    save_mailbox(cache_root, account_id, &mailbox).map(|_| ())
+    save_mailbox_unlocked(cache_root, account_id, &mailbox).map(|_| ())
 }
 
 fn validate_mailbox_name(name: &str) -> Result<()> {
@@ -1130,6 +1220,11 @@ pub fn delete_message(
 ) -> Result<()> {
     validate_mailbox_name(folder)?;
     validate_mailbox_name(trash_folder)?;
+    if folder.eq_ignore_ascii_case(trash_folder) && !is_trash_folder(profile.provider, folder) {
+        return Err(anyhow!(
+            "permanent delete is only allowed from the provider trash folder"
+        ));
+    }
     let mut session = authenticate(&profile, email, credential)?;
     session.select(folder)?;
     let result = if folder.eq_ignore_ascii_case(trash_folder) {
@@ -1141,6 +1236,16 @@ pub fn delete_message(
     result
 }
 
+pub fn is_trash_folder(provider: crate::providers::ProviderKind, folder: &str) -> bool {
+    let expected = match provider {
+        crate::providers::ProviderKind::Google => "[Gmail]/Trash",
+        crate::providers::ProviderKind::Qq => "Trash",
+        crate::providers::ProviderKind::Outlook => "Deleted Items",
+        crate::providers::ProviderKind::Other => "Trash",
+    };
+    folder.eq_ignore_ascii_case(expected)
+}
+
 pub fn queue_move_mutation(
     cache_root: &Path,
     account_id: &str,
@@ -1149,6 +1254,7 @@ pub fn queue_move_mutation(
     uid: u32,
     target_folder: Option<&str>,
 ) -> Result<()> {
+    let _write_guard = cache_write_guard();
     if !matches!(operation, "move" | "archive" | "delete") {
         return Err(anyhow!("unsupported queued mail operation"));
     }
@@ -1156,6 +1262,8 @@ pub fn queue_move_mutation(
     if let Some(target) = target_folder {
         validate_mailbox_name(target)?;
     }
+    let uid_validity = load_mailbox_for_folder(cache_root, account_id, folder)?
+        .and_then(|mailbox| mailbox.uid_validity);
     let directory = cache_root.join(safe_component(account_id));
     fs::create_dir_all(&directory).with_context(|| format!("create {}", directory.display()))?;
     let path = directory.join(MOVE_MUTATION_FILE);
@@ -1170,8 +1278,9 @@ pub fn queue_move_mutation(
         folder: folder.to_string(),
         uid,
         target_folder: target_folder.map(ToOwned::to_owned),
+        uid_validity,
     });
-    save_move_mutations(&path, &mutations)
+    save_move_mutations_unlocked(&path, &mutations)
 }
 
 pub fn remove_queued_move(
@@ -1181,6 +1290,7 @@ pub fn remove_queued_move(
     folder: &str,
     uid: u32,
 ) -> Result<()> {
+    let _write_guard = cache_write_guard();
     let path = cache_root
         .join(safe_component(account_id))
         .join(MOVE_MUTATION_FILE);
@@ -1192,7 +1302,7 @@ pub fn remove_queued_move(
             && mutation.operation == operation)
     });
     if mutations.len() != original_len {
-        save_move_mutations(&path, &mutations)?;
+        save_move_mutations_unlocked(&path, &mutations)?;
     }
     Ok(())
 }
@@ -1220,6 +1330,7 @@ fn flush_queued_moves(
     account_id: &str,
     provider: crate::providers::ProviderKind,
 ) {
+    let _write_guard = cache_write_guard();
     let path = cache_root
         .join(safe_component(account_id))
         .join(MOVE_MUTATION_FILE);
@@ -1231,36 +1342,48 @@ fn flush_queued_moves(
     }
     let mut remaining = Vec::new();
     for mutation in mutations {
-        let applied = match session.select(&mutation.folder) {
-            Ok(_) => match mutation.operation.as_str() {
-                "archive" => mutation
+        let selected = match session.select(&mutation.folder) {
+            Ok(mailbox) => mailbox,
+            Err(error) => {
+                remaining.push(mutation);
+                tracing::debug!(account_id = %account_id, "select queued move folder failed: {error}");
+                continue;
+            }
+        };
+        if !uid_validity_matches(mutation.uid_validity, selected.uid_validity) {
+            tracing::warn!(account_id = %account_id, uid = mutation.uid, "discarding stale queued mail move after UIDVALIDITY changed");
+            continue;
+        }
+        let permanent_delete = mutation.operation == "delete"
+            && (mutation.target_folder.is_none()
+                || mutation
                     .target_folder
                     .as_deref()
-                    .ok_or_else(|| anyhow!("queued archive has no target folder"))
-                    .and_then(|target| {
-                        archive_uid(session, provider, &mutation.folder, mutation.uid, target)
-                    }),
-                "delete"
-                    if mutation.target_folder.is_none()
-                        || mutation.target_folder.as_deref().is_some_and(|target| {
-                            target.eq_ignore_ascii_case(&mutation.folder)
-                        }) =>
-                {
-                    delete_uid(session, mutation.uid)
-                }
-                "delete" => mutation
-                    .target_folder
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("queued delete has no trash folder"))
-                    .and_then(|target| move_uid(session, mutation.uid, target)),
-                "move" => mutation
-                    .target_folder
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("queued move has no target folder"))
-                    .and_then(|target| move_uid(session, mutation.uid, target)),
-                _ => Err(anyhow!("unsupported queued mail operation")),
-            },
-            Err(error) => Err(anyhow!("select queued mutation folder: {error}")),
+                    .is_some_and(|target| target.eq_ignore_ascii_case(&mutation.folder)));
+        if permanent_delete && !is_trash_folder(provider, &mutation.folder) {
+            tracing::warn!(account_id = %account_id, uid = mutation.uid, "discarding unsafe queued permanent delete outside provider trash");
+            continue;
+        }
+        let applied = match mutation.operation.as_str() {
+            "archive" => mutation
+                .target_folder
+                .as_deref()
+                .ok_or_else(|| anyhow!("queued archive has no target folder"))
+                .and_then(|target| {
+                    archive_uid(session, provider, &mutation.folder, mutation.uid, target)
+                }),
+            "delete" if permanent_delete => delete_uid(session, mutation.uid),
+            "delete" => mutation
+                .target_folder
+                .as_deref()
+                .ok_or_else(|| anyhow!("queued delete has no trash folder"))
+                .and_then(|target| move_uid(session, mutation.uid, target)),
+            "move" => mutation
+                .target_folder
+                .as_deref()
+                .ok_or_else(|| anyhow!("queued move has no target folder"))
+                .and_then(|target| move_uid(session, mutation.uid, target)),
+            _ => Err(anyhow!("unsupported queued mail operation")),
         }
         .is_ok();
         if applied {
@@ -1271,9 +1394,14 @@ fn flush_queued_moves(
                         .as_deref()
                         .is_some_and(|target| target.eq_ignore_ascii_case(&mutation.folder)))
             {
-                remove_cached_message(cache_root, account_id, &mutation.folder, mutation.uid)
+                remove_cached_message_unlocked(
+                    cache_root,
+                    account_id,
+                    &mutation.folder,
+                    mutation.uid,
+                )
             } else if let Some(target) = mutation.target_folder.as_deref() {
-                update_cached_move(
+                update_cached_move_unlocked(
                     cache_root,
                     account_id,
                     &mutation.folder,
@@ -1290,7 +1418,7 @@ fn flush_queued_moves(
             remaining.push(mutation);
         }
     }
-    if let Err(error) = save_move_mutations(&path, &remaining) {
+    if let Err(error) = save_move_mutations_unlocked(&path, &remaining) {
         tracing::warn!(account_id = %account_id, "save pending mail moves failed: {error}");
     }
 }
@@ -1327,6 +1455,7 @@ pub fn queue_flag_mutation(
     flag: &str,
     enabled: bool,
 ) -> Result<()> {
+    let _write_guard = cache_write_guard();
     validate_mailbox_name(folder)?;
     let directory = cache_root.join(safe_component(account_id));
     fs::create_dir_all(&directory).with_context(|| format!("create {}", directory.display()))?;
@@ -1342,8 +1471,10 @@ pub fn queue_flag_mutation(
         uid,
         flag: flag.to_string(),
         enabled,
+        uid_validity: load_mailbox_for_folder(cache_root, account_id, folder)?
+            .and_then(|mailbox| mailbox.uid_validity),
     });
-    save_mutations(&path, &mutations)
+    save_mutations_unlocked(&path, &mutations)
 }
 
 pub fn remove_queued_flag(
@@ -1353,6 +1484,7 @@ pub fn remove_queued_flag(
     uid: u32,
     flag: &str,
 ) -> Result<()> {
+    let _write_guard = cache_write_guard();
     let path = cache_root
         .join(safe_component(account_id))
         .join(MUTATION_FILE);
@@ -1364,7 +1496,7 @@ pub fn remove_queued_flag(
             && mutation.flag == flag)
     });
     if mutations.len() != original_len {
-        save_mutations(&path, &mutations)?;
+        save_mutations_unlocked(&path, &mutations)?;
     }
     Ok(())
 }
@@ -1374,6 +1506,7 @@ fn flush_queued_flags(
     cache_root: &Path,
     account_id: &str,
 ) {
+    let _write_guard = cache_write_guard();
     let path = cache_root
         .join(safe_component(account_id))
         .join(MUTATION_FILE);
@@ -1385,36 +1518,61 @@ fn flush_queued_flags(
     }
     let mut remaining = Vec::new();
     for mutation in mutations {
-        let applied = session
-            .select(&mutation.folder)
-            .and_then(|_| {
-                let operation = if mutation.enabled {
-                    "+FLAGS.SILENT"
-                } else {
-                    "-FLAGS.SILENT"
-                };
-                session
-                    .uid_store(
-                        mutation.uid.to_string(),
-                        format!("{operation} ({})", mutation.flag),
-                    )
-                    .map(|_| ())
-            })
-            .is_ok();
+        let selected = match session.select(&mutation.folder) {
+            Ok(mailbox) => mailbox,
+            Err(error) => {
+                remaining.push(mutation);
+                tracing::debug!(account_id = %account_id, "select queued flag folder failed: {error}");
+                continue;
+            }
+        };
+        if !uid_validity_matches(mutation.uid_validity, selected.uid_validity) {
+            tracing::warn!(account_id = %account_id, uid = mutation.uid, "discarding stale queued mail flag after UIDVALIDITY changed");
+            continue;
+        }
+        let applied = {
+            let operation = if mutation.enabled {
+                "+FLAGS.SILENT"
+            } else {
+                "-FLAGS.SILENT"
+            };
+            session
+                .uid_store(
+                    mutation.uid.to_string(),
+                    format!("{operation} ({})", mutation.flag),
+                )
+                .map(|_| ())
+        }
+        .is_ok();
         if !applied {
             remaining.push(mutation);
         }
     }
-    if let Err(error) = save_mutations(&path, &remaining) {
+    if let Err(error) = save_mutations_unlocked(&path, &remaining) {
         tracing::warn!(account_id = %account_id, "save pending mail mutations failed: {error}");
     }
+}
+
+fn uid_validity_matches(expected: Option<u32>, current: Option<u32>) -> bool {
+    expected.is_some_and(|value| current == Some(value))
 }
 
 fn load_mutations(path: &Path) -> Result<Vec<PendingFlagMutation>> {
     match fs::read(path) {
         Ok(contents) => {
+            if contents.len() > MAX_MUTATION_FILE_BYTES {
+                return Err(anyhow!("pending mail flag mutations are too large"));
+            }
             let decoded = unprotect_cache(&contents)?;
-            serde_json::from_slice(&decoded).context("parse pending mail mutations")
+            if decoded.len() > MAX_MUTATION_FILE_BYTES {
+                return Err(anyhow!("pending mail flag mutations are too large"));
+            }
+            let mutations: Vec<PendingFlagMutation> =
+                serde_json::from_slice(&decoded).context("parse pending mail mutations")?;
+            if mutations.len() > MAX_MUTATIONS {
+                return Err(anyhow!("too many pending mail flag mutations"));
+            }
+            Ok(mutations)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
@@ -1424,17 +1582,38 @@ fn load_mutations(path: &Path) -> Result<Vec<PendingFlagMutation>> {
 fn load_move_mutations(path: &Path) -> Result<Vec<PendingMoveMutation>> {
     match fs::read(path) {
         Ok(contents) => {
+            if contents.len() > MAX_MUTATION_FILE_BYTES {
+                return Err(anyhow!("pending mail move mutations are too large"));
+            }
             let decoded = unprotect_cache(&contents)?;
-            serde_json::from_slice(&decoded).context("parse pending mail moves")
+            if decoded.len() > MAX_MUTATION_FILE_BYTES {
+                return Err(anyhow!("pending mail move mutations are too large"));
+            }
+            let mutations: Vec<PendingMoveMutation> =
+                serde_json::from_slice(&decoded).context("parse pending mail moves")?;
+            if mutations.len() > MAX_MUTATIONS {
+                return Err(anyhow!("too many pending mail move mutations"));
+            }
+            Ok(mutations)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
     }
 }
 
-fn save_mutations(path: &Path, mutations: &[PendingFlagMutation]) -> Result<()> {
+fn save_mutations_unlocked(path: &Path, mutations: &[PendingFlagMutation]) -> Result<()> {
+    if mutations.len() > MAX_MUTATIONS {
+        return Err(anyhow!("too many pending mail flag mutations"));
+    }
     let temporary = path.with_extension("bin.tmp");
-    let payload = protect_cache(&serde_json::to_vec(mutations)?)?;
+    let serialized = serde_json::to_vec(mutations)?;
+    if serialized.len() > MAX_MUTATION_FILE_BYTES {
+        return Err(anyhow!("pending mail flag mutations are too large"));
+    }
+    let payload = protect_cache(&serialized)?;
+    if payload.len() > MAX_MUTATION_FILE_BYTES {
+        return Err(anyhow!("pending mail flag mutations are too large"));
+    }
     fs::write(&temporary, payload).context("write pending mail mutations")?;
     if path.exists() {
         fs::remove_file(path).context("replace pending mail mutations")?;
@@ -1443,9 +1622,19 @@ fn save_mutations(path: &Path, mutations: &[PendingFlagMutation]) -> Result<()> 
     Ok(())
 }
 
-fn save_move_mutations(path: &Path, mutations: &[PendingMoveMutation]) -> Result<()> {
+fn save_move_mutations_unlocked(path: &Path, mutations: &[PendingMoveMutation]) -> Result<()> {
+    if mutations.len() > MAX_MUTATIONS {
+        return Err(anyhow!("too many pending mail move mutations"));
+    }
     let temporary = path.with_extension("bin.tmp");
-    let payload = protect_cache(&serde_json::to_vec(mutations)?)?;
+    let serialized = serde_json::to_vec(mutations)?;
+    if serialized.len() > MAX_MUTATION_FILE_BYTES {
+        return Err(anyhow!("pending mail move mutations are too large"));
+    }
+    let payload = protect_cache(&serialized)?;
+    if payload.len() > MAX_MUTATION_FILE_BYTES {
+        return Err(anyhow!("pending mail move mutations are too large"));
+    }
     fs::write(&temporary, payload).context("write pending mail moves")?;
     if path.exists() {
         fs::remove_file(path).context("replace pending mail moves")?;
@@ -1455,12 +1644,40 @@ fn save_move_mutations(path: &Path, mutations: &[PendingMoveMutation]) -> Result
 }
 
 fn save_mailbox(cache_root: &Path, account_id: &str, mailbox: &CachedMailbox) -> Result<PathBuf> {
+    let _write_guard = cache_write_guard();
+    save_mailbox_unlocked(cache_root, account_id, mailbox)
+}
+
+fn save_mailbox_unlocked(
+    cache_root: &Path,
+    account_id: &str,
+    mailbox: &CachedMailbox,
+) -> Result<PathBuf> {
     let directory = cache_root.join(safe_component(account_id));
     fs::create_dir_all(&directory).with_context(|| format!("create {}", directory.display()))?;
     let file_name = cache_file_name(&mailbox.folder);
     let path = directory.join(&file_name);
     let temporary = directory.join(format!("{file_name}.tmp"));
-    let payload = protect_cache(&serde_json::to_vec_pretty(mailbox)?)?;
+    let mut bounded_mailbox = mailbox.clone();
+    if bounded_mailbox.messages.len() > MAX_CACHED_MESSAGES_PER_FOLDER {
+        bounded_mailbox
+            .messages
+            .truncate(MAX_CACHED_MESSAGES_PER_FOLDER);
+        bounded_mailbox.has_more = true;
+        bounded_mailbox.oldest_uid = bounded_mailbox
+            .messages
+            .iter()
+            .map(|message| message.uid)
+            .min();
+    }
+    let serialized = serde_json::to_vec_pretty(&bounded_mailbox)?;
+    if serialized.len() > MAX_CACHE_FILE_BYTES {
+        return Err(anyhow!("mailbox cache is too large"));
+    }
+    let payload = protect_cache(&serialized)?;
+    if payload.len() > MAX_CACHE_FILE_BYTES {
+        return Err(anyhow!("mailbox cache is too large"));
+    }
     fs::write(&temporary, payload).context("write mailbox cache")?;
     if path.exists() {
         let backup = directory.join(format!("{file_name}.bak"));
@@ -1803,6 +2020,7 @@ mod tests {
             folder: "INBOX".into(),
             uid: 42,
             target_folder: Some("[Gmail]/All Mail".into()),
+            uid_validity: Some(7),
         };
         let value = serde_json::to_value(mutation).unwrap();
         assert_eq!(value["operation"], "archive");

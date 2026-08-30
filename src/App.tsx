@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Icon, type IconName } from './components/Icon'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
 import { invoke, readNativeState } from './lib/ipc'
-import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeDraft, NativeMailboxResponse, NativeMessageResponse, NativeQueueStatus, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
+import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeDraft, NativeMailboxResponse, NativeMessageResponse, NativeOutboxStatus, NativeQueueStatus, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 type ToastTone = 'info' | 'success' | 'error'
 type Toast = { id: number; message: string; tone: ToastTone }
@@ -324,6 +324,8 @@ function App() {
   const [remoteImagesEnabled, setRemoteImagesEnabled] = useState(loadRemoteImages)
   const [hideAds, setHideAds] = useState(loadHideAds)
   const [pendingOperations, setPendingOperations] = useState(0)
+  const [outboxTotal, setOutboxTotal] = useState(0)
+  const [outboxPaused, setOutboxPaused] = useState(0)
   const [nativeDrafts, setNativeDrafts] = useState<NativeDraft[]>([])
   const [provider, setProvider] = useState<Provider>('qq')
   const [accountEmail, setAccountEmail] = useState('')
@@ -370,6 +372,21 @@ function App() {
       setPendingOperations(statuses.reduce((total, status) => total + status.total, 0))
     } catch {
       // Queue status is telemetry for the local UI; a transient read failure must not interrupt mail actions.
+    }
+  }
+
+  const refreshOutbox = async (accountList: MailAccount[] = accounts) => {
+    if (!isNativeRuntime) {
+      setOutboxTotal(0)
+      setOutboxPaused(0)
+      return
+    }
+    try {
+      const statuses = await Promise.all(accountList.map((account) => invoke<NativeOutboxStatus>('mail.outbox.status', { accountId: account.id })))
+      setOutboxTotal(statuses.reduce((total, status) => total + status.total, 0))
+      setOutboxPaused(statuses.reduce((total, status) => total + status.paused, 0))
+    } catch {
+      // Outbox telemetry is intentionally non-blocking; the encrypted queue remains native-owned.
     }
   }
 
@@ -474,6 +491,7 @@ function App() {
       setRemoteImagesEnabled(nativeState.remoteImagesEnabled ?? false)
       setHideAds(nativeState.hideAds ?? false)
       void refreshPendingOperations(nativeState.accounts)
+      void refreshOutbox(nativeState.accounts)
       void refreshNativeDrafts(nativeState.accounts)
       if (!isNativeRuntime) return
       await Promise.all(nativeState.accounts.map(async (account) => {
@@ -1095,6 +1113,7 @@ function App() {
           }
         }))
         await refreshPendingOperations(accounts)
+        await refreshOutbox(accounts)
       }
     } catch {
       // Browser preview has no account transport. Keep the design-time demo responsive.
@@ -1103,6 +1122,23 @@ function App() {
       pushToast('所有账户已完成同步', 'success')
     } finally {
       setSyncing(false)
+    }
+  }
+
+  const retryPendingOutbox = async () => {
+    if (!isNativeRuntime || !accounts.length) return
+    try {
+      const results = await Promise.all(accounts.map((account) => invoke<{ reset: number }>('mail.outbox.retry_all', { accountId: account.id })))
+      const reset = results.reduce((total, result) => total + result.reset, 0)
+      await refreshOutbox()
+      if (reset > 0) {
+        pushToast(`已恢复 ${reset} 封待发送邮件，正在尝试发送`, 'info')
+        void handleSync()
+      } else {
+        pushToast('当前没有需要手动重试的待发送邮件', 'info')
+      }
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : '发件箱暂时无法操作', 'error')
     }
   }
 
@@ -1332,6 +1368,10 @@ function App() {
     const file = event.target.files?.[0]
     event.target.value = ''
     if (!file) return
+    if (file.size > 2 * 1024 * 1024) {
+      pushToast('配置文件必须小于 2 MB', 'error')
+      return
+    }
     setImporting(true)
     try {
       const parsed = JSON.parse(await file.text()) as { accounts?: unknown[]; schemaVersion?: number }
@@ -1525,7 +1565,7 @@ function App() {
           <div className="storage-bar">
             <div className="storage-meta"><span>本地缓存</span><span>4.2 GB / 15 GB</span></div>
             <div className="storage-track"><span /></div>
-            <div className="storage-foot"><span aria-live="polite"><Icon name={pendingOperations ? 'rotate' : 'cloud'} size={13} /> {pendingOperations ? `${pendingOperations} 项操作待同步` : '离线可查看最近邮件'}</span><button type="button" onClick={handleSync}><Icon name="rotate" size={13} /> {isSyncing ? '同步中…' : '立即同步'}</button></div>
+            <div className="storage-foot"><span aria-live="polite"><Icon name={outboxTotal || pendingOperations ? 'rotate' : 'cloud'} size={13} /> {outboxTotal ? `${outboxTotal} 封待发送${outboxPaused ? ` · ${outboxPaused} 封需重试` : ''}` : pendingOperations ? `${pendingOperations} 项操作待同步` : '离线可查看最近邮件'}</span><div className="storage-foot-actions">{outboxPaused > 0 && <button type="button" onClick={() => { void retryPendingOutbox() }}><Icon name="rotate" size={13} />重试待发送</button>}<button type="button" onClick={handleSync}><Icon name="rotate" size={13} /> {isSyncing ? '同步中…' : '立即同步'}</button></div></div>
           </div>
 
           <div className="sidebar-quick-settings">
@@ -1626,7 +1666,7 @@ function App() {
       </AnimatePresence>
 
       <AnimatePresence>{isHelpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}</AnimatePresence>
-      <AnimatePresence>{isComposeOpen && <ComposeModal mode={composeMode} source={composeSource} accountId={composeSource?.accountId ?? selectedAccountId ?? accounts[0]?.id} senderEmail={accounts.find((account) => account.id === (composeSource?.accountId ?? selectedAccountId))?.email ?? accounts[0]?.email} draftId={composeDraftId} onDraftChanged={handleDraftChanged} onDraftRemoved={handleDraftRemoved} onClose={() => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts() }} onSent={() => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts(); pushToast('邮件已发送', 'success') }} onError={(message) => pushToast(message, 'error')} />}</AnimatePresence>
+      <AnimatePresence>{isComposeOpen && <ComposeModal mode={composeMode} source={composeSource} accountId={composeSource?.accountId ?? selectedAccountId ?? accounts[0]?.id} senderEmail={accounts.find((account) => account.id === (composeSource?.accountId ?? selectedAccountId))?.email ?? accounts[0]?.email} draftId={composeDraftId} onDraftChanged={handleDraftChanged} onDraftRemoved={handleDraftRemoved} onClose={() => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts() }} onSent={(queued) => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts(); void refreshOutbox(); pushToast(queued ? '网络暂不可用，邮件已加入发件箱，联网后自动重试' : '邮件已发送', 'success') }} onError={(message) => pushToast(message, 'error')} />}</AnimatePresence>
       <AnimatePresence>{isAccountModalOpen && <AccountModal editingAccountId={editingAccountId} provider={provider} setProvider={changeProvider} providerDefinition={selectedProvider} accountEmail={accountEmail} setAccountEmail={setAccountEmail} authorizationCode={authorizationCode} setAuthorizationCode={setAuthorizationCode} showAuthorizationCode={showAuthorizationCode} setShowAuthorizationCode={setShowAuthorizationCode} customImapHost={customImapHost} setCustomImapHost={setCustomImapHost} customImapPort={customImapPort} setCustomImapPort={setCustomImapPort} customImapSecurity={customImapSecurity} setCustomImapSecurity={setCustomImapSecurity} customSmtpHost={customSmtpHost} setCustomSmtpHost={setCustomSmtpHost} customSmtpPort={customSmtpPort} setCustomSmtpPort={setCustomSmtpPort} customSmtpSecurity={customSmtpSecurity} setCustomSmtpSecurity={setCustomSmtpSecurity} customAuthentication={customAuthentication} setCustomAuthentication={setCustomAuthentication} deviceFlow={deviceFlow} onClose={() => setAccountModalOpen(false)} onOpenProvider={() => { void handleOpenProvider() }} onCopy={handleCopy} onAdd={handleAddAccount} onRemove={handleRemoveAccount} />}</AnimatePresence>
       <AnimatePresence>{transferMode && <TransferModal mode={transferMode} fileName={transferFile?.name} isBusy={isImporting} onClose={() => { if (!isImporting) { setTransferMode(null); setTransferFile(null) } }} onSubmit={handleEncryptedTransfer} />}</AnimatePresence>
       <div className="toast-stack" aria-live="polite">{toasts.map((toast) => <motion.div key={toast.id} className={`toast toast-${toast.tone}`} initial={{ opacity: 0, y: 12, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 12 }}><Icon name={toast.tone === 'success' ? 'checkCircle' : toast.tone === 'error' ? 'info' : 'bell'} size={17} /><span>{toast.message}</span></motion.div>)}</div>
@@ -1669,7 +1709,7 @@ function AccountModal({ editingAccountId, provider, setProvider, providerDefinit
   return <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="account-modal" initial={{ opacity: 0, y: 14, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 8, scale: 0.98 }} role="dialog" aria-modal="true" aria-labelledby="account-modal-title"><div className="modal-header"><div><Icon name="user" size={21} /><h2 id="account-modal-title">{editingAccountId ? '重新授权账户' : '添加账户'}</h2></div><TooltipButton label="关闭" onClick={onClose}><Icon name="close" size={19} /></TooltipButton></div><div className="account-modal-body"><div className="provider-chooser">{providerDefinitions.map((item) => <button key={item.id} type="button" className={`provider-option ${provider === item.id ? 'is-selected' : ''}`} onClick={() => setProvider(item.id)}><ProviderMark provider={item.id} size="md" /><span><strong>{item.label}</strong><small>{item.description}</small></span>{provider === item.id && <Icon name="checkCircle" size={19} />}</button>)}</div><div className="account-form"><label>邮箱地址<input type="email" value={accountEmail} onChange={(event) => setAccountEmail(event.target.value)} placeholder={provider === 'qq' ? 'yourname@qq.com' : 'name@example.com'} autoFocus /></label>{(provider === 'google' || provider === 'outlook') && <label>认证方式<select value={customAuthentication} onChange={(event) => setCustomAuthentication(event.target.value)}><option value="oauth2">OAuth2 安全授权</option>{provider === 'google' && <option value="app-password">应用专用密码</option>}</select></label>}<label><span className="label-with-action">{credentialLabel}<button type="button" onClick={onOpenProvider}>{isOAuth ? '打开授权页面' : '如何获取授权码？'} <Icon name="link" size={13} /></button></span><span className="secret-input"><input type={showAuthorizationCode ? 'text' : 'password'} value={authorizationCode} onChange={(event) => setAuthorizationCode(event.target.value)} placeholder={isOAuth ? 'OAuth 授权完成后无需粘贴' : '粘贴邮箱授权码'} /><button type="button" onClick={() => setShowAuthorizationCode(!showAuthorizationCode)} aria-label={showAuthorizationCode ? '隐藏授权码' : '显示授权码'}><Icon name={showAuthorizationCode ? 'eyeSlash' : 'eye'} size={17} /></button><button type="button" onClick={onCopy} aria-label="复制授权码"><Icon name="copy" size={17} /></button></span></label>{deviceFlow && <div className="device-flow-box"><div className="device-flow-heading"><span><Icon name="shieldCheck" size={16} />Outlook 设备授权</span><strong>{deviceFlow.status === 'complete' ? '已完成' : deviceFlow.status === 'error' ? '需要重试' : '等待验证'}</strong></div><code>{deviceFlow.userCode}</code><p>{deviceFlow.status === 'complete' ? '设备验证已完成，可以开始同步。' : (deviceFlow.message || '请打开验证页完成 Microsoft 账户授权。')}</p><small>{deviceFlow.verificationUri}</small>{deviceFlow.status !== 'complete' && <button type="button" onClick={onOpenProvider}>{deviceFlow.status === 'error' ? '重新开始授权' : '重新打开验证页'} <Icon name="link" size={13} /></button>}</div>}{provider === 'other' && <div className="custom-transport-fields"><div className="transport-heading"><Icon name="settings" size={15} />自定义服务器</div><div className="transport-row"><label>IMAP 主机<input value={customImapHost} onChange={(event) => setCustomImapHost(event.target.value)} placeholder="imap.example.com" /></label><label>端口<input type="number" min="1" max="65535" value={customImapPort} onChange={(event) => setCustomImapPort(event.target.value)} /></label><label>安全<input value={customImapSecurity} onChange={(event) => setCustomImapSecurity(event.target.value)} placeholder="tls / starttls" /></label></div><div className="transport-row"><label>SMTP 主机<input value={customSmtpHost} onChange={(event) => setCustomSmtpHost(event.target.value)} placeholder="smtp.example.com" /></label><label>端口<input type="number" min="1" max="65535" value={customSmtpPort} onChange={(event) => setCustomSmtpPort(event.target.value)} /></label><label>安全<input value={customSmtpSecurity} onChange={(event) => setCustomSmtpSecurity(event.target.value)} placeholder="tls / starttls" /></label></div><label>认证方式<select value={customAuthentication} onChange={(event) => setCustomAuthentication(event.target.value)}><option value="password">密码 / 授权码</option><option value="app-password">应用专用密码</option><option value="oauth2">OAuth2 Bearer Token</option></select></label></div>}<div className="guide-box"><div className="guide-heading"><span><Icon name="key" size={17} />{guideTitle}</span><em>{providerDefinition.label}</em></div>{guide.map((step, index) => <div className="guide-step" key={step}><span className="step-number">{index + 1}</span><span><strong>{step}</strong><small>{isOAuth ? (index === 0 ? 'MailGo 会在本机发起安全授权流程' : index === 1 ? '只授予邮件同步所需的账户权限' : '令牌仅保存到本机系统安全存储') : (index === 0 ? `登录 ${providerDefinition.label}，打开设置页面` : index === 1 ? '找到第三方客户端或账户安全选项' : '复制生成的授权凭据，返回此处粘贴')}</small></span>{index === 0 && <button type="button" onClick={onOpenProvider}>{isOAuth ? '开始授权' : '前往设置'} <Icon name="link" size={13} /></button>}</div>)}</div></div></div><div className="modal-footer"><span><Icon name="shieldCheck" size={17} />凭据只保存在本机，不会上传到第三方</span><div>{editingAccountId && <button className="danger-button" type="button" onClick={onRemove}><Icon name="trash" size={16} />移除账户</button>}<button className="secondary-button" type="button" onClick={onClose}>取消</button><button className="gradient-button" type="button" onClick={onAdd}><Icon name="rotate" size={17} />{editingAccountId ? '保存并同步' : '开始同步'}</button></div></div></motion.div></motion.div>
 }
 
-function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraftId, onClose, onSent, onError, onDraftChanged, onDraftRemoved }: { mode: ComposeMode; source?: MailMessage; accountId?: string; senderEmail?: string; draftId?: string; onClose: () => void; onSent: () => void; onError: (message: string) => void; onDraftChanged?: (draft: NativeDraft) => void; onDraftRemoved?: (draftId: string) => void }) {
+function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraftId, onClose, onSent, onError, onDraftChanged, onDraftRemoved }: { mode: ComposeMode; source?: MailMessage; accountId?: string; senderEmail?: string; draftId?: string; onClose: () => void; onSent: (queued: boolean) => void; onError: (message: string) => void; onDraftChanged?: (draft: NativeDraft) => void; onDraftRemoved?: (draftId: string) => void }) {
   const [to, setTo] = useState('')
   const [cc, setCc] = useState('')
   const [bcc, setBcc] = useState('')
@@ -1832,13 +1872,14 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
     }
     setSending(true)
     const uploadIds: string[] = []
+    let queued = false
     try {
       if (isNativeRuntime) {
         for (const file of attachments) {
           setUploadingName('正在上传 ' + file.name)
           uploadIds.push(await uploadAttachment(file))
         }
-        await invoke('mail.send', {
+        const result = await invoke<{ queued?: boolean }>('mail.send', {
           accountId,
           to: to.trim(),
           ...(cc.trim() ? { cc: cc.trim() } : {}),
@@ -1848,6 +1889,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
           ...(htmlMode && body.trim() ? { htmlBody: `<div>${escapeHtml(body).replace(/\r?\n/g, '<br>')}</div>` } : {}),
           ...(uploadIds.length ? { attachmentIds: uploadIds } : {}),
         })
+        queued = Boolean(result.queued)
       } else {
         await new Promise((resolve) => window.setTimeout(resolve, 700))
       }
@@ -1855,7 +1897,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
         await invoke('drafts.remove', { accountId, id: draftId }, 30_000).catch(() => undefined)
         onDraftRemoved?.(draftId)
       }
-      onSent()
+      onSent(Boolean(isNativeRuntime && queued))
     } catch (error) {
       await Promise.all(uploadIds.map((uploadId) => invoke('mail.attachment.upload.cancel', { uploadId }).catch(() => undefined)))
       onError(error instanceof Error ? error.message : '邮件发送失败，请稍后重试')

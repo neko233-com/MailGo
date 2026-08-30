@@ -8,6 +8,57 @@ use crate::providers::{Authentication, ProviderProfile, TransportSecurity};
 const MAX_RECIPIENTS_PER_FIELD: usize = 50;
 const MAX_RECIPIENTS_PER_MESSAGE: usize = 100;
 
+/// Sending can fail after the message has been fully validated, for example when a laptop goes
+/// offline or an SMTP service temporarily throttles the connection. These failures are safe to
+/// hand to the encrypted outbox; authentication and message-construction failures are not.
+pub fn is_retryable_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    [
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection refused",
+        "connection aborted",
+        "broken pipe",
+        "temporarily unavailable",
+        "network is unreachable",
+        "could not resolve",
+        "dns",
+        "rate limit",
+        "too many requests",
+        "throttl",
+        "try again later",
+        "smtp response code: 421",
+        "smtp response code: 450",
+        "smtp response code: 451",
+        "smtp response code: 452",
+        "smtp response code: 503",
+        "smtp response code: 554",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+/// Extract a numeric Retry-After hint when the transport includes one in its error text. The
+/// value is capped by the outbox caller and is never persisted as provider response text.
+pub fn retry_after_seconds(error: &anyhow::Error) -> Option<u64> {
+    let message = error.to_string().to_ascii_lowercase();
+    for marker in ["retry-after", "retry after", "retry_after"] {
+        let Some(start) = message.find(marker) else {
+            continue;
+        };
+        let digits = message[start + marker.len()..]
+            .chars()
+            .skip_while(|character| !character.is_ascii_digit())
+            .take_while(|character| character.is_ascii_digit())
+            .collect::<String>();
+        if let Ok(seconds) = digits.parse::<u64>() {
+            return Some(seconds);
+        }
+    }
+    None
+}
+
 pub struct OutgoingAttachment {
     pub file_name: String,
     pub content_type: String,

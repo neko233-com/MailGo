@@ -137,6 +137,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .storage-track span { display: block; width: 28%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #4664d1, #6f78ff); }
 .storage-foot { gap: 9px; font-size: 10px; }
 .storage-foot span { display: inline-flex; align-items: center; gap: 4px; }
+.storage-foot-actions { display: inline-flex; align-items: center; gap: 8px; }
 .storage-foot button { display: inline-flex; align-items: center; gap: 4px; color: #aab5ff; background: transparent; font-size: 10px; }
 .sidebar-quick-settings { padding: 0 8px 4px; }
 .sidebar-quick-settings button { width: 100%; min-height: 31px; display: flex; align-items: center; gap: 7px; padding: 0 9px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: var(--surface); text-align: left; font-size: 10px; }

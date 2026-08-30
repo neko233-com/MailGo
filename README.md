@@ -19,11 +19,13 @@ The current foundation includes:
 - Native sync discovers selectable IMAP mailboxes (including custom folders), persists a bounded per-account folder index, and exposes those folders in the desktop sidebar for offline browsing and UID pagination.
 - Mail actions use UID semantics end-to-end: batch selection supports mark-read, archive, and delete; archive/trash operations update encrypted local folder caches immediately and queue provider mutations when offline. Gmail archive removes the Inbox label instead of copying the message into a duplicate folder.
 - The desktop cache footer reports the number of encrypted flag/move mutations still waiting for provider replay across all accounts; the renderer receives counts only, never queue contents.
+- Native mode also has an encrypted, bounded offline 发件箱: transient SMTP/network failures are queued without credentials, retried with bounded backoff, paused after repeated permanent failures, and resumed after reauthorization.
 - Native SMTP sending supports plain text and HTML alternatives through provider-specific TLS/STARTTLS defaults.
 - Compose supports bounded To/CC/BCC recipient lists, safe HTML alternatives, and chunked multi-file attachments without putting attachment bytes in a single IPC request.
 - Reply, reply-all, and forward preserve the active account, prefill recipients from MIME To/CC headers, add safe subject prefixes, and quote the original message without restoring an unrelated draft.
 - The desktop keyboard flow includes `C` for compose, `R` for replying to the selected message, `Ctrl/Cmd+K` for search, and `Esc` for closing transient UI.
 - Native mode automatically saves and restores the latest text draft per account in a DPAPI-protected local store; sending removes the draft, while attachments remain intentionally session-scoped.
+- Mailbox caches and MIME payloads have explicit byte/count limits; cached mutations are bound to UIDVALIDITY, and cache/outbox writes are serialized to avoid scheduler/IPC races.
 - Native mode also surfaces those encrypted local drafts in the 草稿箱 list, with per-account counts, draft-specific continue-editing actions, and an explicit discard action.
 - Windows tray lifecycle is implemented with the generated `resources/icons/mailgo.ico`: close-to-tray, restore on click, deliberate quit, and a five-minute background sync scheduler.
 - Custom IMAP/SMTP onboarding accepts host, port, TLS mode, and password/app-password/OAuth2 settings without putting credentials in metadata.

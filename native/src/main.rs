@@ -19,6 +19,7 @@ mod drafts;
 mod instance;
 mod mail;
 mod oauth;
+mod outbox;
 mod providers;
 mod send;
 mod sync;
@@ -897,6 +898,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 app.state.accounts.push(new_account);
                 app.state.folder_names.remove(&id);
                 app.save()?;
+                outbox::resume_account(&cache_dir(), &id)?;
                 Ok(json!({ "id": id, "stored": true }))
             }
             "accounts.import" => {
@@ -937,9 +939,6 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                         || providers::validate_email(email).is_err()
                     {
                         continue;
-                    }
-                    if let Ok(entry) = credential_entry(id) {
-                        let _ = entry.delete_credential();
                     }
                     let imported_account = PersistedAccount {
                         id: id.to_string(),
@@ -982,6 +981,9 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     if profile_for_account(&imported_account).is_err() {
                         continue;
                     }
+                    if let Ok(entry) = credential_entry(id) {
+                        let _ = entry.delete_credential();
+                    }
                     app.state.accounts.retain(|account| account.id != id);
                     app.state.accounts.push(imported_account);
                     app.state.folder_names.remove(id);
@@ -997,6 +999,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 }
                 sync::remove_account_cache(&cache_dir(), &id)?;
                 let _ = drafts::remove_account(&cache_dir(), &id);
+                let _ = outbox::remove_account(&cache_dir(), &id);
                 let _ = credential_entry(&id)
                     .and_then(|entry| entry.delete_credential().map_err(anyhow::Error::from));
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
@@ -1089,6 +1092,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     let state_result = (|| -> Result<u32> {
                         for record in &records {
                             sync::remove_account_cache(&cache_dir(), &record.account.id)?;
+                            outbox::remove_account(&cache_dir(), &record.account.id)?;
                         }
                         let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                         for record in &records {
@@ -1166,6 +1170,20 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     &account_id,
                 )?)?)
             }
+            "mail.outbox.status" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
+                Ok(serde_json::to_value(outbox::status(
+                    &cache_dir(),
+                    &account_id,
+                )?)?)
+            }
+            "mail.outbox.retry_all" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
+                let reset = outbox::retry_all(&cache_dir(), &account_id)?;
+                Ok(json!({ "accountId": account_id, "reset": reset }))
+            }
             "sync.account" => {
                 let account_id = string_field(&message.payload, "accountId")?;
                 let account = account_for(shared, &account_id)?;
@@ -1191,6 +1209,15 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                         return Err(error);
                     }
                 };
+                if let Err(error) = outbox::flush_due(
+                    &cache_dir(),
+                    &account.id,
+                    profile.clone(),
+                    &account.email,
+                    &credential,
+                ) {
+                    tracing::warn!(account_id = %account.id, "manual outbox flush failed: {error}");
+                }
                 let result = match sync::sync_account(
                     &account.id,
                     profile,
@@ -1313,6 +1340,15 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                             continue;
                         }
                     };
+                    if let Err(error) = outbox::flush_due(
+                        &cache_dir(),
+                        &account.id,
+                        profile.clone(),
+                        &account.email,
+                        &credential,
+                    ) {
+                        tracing::warn!(account_id = %account.id, "all-account outbox flush failed: {error}");
+                    }
                     match sync::sync_account(
                         &account.id,
                         profile,
@@ -1445,8 +1481,12 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     .and_then(|value| usize::try_from(value).ok())
                     .ok_or_else(|| anyhow!("missing or invalid field: offset"))?;
                 let data_base64 = string_field(&message.payload, "dataBase64")?;
+                let max_encoded_chunk = ATTACHMENT_CHUNK_BYTES.div_ceil(3) * 4;
+                if data_base64.len() > max_encoded_chunk {
+                    return Err(anyhow!("attachment chunk is too large"));
+                }
                 let bytes = STANDARD
-                    .decode(data_base64)
+                    .decode(&data_base64)
                     .map_err(|_| anyhow!("attachment chunk is not valid base64"))?;
                 if bytes.len() > ATTACHMENT_CHUNK_BYTES {
                     return Err(anyhow!("attachment chunk is too large"));
@@ -1642,14 +1682,25 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                                 target,
                             )
                         }),
-                    "delete" => sync::delete_message(
-                        profile,
-                        &account.email,
-                        &credential,
-                        &folder,
-                        uid,
-                        target_folder.as_deref().unwrap_or(&folder),
-                    ),
+                    "delete" => {
+                        let permanent = target_folder
+                            .as_deref()
+                            .is_none_or(|target| target.eq_ignore_ascii_case(&folder));
+                        if permanent && !sync::is_trash_folder(profile.provider, &folder) {
+                            Err(anyhow!(
+                                "permanent delete is only allowed from the provider trash folder"
+                            ))
+                        } else {
+                            sync::delete_message(
+                                profile,
+                                &account.email,
+                                &credential,
+                                &folder,
+                                uid,
+                                target_folder.as_deref().unwrap_or(&folder),
+                            )
+                        }
+                    }
                     _ => unreachable!("matched mail mutation command"),
                 };
                 let queued = if let Err(error) = result {
@@ -1810,30 +1861,64 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     }
                     attachments
                 };
-                let send_result = (|| -> Result<()> {
-                    let account = account_for(shared, &account_id)?;
-                    let profile = profile_for_account(&account)?;
-                    let credential = load_credential(&account)?;
-                    let outgoing = send::OutgoingMessage {
-                        from: &account.email,
-                        credential: &credential,
-                        to: &to,
-                        cc: cc.as_deref(),
-                        bcc: bcc.as_deref(),
-                        subject: &subject,
-                        text_body: &text_body,
-                        html_body: html_body.as_deref(),
-                    };
-                    send::send_message(profile, &outgoing, &attachments)?;
-                    Ok(())
-                })();
+                let account = account_for(shared, &account_id)?;
+                let profile = profile_for_account(&account)?;
+                let credential = load_credential(&account)?;
+                let outgoing = send::OutgoingMessage {
+                    from: &account.email,
+                    credential: &credential,
+                    to: &to,
+                    cc: cc.as_deref(),
+                    bcc: bcc.as_deref(),
+                    subject: &subject,
+                    text_body: &text_body,
+                    html_body: html_body.as_deref(),
+                };
+                let send_result = send::send_message(profile, &outgoing, &attachments);
                 if let Ok(mut app) = shared.lock() {
                     for upload_id in &attachment_ids {
                         app.attachment_uploads.remove(upload_id);
                     }
                 }
-                send_result?;
-                Ok(json!({ "sent": true, "accountId": account_id }))
+                match send_result {
+                    Ok(()) => Ok(json!({ "sent": true, "queued": false, "accountId": account_id })),
+                    Err(error) if send::is_retryable_error(&error) => {
+                        let queued = outbox::enqueue(
+                            &cache_dir(),
+                            outbox::QueuedMessage {
+                                id: String::new(),
+                                account_id: account_id.clone(),
+                                to,
+                                cc: cc.unwrap_or_default(),
+                                bcc: bcc.unwrap_or_default(),
+                                subject,
+                                text_body,
+                                html_body,
+                                attachments: attachments
+                                    .into_iter()
+                                    .map(|attachment| outbox::QueuedAttachment {
+                                        file_name: attachment.file_name,
+                                        content_type: attachment.content_type,
+                                        bytes: attachment.bytes,
+                                    })
+                                    .collect(),
+                                created_at: 0,
+                                updated_at: 0,
+                                attempts: 0,
+                                next_attempt_at: 0,
+                                paused: false,
+                                last_error: None,
+                            },
+                        )?;
+                        Ok(json!({
+                            "sent": false,
+                            "queued": true,
+                            "outboxId": queued.id,
+                            "accountId": account_id,
+                        }))
+                    }
+                    Err(error) => Err(error),
+                }
             }
             _ => Err(anyhow!("unknown command: {}", message.cmd)),
         }

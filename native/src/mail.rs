@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::classifier::{classify, SmartCategory};
 
+const MAX_CACHED_TEXT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CACHED_HTML_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PREVIEW_CHARS: usize = 240;
 pub const MAX_FULL_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -139,15 +140,18 @@ fn build_message(
     _raw: Option<&[u8]>,
 ) -> Result<CachedMessage> {
     let (sender_name, sender_email) = address_parts(parsed.from());
-    let subject = parsed.subject().unwrap_or("(无主题)").trim().to_string();
+    let subject = truncate_utf8(parsed.subject().unwrap_or("(无主题)").trim(), 998);
     let to = address_list(parsed.to());
     let cc = address_list(parsed.cc());
-    let text_body = parsed.body_text(0).map(Cow::into_owned).unwrap_or_default();
+    let text_body = parsed
+        .body_text(0)
+        .map(|text| truncate_utf8(text.as_ref(), MAX_CACHED_TEXT_BYTES))
+        .unwrap_or_default();
     let html_body = parsed
         .body_html(0)
         .map(|html| sanitize_html(html.as_ref()))
         .filter(|html| !html.is_empty())
-        .map(|html| html.chars().take(MAX_CACHED_HTML_BYTES).collect());
+        .map(|html| truncate_utf8(&html, MAX_CACHED_HTML_BYTES));
     let preview = text_body
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -185,7 +189,7 @@ fn build_message(
         .map(str::to_string)
         .unwrap_or_else(|| format!("{account_id}-{folder}-{uid}"));
 
-    Ok(CachedMessage {
+    let mut message = CachedMessage {
         id: message_id,
         account_id: account_id.to_string(),
         folder: folder.to_string(),
@@ -207,7 +211,24 @@ fn build_message(
         // Raw MIME is never exposed to the renderer; attachment bytes are stored separately in
         // the encrypted cache when a full message fetch populates them.
         raw_path: None,
-    })
+    };
+    bound_cached_message(&mut message);
+    Ok(message)
+}
+
+pub(crate) fn bound_cached_message(message: &mut CachedMessage) {
+    message.subject = truncate_utf8(&message.subject, 998);
+    message.sender_name = truncate_utf8(&message.sender_name, MAX_RECIPIENT_CHARS);
+    message.sender_email = truncate_utf8(&message.sender_email, MAX_RECIPIENT_CHARS);
+    message.to.truncate(MAX_RECIPIENTS_PER_MESSAGE);
+    message.cc.truncate(MAX_RECIPIENTS_PER_MESSAGE);
+    message.text_body = truncate_utf8(&message.text_body, MAX_CACHED_TEXT_BYTES);
+    message.html_body = message
+        .html_body
+        .as_deref()
+        .map(|html| truncate_utf8(html, MAX_CACHED_HTML_BYTES));
+    message.preview = truncate_utf8(&message.preview, MAX_PREVIEW_CHARS);
+    message.attachments.truncate(MAX_ATTACHMENTS_PER_MESSAGE);
 }
 
 pub fn extract_attachment_payloads(raw: &[u8]) -> Result<Vec<AttachmentPayload>> {
@@ -260,6 +281,20 @@ pub fn embed_inline_images(html: &mut Option<String>, payloads: &[AttachmentPayl
             *html = replaced;
         }
     }
+    *html = truncate_utf8(html, MAX_CACHED_HTML_BYTES);
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let end = value
+        .char_indices()
+        .take_while(|(index, _)| *index < max_bytes)
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or_default();
+    value[..end].to_string()
 }
 
 fn address_parts(address: Option<&Address<'_>>) -> (String, String) {

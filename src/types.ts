@@ -112,6 +112,12 @@ export interface NativeQueueStatus {
   total: number
 }
 
+export interface NativeOutboxStatus {
+  total: number
+  pending: number
+  paused: number
+}
+
 export interface NativeDraft {
   id: string
   accountId: string

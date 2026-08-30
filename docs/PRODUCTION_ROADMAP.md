@@ -48,6 +48,8 @@ The repository is deliberately split into a real desktop UI foundation and provi
 39. IMAP sync now adopts all bounded selectable mailboxes returned by `LIST`, persists a sanitized per-account folder index, and lets the renderer browse custom server folders offline with account-scoped UID pagination.
 40. Reply, reply-all, and forward now carry the active account context, preserve parsed To/CC recipients, add idempotent subject prefixes, and quote bounded original content while keeping unrelated local drafts isolated.
 41. The documented desktop shortcuts now match the implementation: compose, reply, search focus, and transient UI dismissal are keyboard-accessible.
+42. Transient send failures now enter a bounded DPAPI-protected offline outbox without storing provider credentials; automatic retry uses safe backoff, permanent/authentication failures pause, and the desktop exposes status and manual retry controls.
+43. MIME text/HTML and CID expansion, IMAP header payloads, UID discovery, mailbox caches, Base64 upload chunks, and import files now have explicit pre-allocation or post-expansion bounds; cache mutations are UIDVALIDITY-bound and cache writes are serialized.
 
 ## Remaining production acceptance work
 
@@ -56,5 +58,6 @@ The repository is deliberately split into a real desktop UI foundation and provi
 - Disposable-provider acceptance tests for OAuth/IMAP/SMTP, including reconnect, UIDVALIDITY changes, folder mappings, and server-side mutation conflicts.
 - Tray integration tests on supported Windows versions.
 - Signed installer generation on a trusted Windows release host; the current rdesktop NSIS command is still an upstream placeholder.
+- Independent authentication of the floating rdesktop updater trust root, packaged IPC caller isolation, and a protected non-Windows cache backend.
 
 Production acceptance requires integration tests against disposable provider fixtures, a Windows WebView2 smoke test, migration tests for every persisted-state schema, and a security review of HTML/MIME parsing before shipping.
