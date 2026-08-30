@@ -1,0 +1,15 @@
+[package]
+name = "mailgo-native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+keyring = "4.2"
+rdesktop-core = { path = "../../rdesktop/crates/rdesktop-core" }
+rdesktop-webview = { path = "../../rdesktop/crates/rdesktop-webview" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"

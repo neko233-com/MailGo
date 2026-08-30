@@ -1,0 +1,27 @@
+[app]
+identifier = "com.neko233.mailgo"
+name = "MailGo"
+version = "0.1.0"
+
+[renderer]
+kind = "webview"
+webgpu = false
+
+[window]
+title = "MailGo"
+width = 1440
+height = 900
+resizable = true
+decorations = false
+
+[dev]
+host = "localhost"
+port = 1420
+open_browser = true
+hot_reload = true
+agent_mode = true
+devtools = true
+
+[bundle]
+windows_installer = "nsis"
+icon = "resources/icons/mailgo.ico"

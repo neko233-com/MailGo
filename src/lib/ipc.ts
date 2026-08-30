@@ -1,0 +1,62 @@
+import type { NativeState } from '../types'
+
+type IpcResponse<T> = { id: string; success: boolean; data: T }
+
+declare global {
+  interface Window {
+    ipc?: { postMessage: (message: string) => void }
+    __RDESKTOP_IPC__?: (response: IpcResponse<unknown>) => void
+    __RDESKTOP_WINDOW__?: {
+      minimize: () => void
+      maximize: () => void
+      close: () => void
+      startDrag: () => void
+    }
+  }
+}
+
+const pending = new Map<string, { resolve: (value: unknown) => void; reject: (reason: Error) => void }>()
+
+if (typeof window !== 'undefined') {
+  window.__RDESKTOP_IPC__ = (response) => {
+    const request = pending.get(response.id)
+    if (!request) return
+    pending.delete(response.id)
+    if (response.success) request.resolve(response.data)
+    else request.reject(new Error(String(response.data ?? 'Native request failed')))
+  }
+}
+
+export async function invoke<T>(cmd: string, payload: Record<string, unknown> = {}): Promise<T> {
+  const id = `mailgo-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+
+  if (window.ipc?.postMessage) {
+    return new Promise<T>((resolve, reject) => {
+      pending.set(id, { resolve: resolve as (value: unknown) => void, reject })
+      window.ipc?.postMessage(JSON.stringify({ id, cmd, payload }))
+      window.setTimeout(() => {
+        if (!pending.has(id)) return
+        pending.delete(id)
+        reject(new Error(`Native request timed out: ${cmd}`))
+      }, 12_000)
+    })
+  }
+
+  const response = await fetch('/__rdesktop__/agent/ipc', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, cmd, payload }),
+  })
+  if (!response.ok) throw new Error(`Dev bridge request failed: ${response.status}`)
+  const envelope = (await response.json()) as IpcResponse<T>
+  if (!envelope.success) throw new Error(String(envelope.data ?? 'Dev bridge request failed'))
+  return envelope.data
+}
+
+export async function readNativeState(): Promise<NativeState | null> {
+  try {
+    return await invoke<NativeState>('app.get_state')
+  } catch {
+    return null
+  }
+}
