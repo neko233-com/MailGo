@@ -344,6 +344,8 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .modal-footer > div { display: flex; gap: 10px; }
 .secondary-button { height: 42px; padding: 0 24px; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--muted-strong); background: transparent; }
 .secondary-button:hover { color: var(--text); background: var(--surface-hover); }
+.danger-button { height: 42px; display: inline-flex; align-items: center; gap: 7px; padding: 0 14px; border: 1px solid rgba(250, 113, 128, .34); border-radius: 8px; color: var(--danger); background: rgba(250, 113, 128, .08); }
+.danger-button:hover { border-color: rgba(250, 113, 128, .58); background: rgba(250, 113, 128, .16); }
 .modal-footer .gradient-button { min-width: 130px; height: 42px; }
 .help-modal { width: min(560px, calc(100vw - 60px)); overflow: hidden; border: 1px solid rgba(139, 160, 210, .34); border-radius: 13px; background: linear-gradient(145deg, #121e35, #0d172a); box-shadow: 0 34px 120px rgba(0, 0, 0, .52); }
 :root[data-theme='light'] .help-modal { background: #fff; border-color: var(--line-strong); }
