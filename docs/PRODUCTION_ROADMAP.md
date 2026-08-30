@@ -15,10 +15,11 @@ The repository is deliberately split into a real desktop UI foundation and provi
 9. Native OAuth2 + PKCE exchange and refresh-token rotation are available when registered client IDs are provided through environment configuration; codes and tokens remain outside metadata.
 10. Provider folder mappings, DPAPI-protected attachment storage, inline CID image embedding, and an offline flag-mutation queue are implemented.
 11. Bounded exponential retry is applied to transient IMAP synchronization failures while authentication/configuration failures fail fast.
+12. Mailbox caches retain `UIDVALIDITY`, the oldest UID, and a continuation marker; `sync.page` fetches older UID ranges, merges them idempotently, and resets the affected cache when the server UID space changes.
 
 ## Remaining production acceptance work
 
-- Device-flow UX, provider capability discovery, resumable pagination, UIDVALIDITY migration policy, and server rate-limit handling.
+- Device-flow UX, provider capability discovery, server rate-limit handling, and provider-specific incremental delta sync beyond the resumable UID-page path.
 - Attachment download progress/cancellation and richer MIME regression fixtures; the current path is bounded and encrypted but intentionally returns a single IPC payload.
 - Notification policy and tray integration tests on supported Windows versions.
 - Encrypted, user-confirmed portable secret transfer if MailGo ever adds credential migration.

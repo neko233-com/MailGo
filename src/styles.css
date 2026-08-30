@@ -179,6 +179,10 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .empty-list p { margin: 0; font-size: 12px; }
 .empty-icon { width: 48px; height: 48px; display: grid; place-items: center; margin-bottom: 6px; border: 1px solid var(--line); border-radius: 50%; color: var(--accent); background: var(--accent-soft); }
 .list-footer { height: 45px; padding: 0 16px 0 22px; border-top: 1px solid var(--line); color: var(--muted); font-size: 10px; }
+.list-footer-actions { display: flex; align-items: center; gap: 8px; }
+.load-earlier-button { min-height: 27px; padding: 0 9px; border: 1px solid rgba(104, 135, 240, .36); border-radius: 6px; color: #91a8ff; background: rgba(87, 112, 217, .12); font-size: 10px; }
+.load-earlier-button:hover:not(:disabled) { border-color: rgba(128, 153, 255, .66); background: rgba(87, 112, 217, .22); }
+.load-earlier-button:disabled { cursor: wait; opacity: .58; }
 
 .reading-panel { display: flex; flex-direction: column; overflow: hidden; background: var(--bg-raised); }
 .reading-toolbar { height: 70px; display: flex; align-items: center; justify-content: space-between; padding: 0 22px; border-bottom: 1px solid var(--line); }

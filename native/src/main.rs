@@ -516,6 +516,49 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 app.save()?;
                 Ok(serde_json::to_value(result)?)
             }
+            "sync.page" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                let folder = optional_string_field(&message.payload, "folder")
+                    .unwrap_or_else(|| "INBOX".to_string());
+                let before_uid = message
+                    .payload
+                    .get("beforeUid")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok());
+                let limit = message
+                    .payload
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(50)
+                    .clamp(1, 100);
+                let account = account_for(shared, &account_id)?;
+                let profile = profile_for_account(&account)?;
+                let credential = load_credential(&account)?;
+                let result = sync::sync_folder_page(
+                    &account.id,
+                    profile,
+                    &account.email,
+                    &credential,
+                    &folder,
+                    before_uid,
+                    limit,
+                    &cache_dir(),
+                )?;
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                if let Some(stored) = app
+                    .state
+                    .accounts
+                    .iter_mut()
+                    .find(|item| item.id == account.id)
+                {
+                    stored.unread = result.unread as u32;
+                    stored.status = "synced".to_string();
+                    stored.last_sync = "刚刚同步".to_string();
+                }
+                app.save()?;
+                Ok(serde_json::to_value(result)?)
+            }
             "sync.all" => {
                 let accounts = shared
                     .lock()
@@ -601,7 +644,9 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 let uid = u32_field(&message.payload, "uid")?;
                 let folder = optional_string_field(&message.payload, "folder")
                     .unwrap_or_else(|| "INBOX".to_string());
-                if let Some(message) = sync::load_cached_message(&cache_dir(), &account_id, uid)? {
+                if let Some(message) =
+                    sync::load_cached_message(&cache_dir(), &account_id, &folder, uid)?
+                {
                     if !message.text_body.is_empty() || message.html_body.is_some() {
                         return Ok(json!({ "offline": true, "message": message }));
                     }

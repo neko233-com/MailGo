@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Icon, type IconName } from './components/Icon'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
 import { invoke, readNativeState } from './lib/ipc'
-import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentResponse, NativeCachedMessage, NativeMailboxResponse, NativeMessageResponse, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
+import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentResponse, NativeCachedMessage, NativeMailboxResponse, NativeMessageResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 type ToastTone = 'info' | 'success' | 'error'
 type Toast = { id: number; message: string; tone: ToastTone }
@@ -67,6 +67,10 @@ function nativeFolderName(account: MailAccount, folder: FolderId): string {
   if (folder === 'spam') return account.provider === 'google' ? '[Gmail]/Spam' : account.provider === 'outlook' ? 'Junk Email' : 'Spam'
   if (folder === 'trash') return account.provider === 'google' ? '[Gmail]/Trash' : account.provider === 'outlook' ? 'Deleted Items' : 'Trash'
   return account.provider === 'google' ? '[Gmail]/All Mail' : 'Archive'
+}
+
+function nativeMailboxKey(accountId: string, folder: string) {
+  return `${accountId}::${folder}`
 }
 
 function nativeAttachmentKind(contentType: string): MailAttachment['kind'] {
@@ -168,6 +172,8 @@ function App() {
   const [isAuthPanelOpen, setAuthPanelOpen] = useState(true)
   const [isSettingsOpen, setSettingsOpen] = useState(false)
   const [isSyncing, setSyncing] = useState(false)
+  const [isLoadingEarlier, setLoadingEarlier] = useState(false)
+  const [mailboxMeta, setMailboxMeta] = useState<Record<string, { oldestUid?: number; hasMore?: boolean }>>({})
   const [isHtmlMode, setHtmlMode] = useState(false)
   const [isImporting, setImporting] = useState(false)
   const [toasts, setToasts] = useState<Toast[]>([])
@@ -218,6 +224,9 @@ function App() {
           const result = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id })
           const converted = (result.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, account))
           if (cancelled) return
+          if (result.mailbox) {
+            setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(account.id, result.mailbox!.folder)]: { oldestUid: result.mailbox!.oldestUid, hasMore: result.mailbox!.hasMore } }))
+          }
           setMails((current) => [...current.filter((mail) => mail.accountId !== account.id), ...converted])
           if (converted.length) setSelectedMailId((current) => current === 'launch-plan' ? converted[0].id : current)
         } catch {
@@ -276,6 +285,10 @@ function App() {
       return groups
     }, {})
   }, [visibleMails])
+
+  const canLoadEarlier = isNativeRuntime && selectedFolder !== 'starred' && accounts
+    .filter((account) => !selectedAccountId || account.id === selectedAccountId)
+    .some((account) => mailboxMeta[nativeMailboxKey(account.id, nativeFolderName(account, selectedFolder))]?.hasMore)
 
   const selectMail = async (mail: MailMessage) => {
     setSelectedMailId(mail.id)
@@ -342,11 +355,52 @@ function App() {
           const serverFolder = nativeFolderName(account, folder)
           const result = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, folder: serverFolder })
           const converted = (result.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, account))
+          if (result.mailbox) {
+            setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(account.id, serverFolder)]: { oldestUid: result.mailbox!.oldestUid, hasMore: result.mailbox!.hasMore } }))
+          }
           setMails((current) => [...current.filter((mail) => !(mail.accountId === account.id && mail.nativeFolder === serverFolder)), ...converted])
         } catch {
           // A provider may not expose every optional folder; its cached copy remains untouched.
         }
       }))
+    }
+  }
+
+  const loadEarlier = async () => {
+    if (!isNativeRuntime || selectedFolder === 'starred' || isLoadingEarlier) return
+    const targetAccounts = accounts.filter((account) => !selectedAccountId || account.id === selectedAccountId)
+    const pendingAccounts = targetAccounts.filter((account) => mailboxMeta[nativeMailboxKey(account.id, nativeFolderName(account, selectedFolder))]?.hasMore)
+    if (!pendingAccounts.length) {
+      pushToast('已经加载到更早的邮件', 'info')
+      return
+    }
+    setLoadingEarlier(true)
+    try {
+      let loaded = 0
+      await Promise.all(pendingAccounts.map(async (account) => {
+        const serverFolder = nativeFolderName(account, selectedFolder)
+        const meta = mailboxMeta[nativeMailboxKey(account.id, serverFolder)]
+        try {
+          const pageResult = await invoke<NativeSyncItem>('sync.page', {
+            accountId: account.id,
+            folder: serverFolder,
+            ...(meta?.oldestUid != null ? { beforeUid: meta.oldestUid } : {}),
+            limit: 50,
+          }, 60_000)
+          const mailbox = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, folder: serverFolder })
+          if (!mailbox.mailbox) return
+          loaded += pageResult.fetched
+          setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(account.id, serverFolder)]: { oldestUid: mailbox.mailbox!.oldestUid, hasMore: mailbox.mailbox!.hasMore } }))
+          const converted = mailbox.mailbox.messages.map((message) => nativeMessageToUi(message, account))
+          const incomingIds = new Set(converted.map((mail) => mail.id))
+          setMails((current) => [...current.filter((mail) => !incomingIds.has(mail.id)), ...converted])
+        } catch {
+          pushToast(`${account.label} 的更早邮件加载失败，可稍后重试`, 'error')
+        }
+      }))
+      if (loaded) pushToast(`已更新 ${loaded} 封本地邮件`, 'success')
+    } finally {
+      setLoadingEarlier(false)
     }
   }
 
@@ -376,6 +430,9 @@ function App() {
           try {
             const mailbox = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id })
             const converted = (mailbox.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, account))
+            if (mailbox.mailbox) {
+              setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(account.id, mailbox.mailbox!.folder)]: { oldestUid: mailbox.mailbox!.oldestUid, hasMore: mailbox.mailbox!.hasMore } }))
+            }
             setMails((current) => [...current.filter((mail) => mail.accountId !== account.id), ...converted])
           } catch {
             // Preserve the previous offline copy if one account has a transient cache error.
@@ -469,6 +526,9 @@ function App() {
       if (isNativeRuntime) {
         const mailbox = await invoke<NativeMailboxResponse>('mail.list', { accountId: id })
         const converted = (mailbox.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, newAccount))
+        if (mailbox.mailbox) {
+          setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(id, mailbox.mailbox!.folder)]: { oldestUid: mailbox.mailbox!.oldestUid, hasMore: mailbox.mailbox!.hasMore } }))
+        }
         setMails((current) => [...current.filter((mail) => mail.accountId !== id), ...converted])
         if (converted.length) setSelectedMailId(converted[0].id)
       }
@@ -645,7 +705,7 @@ function App() {
             </AnimatePresence>
             {visibleMails.length === 0 && <div className="empty-list"><span className="empty-icon"><Icon name="search" size={24} /></span><strong>没有找到邮件</strong><p>试试清除筛选或搜索其他关键词。</p></div>}
           </div>
-          <div className="list-footer"><span>{visibleMails.length ? `1–${visibleMails.length} / ${visibleMails.length}` : '0 封邮件'}</span><TooltipButton label="刷新邮件" onClick={handleSync}><Icon name="rotate" size={17} /></TooltipButton></div>
+          <div className="list-footer"><span>{visibleMails.length ? `1–${visibleMails.length} / ${visibleMails.length}` : '0 封邮件'}</span><div className="list-footer-actions">{canLoadEarlier && <button type="button" className="load-earlier-button" onClick={() => { void loadEarlier() }} disabled={isLoadingEarlier}>{isLoadingEarlier ? '加载中…' : '加载更早邮件'}</button>}<TooltipButton label="刷新邮件" onClick={handleSync}><Icon name="rotate" size={17} /></TooltipButton></div></div>
         </main>
 
         <section className="reading-panel" aria-label="邮件阅读区">

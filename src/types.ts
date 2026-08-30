@@ -141,6 +141,8 @@ export interface NativeMailbox {
   uidValidity?: number
   syncedAt: string
   messages: NativeCachedMessage[]
+  oldestUid?: number
+  hasMore?: boolean
 }
 
 export interface NativeMailboxResponse {

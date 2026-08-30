@@ -62,6 +62,10 @@ pub struct CachedMailbox {
     pub uid_validity: Option<u32>,
     pub synced_at: String,
     pub messages: Vec<CachedMessage>,
+    #[serde(default)]
+    pub oldest_uid: Option<u32>,
+    #[serde(default)]
+    pub has_more: bool,
 }
 
 impl CachedMailbox {
@@ -73,6 +77,8 @@ impl CachedMailbox {
             uid_validity: None,
             synced_at: String::new(),
             messages: Vec::new(),
+            oldest_uid: None,
+            has_more: false,
         }
     }
 }
@@ -304,5 +310,22 @@ mod tests {
         let html = sanitize_html("<a href=\"javascript:alert(1)\">bad</a><p>ok</p>");
         assert!(!html.contains("javascript:"));
         assert!(html.contains("ok"));
+    }
+
+    #[test]
+    fn legacy_mailbox_cache_defaults_cursor_fields() {
+        let mailbox: CachedMailbox = serde_json::from_str(
+            r#"{
+                "schemaVersion": 1,
+                "accountId": "account",
+                "folder": "INBOX",
+                "uidValidity": 7,
+                "syncedAt": "unix:1",
+                "messages": []
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(mailbox.oldest_uid, None);
+        assert!(!mailbox.has_more);
     }
 }

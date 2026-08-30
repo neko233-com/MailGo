@@ -64,6 +64,28 @@ fn connect(profile: &ProviderProfile) -> Result<imap::Client<imap::Connection>> 
         .with_context(|| format!("connect IMAP host {}", profile.imap.host))
 }
 
+fn authenticate(
+    profile: &ProviderProfile,
+    email: &str,
+    credential: &str,
+) -> Result<imap::Session<imap::Connection>> {
+    let client = connect(profile)?;
+    match profile.authentication {
+        Authentication::AppPassword | Authentication::Password => client
+            .login(email, credential)
+            .map_err(|(error, _)| anyhow!("IMAP authentication failed: {error}")),
+        Authentication::OAuth2 => client
+            .authenticate(
+                "XOAUTH2",
+                &XOAuth2 {
+                    user: email.to_string(),
+                    token: crate::oauth::access_token(credential),
+                },
+            )
+            .map_err(|(error, _)| anyhow!("IMAP OAuth authentication failed: {error}")),
+    }
+}
+
 /// Keep the local cache fresh while the window is hidden. The scheduler intentionally runs on a
 /// dedicated thread so IMAP handshakes never block rdesktop's WebView event loop.
 pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathBuf) {
@@ -170,22 +192,7 @@ fn sync_account_once(
         return Err(anyhow!("account requires authorization before syncing"));
     }
 
-    let client = connect(&profile)?;
-    let mut session =
-        match profile.authentication {
-            Authentication::AppPassword | Authentication::Password => client
-                .login(email, credential)
-                .map_err(|(error, _)| anyhow!("IMAP authentication failed: {error}"))?,
-            Authentication::OAuth2 => client
-                .authenticate(
-                    "XOAUTH2",
-                    &XOAuth2 {
-                        user: email.to_string(),
-                        token: crate::oauth::access_token(credential),
-                    },
-                )
-                .map_err(|(error, _)| anyhow!("IMAP OAuth authentication failed: {error}"))?,
-        };
+    let mut session = authenticate(&profile, email, credential)?;
 
     flush_queued_flags(&mut session, cache_root, account_id);
 
@@ -195,8 +202,8 @@ fn sync_account_once(
     let mut inbox_unread = 0usize;
     let mut cache_path = cache_root.join(safe_component(account_id)).join(CACHE_FILE);
 
-    for folder in folders_for(profile.provider) {
-        let Ok(mailbox) = session.select(folder) else {
+    for folder in discover_folders(&mut session, profile.provider) {
+        let Ok(mailbox) = session.select(&folder) else {
             continue;
         };
         let mut uids = session
@@ -205,6 +212,7 @@ fn sync_account_once(
             .into_iter()
             .collect::<Vec<_>>();
         uids.sort_unstable();
+        let total_uids = uids.len();
         let selected_uids = uids
             .into_iter()
             .rev()
@@ -230,17 +238,19 @@ fn sync_account_once(
                     .flags()
                     .iter()
                     .any(|flag| matches!(flag, Flag::Flagged));
-                if let Ok(message) = parse_header(account_id, folder, uid, unread, starred, header)
+                if let Ok(message) = parse_header(account_id, &folder, uid, unread, starred, header)
                 {
                     messages.push(message);
                 }
             }
         }
         messages.sort_by_key(|message| std::cmp::Reverse(message.uid));
-        let mut cached = CachedMailbox::empty(account_id, folder);
+        let mut cached = CachedMailbox::empty(account_id, &folder);
         cached.uid_validity = mailbox.uid_validity;
         cached.synced_at = synced_at.clone();
         cached.messages = messages;
+        cached.oldest_uid = cached.messages.iter().map(|message| message.uid).min();
+        cached.has_more = total_uids > MAX_HEADER_MESSAGES;
         let path = save_mailbox(cache_root, account_id, &cached)?;
         if folder.eq_ignore_ascii_case("INBOX") {
             cache_path = path;
@@ -251,7 +261,7 @@ fn sync_account_once(
                 .filter(|message| message.unread)
                 .count();
         }
-        synced_folders.push(folder.to_string());
+        synced_folders.push(folder);
     }
 
     if !synced_folders
@@ -270,6 +280,193 @@ fn sync_account_once(
         cache_path: cache_path.display().to_string(),
         synced_at,
         folders: synced_folders,
+    })
+}
+
+/// Fetch one older page for a folder and merge it into the encrypted local cache. The cursor is
+/// the oldest cached UID; using UID ranges keeps pagination stable when new mail arrives while a
+/// user is scrolling through a mailbox.
+pub fn sync_folder_page(
+    account_id: &str,
+    profile: ProviderProfile,
+    email: &str,
+    credential: &str,
+    folder: &str,
+    before_uid: Option<u32>,
+    limit: usize,
+    cache_root: &Path,
+) -> Result<SyncResult> {
+    let mut attempt = 0u32;
+    loop {
+        match sync_folder_page_once(
+            account_id,
+            profile.clone(),
+            email,
+            credential,
+            folder,
+            before_uid,
+            limit,
+            cache_root,
+        ) {
+            Ok(result) => return Ok(result),
+            Err(error) if attempt < 2 && is_retryable_sync_error(&error) => {
+                let delay = 1u64 << attempt;
+                attempt += 1;
+                tracing::warn!(account_id = %account_id, attempt, delay, "transient IMAP page failure; retrying");
+                thread::sleep(Duration::from_secs(delay));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn sync_folder_page_once(
+    account_id: &str,
+    profile: ProviderProfile,
+    email: &str,
+    credential: &str,
+    folder: &str,
+    before_uid: Option<u32>,
+    limit: usize,
+    cache_root: &Path,
+) -> Result<SyncResult> {
+    if credential.trim().is_empty() {
+        return Err(anyhow!("account requires authorization before syncing"));
+    }
+    let page_size = limit.clamp(1, MAX_HEADER_MESSAGES);
+    let mut session = authenticate(&profile, email, credential)?;
+    let mailbox = session
+        .select(folder)
+        .with_context(|| format!("select {folder}"))?;
+    let mut cached = load_mailbox_for_folder(cache_root, account_id, folder)?
+        .unwrap_or_else(|| CachedMailbox::empty(account_id, folder));
+    let uid_validity_changed =
+        cached.uid_validity.is_some() && cached.uid_validity != mailbox.uid_validity;
+    if uid_validity_changed {
+        cached.messages.clear();
+        cached.oldest_uid = None;
+        cached.has_more = false;
+    }
+    let effective_before_uid = if uid_validity_changed {
+        None
+    } else {
+        before_uid
+    };
+    let query = match effective_before_uid {
+        Some(uid) if uid <= 1 => {
+            let unread = if folder.eq_ignore_ascii_case("INBOX") {
+                cached
+                    .messages
+                    .iter()
+                    .filter(|message| message.unread)
+                    .count()
+            } else {
+                load_mailbox_for_folder(cache_root, account_id, "INBOX")?
+                    .map(|mailbox| {
+                        mailbox
+                            .messages
+                            .iter()
+                            .filter(|message| message.unread)
+                            .count()
+                    })
+                    .unwrap_or_default()
+            };
+            session.logout().ok();
+            return Ok(SyncResult {
+                account_id: account_id.to_string(),
+                folder: folder.to_string(),
+                fetched: 0,
+                unread,
+                cache_path: cache_root
+                    .join(safe_component(account_id))
+                    .join(cache_file_name(folder))
+                    .display()
+                    .to_string(),
+                synced_at: now_stamp(),
+                folders: vec![folder.to_string()],
+            });
+        }
+        Some(uid) => format!("UID 1:{}", uid - 1),
+        None => "ALL".to_string(),
+    };
+    let mut uids = session
+        .uid_search(query)
+        .with_context(|| format!("search older messages in {folder}"))?
+        .into_iter()
+        .collect::<Vec<_>>();
+    uids.sort_unstable();
+    let has_more = uids.len() > page_size;
+    let selected_uids = uids
+        .iter()
+        .rev()
+        .take(page_size)
+        .copied()
+        .collect::<Vec<_>>();
+    let uid_set = selected_uids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut fetched_messages = Vec::with_capacity(selected_uids.len());
+    if !uid_set.is_empty() {
+        let fetched = session
+            .uid_fetch(uid_set, HEADER_FETCH_QUERY)
+            .with_context(|| format!("fetch {folder} message headers"))?;
+        for item in fetched.iter() {
+            let Some(uid) = item.uid else { continue };
+            let Some(header) = item.header() else {
+                continue;
+            };
+            let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
+            let starred = item
+                .flags()
+                .iter()
+                .any(|flag| matches!(flag, Flag::Flagged));
+            if let Ok(message) = parse_header(account_id, folder, uid, unread, starred, header) {
+                fetched_messages.push(message);
+            }
+        }
+    }
+    fetched_messages.sort_by_key(|message| std::cmp::Reverse(message.uid));
+
+    cached.uid_validity = mailbox.uid_validity;
+    cached.synced_at = now_stamp();
+    cached
+        .messages
+        .retain(|message| !fetched_messages.iter().any(|item| item.uid == message.uid));
+    cached.messages.extend(fetched_messages.iter().cloned());
+    cached
+        .messages
+        .sort_by_key(|message| std::cmp::Reverse(message.uid));
+    cached.oldest_uid = cached.messages.iter().map(|message| message.uid).min();
+    cached.has_more = has_more;
+    let path = save_mailbox(cache_root, account_id, &cached)?;
+    let unread = if folder.eq_ignore_ascii_case("INBOX") {
+        cached
+            .messages
+            .iter()
+            .filter(|message| message.unread)
+            .count()
+    } else {
+        load_mailbox_for_folder(cache_root, account_id, "INBOX")?
+            .map(|mailbox| {
+                mailbox
+                    .messages
+                    .iter()
+                    .filter(|message| message.unread)
+                    .count()
+            })
+            .unwrap_or_default()
+    };
+    session.logout().ok();
+    Ok(SyncResult {
+        account_id: account_id.to_string(),
+        folder: folder.to_string(),
+        fetched: fetched_messages.len(),
+        unread,
+        cache_path: path.display().to_string(),
+        synced_at: cached.synced_at,
+        folders: vec![folder.to_string()],
     })
 }
 
@@ -297,22 +494,7 @@ pub fn fetch_message(
     uid: u32,
     cache_root: &Path,
 ) -> Result<MailDetail> {
-    let client = connect(&profile)?;
-    let mut session =
-        match profile.authentication {
-            Authentication::AppPassword | Authentication::Password => client
-                .login(email, credential)
-                .map_err(|(error, _)| anyhow!("IMAP authentication failed: {error}"))?,
-            Authentication::OAuth2 => client
-                .authenticate(
-                    "XOAUTH2",
-                    &XOAuth2 {
-                        user: email.to_string(),
-                        token: crate::oauth::access_token(credential),
-                    },
-                )
-                .map_err(|(error, _)| anyhow!("IMAP OAuth authentication failed: {error}"))?,
-        };
+    let mut session = authenticate(&profile, email, credential)?;
     session.select(folder)?;
     let fetched = session.uid_fetch(uid.to_string(), FULL_FETCH_QUERY)?;
     let item = fetched
@@ -442,35 +624,17 @@ pub fn load_mailbox_for_folder(
 pub fn load_cached_message(
     cache_root: &Path,
     account_id: &str,
+    folder: &str,
     uid: u32,
 ) -> Result<Option<CachedMessage>> {
-    let directory = cache_root.join(safe_component(account_id));
-    let Ok(entries) = fs::read_dir(directory) else {
-        return Ok(None);
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("bin") {
-            continue;
-        }
-        let Some(contents) = fs::read(&path).ok() else {
-            continue;
-        };
-        let Ok(decoded) = unprotect_cache(&contents) else {
-            continue;
-        };
-        let Ok(mailbox) = serde_json::from_slice::<CachedMailbox>(&decoded) else {
-            continue;
-        };
-        if let Some(message) = mailbox
-            .messages
-            .into_iter()
-            .find(|message| message.uid == uid)
-        {
-            return Ok(Some(message));
-        }
-    }
-    Ok(None)
+    Ok(
+        load_mailbox_for_folder(cache_root, account_id, folder)?.and_then(|mailbox| {
+            mailbox
+                .messages
+                .into_iter()
+                .find(|message| message.uid == uid && message.folder.eq_ignore_ascii_case(folder))
+        }),
+    )
 }
 
 pub fn save_cached_message(
@@ -527,22 +691,7 @@ pub fn set_flag(
     flag: &str,
     enabled: bool,
 ) -> Result<()> {
-    let client = connect(&profile)?;
-    let mut session =
-        match profile.authentication {
-            Authentication::AppPassword | Authentication::Password => client
-                .login(email, credential)
-                .map_err(|(error, _)| anyhow!("IMAP authentication failed: {error}"))?,
-            Authentication::OAuth2 => client
-                .authenticate(
-                    "XOAUTH2",
-                    &XOAuth2 {
-                        user: email.to_string(),
-                        token: crate::oauth::access_token(credential),
-                    },
-                )
-                .map_err(|(error, _)| anyhow!("IMAP OAuth authentication failed: {error}"))?,
-        };
+    let mut session = authenticate(&profile, email, credential)?;
     session.select(folder)?;
     let operation = if enabled {
         "+FLAGS.SILENT"
@@ -799,6 +948,60 @@ fn cache_file_name(folder: &str) -> String {
     }
 }
 
+fn discover_folders(
+    session: &mut imap::Session<imap::Connection>,
+    provider: crate::providers::ProviderKind,
+) -> Vec<String> {
+    let preferred = folders_for(provider);
+    let listed = session
+        .list(None, Some("*"))
+        .map(|names| {
+            names
+                .iter()
+                .map(|name| name.name().to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if listed.is_empty() {
+        return preferred.into_iter().map(ToOwned::to_owned).collect();
+    }
+
+    let mut folders = preferred
+        .into_iter()
+        .map(|candidate| {
+            listed
+                .iter()
+                .find(|name| name.eq_ignore_ascii_case(candidate))
+                .cloned()
+                .unwrap_or_else(|| candidate.to_string())
+        })
+        .collect::<Vec<_>>();
+    for name in listed {
+        if is_likely_mail_folder(&name)
+            && !folders
+                .iter()
+                .any(|folder| folder.eq_ignore_ascii_case(&name))
+        {
+            folders.push(name);
+        }
+    }
+    folders
+}
+
+fn is_likely_mail_folder(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "inbox"
+        || name.contains("sent")
+        || name.contains("draft")
+        || name.contains("spam")
+        || name.contains("junk")
+        || name.contains("trash")
+        || name.contains("deleted")
+        || name.contains("archive")
+        || name.contains("all mail")
+        || name.contains("allmail")
+}
+
 fn folders_for(provider: crate::providers::ProviderKind) -> Vec<&'static str> {
     match provider {
         crate::providers::ProviderKind::Google => vec![
@@ -869,5 +1072,13 @@ mod tests {
         assert!(!is_retryable_sync_error(&anyhow!(
             "unsupported mail provider"
         )));
+    }
+
+    #[test]
+    fn folder_discovery_only_adopts_mailbox_like_names() {
+        assert!(is_likely_mail_folder("[Gmail]/All Mail"));
+        assert!(is_likely_mail_folder("Archive 2026"));
+        assert!(is_likely_mail_folder("Junk Email"));
+        assert!(!is_likely_mail_folder("Contacts"));
     }
 }
