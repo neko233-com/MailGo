@@ -276,13 +276,31 @@ fn part_bytes(part: &mail_parser::MessagePart<'_>) -> Vec<u8> {
 }
 
 /// The only HTML that crosses the IPC boundary is cleaned with a strict allowlist. Remote images
-/// are omitted by default; inline `cid:` images can be resolved by the future attachment loader.
+/// and tracking-related attributes are omitted by default; inline `cid:` images are resolved only
+/// from the same MIME message.
 pub fn sanitize_html(input: &str) -> String {
     let mut allowed_schemes = HashSet::new();
     allowed_schemes.insert("cid");
     allowed_schemes.insert("https");
+    allowed_schemes.insert("mailto");
     Builder::default()
         .url_schemes(allowed_schemes)
+        .attribute_filter(|element, attribute, value| {
+            let element = element.to_ascii_lowercase();
+            let attribute = attribute.to_ascii_lowercase();
+            if (element == "img" && matches!(attribute.as_str(), "src" | "srcset"))
+                || matches!(
+                    attribute.as_str(),
+                    "style" | "srcdoc" | "ping" | "formaction" | "xlink:href"
+                )
+            {
+                if element == "img" && attribute == "src" && value.starts_with("cid:") {
+                    return Some(Cow::Borrowed(value));
+                }
+                return None;
+            }
+            Some(Cow::Borrowed(value))
+        })
         .link_rel(Some("noreferrer noopener"))
         .clean(input)
         .to_string()
@@ -310,6 +328,18 @@ mod tests {
         let html = sanitize_html("<a href=\"javascript:alert(1)\">bad</a><p>ok</p>");
         assert!(!html.contains("javascript:"));
         assert!(html.contains("ok"));
+    }
+
+    #[test]
+    fn blocks_remote_images_and_unsafe_attributes_but_keeps_safe_links() {
+        let html = sanitize_html(
+            r#"<p style="background:url(https://tracker.example/pixel)">ok</p><img src="https://tracker.example/pixel" srcset="https://tracker.example/2x"><a href="mailto:person@example.com" target="_blank">contact</a><img src="cid:logo@example.com">"#,
+        );
+        assert!(!html.contains("tracker.example"));
+        assert!(!html.contains("style="));
+        assert!(html.contains("mailto:person@example.com"));
+        assert!(html.contains("cid:logo@example.com"));
+        assert!(html.contains("noreferrer noopener"));
     }
 
     #[test]

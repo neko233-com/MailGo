@@ -27,6 +27,9 @@ The repository is deliberately split into a real desktop UI foundation and provi
 21. Existing accounts can re-enter the authorization flow without changing their stable account ID, and native account removal clears the protected credential plus the account-scoped offline cache.
 22. Windows desktop can export/import fully configured accounts through a password-protected Argon2id + ChaCha20-Poly1305 bundle; decrypted credentials are written only to Windows Credential Manager and imported account caches are reset before the next sync.
 23. The per-user rdesktop updater preserves a working installation when local application-control policy blocks source builds and only accepts a checksum-verified official binary fallback when it is newer.
+24. Persisted state loading explicitly migrates legacy missing fields and both snake_case/camelCase spellings, normalizes the current schema version, and rejects future unsupported versions before touching the backup state.
+25. Native MIME sanitization now removes remote image sources and tracking-related attributes before caching while preserving safe HTTPS/mailto links and inline CID images.
+26. Sync retry handling honors numeric `Retry-After` hints that survive transport errors, with a bounded 1–300 second cap and exponential fallback for providers that omit the hint.
 
 ## Remaining production acceptance work
 

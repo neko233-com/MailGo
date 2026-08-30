@@ -72,8 +72,65 @@ struct PersistedState {
     remote_images_enabled: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct PersistedStateDisk {
+    #[serde(default, alias = "schemaVersion")]
+    schema_version: Option<u32>,
+    #[serde(default)]
+    accounts: Vec<PersistedAccount>,
+    #[serde(default = "default_theme")]
+    theme: String,
+    #[serde(default = "default_minimize_to_tray", alias = "minimizeToTray")]
+    minimize_to_tray: bool,
+    #[serde(default = "default_offline_mode", alias = "offlineMode")]
+    offline_mode: bool,
+    #[serde(
+        default = "default_notifications_enabled",
+        alias = "notificationsEnabled"
+    )]
+    notifications_enabled: bool,
+    #[serde(default, alias = "remoteImagesEnabled")]
+    remote_images_enabled: bool,
+}
+
+fn default_theme() -> String {
+    "dark".to_string()
+}
+
+fn default_minimize_to_tray() -> bool {
+    true
+}
+
+fn default_offline_mode() -> bool {
+    true
+}
+
 fn default_notifications_enabled() -> bool {
     true
+}
+
+fn decode_persisted_state(contents: &str) -> Result<PersistedState> {
+    let disk: PersistedStateDisk =
+        serde_json::from_str(contents).context("parse MailGo persisted state")?;
+    let version = disk.schema_version.unwrap_or(0);
+    if version > STATE_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "MailGo state schema {version} is newer than supported schema {STATE_SCHEMA_VERSION}"
+        ));
+    }
+    Ok(PersistedState {
+        schema_version: STATE_SCHEMA_VERSION,
+        accounts: disk.accounts,
+        theme: if disk.theme == "light" {
+            "light".to_string()
+        } else {
+            "dark".to_string()
+        },
+        minimize_to_tray: disk.minimize_to_tray,
+        offline_mode: disk.offline_mode,
+        notifications_enabled: disk.notifications_enabled,
+        remote_images_enabled: disk.remote_images_enabled,
+    })
 }
 
 impl Default for PersistedState {
@@ -119,14 +176,12 @@ impl MailGoState {
         let state_path = root.join("state.json");
         let backup_path = root.join("state.json.bak");
         let state = match fs::read_to_string(&state_path) {
-            Ok(contents) => match serde_json::from_str::<PersistedState>(&contents) {
+            Ok(contents) => match decode_persisted_state(&contents) {
                 Ok(state) => state,
                 Err(primary_error) => match fs::read_to_string(&backup_path) {
-                    Ok(backup) => {
-                        serde_json::from_str::<PersistedState>(&backup).with_context(|| {
-                            format!("parse {} after {}", backup_path.display(), primary_error)
-                        })?
-                    }
+                    Ok(backup) => decode_persisted_state(&backup).with_context(|| {
+                        format!("parse {} after {}", backup_path.display(), primary_error)
+                    })?,
                     Err(_) => {
                         return Err(primary_error)
                             .with_context(|| format!("parse {}", state_path.display()))
@@ -135,7 +190,7 @@ impl MailGoState {
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 match fs::read_to_string(&backup_path) {
-                    Ok(backup) => serde_json::from_str::<PersistedState>(&backup)
+                    Ok(backup) => decode_persisted_state(&backup)
                         .with_context(|| format!("parse {}", backup_path.display()))?,
                     Err(backup_error) if backup_error.kind() == std::io::ErrorKind::NotFound => {
                         PersistedState::default()
@@ -1482,6 +1537,57 @@ mod tests {
         assert_eq!(next, ATTACHMENT_CHUNK_BYTES + 10);
         assert!(done);
         assert!(attachment_chunk_bounds(10, 11).is_err());
+    }
+
+    #[test]
+    fn state_decoder_migrates_legacy_fields_and_defaults() {
+        let state = decode_persisted_state(
+            r#"{
+                "accounts": [],
+                "theme": "light",
+                "minimize_to_tray": false,
+                "offline_mode": true,
+                "notifications_enabled": false
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(state.schema_version, STATE_SCHEMA_VERSION);
+        assert_eq!(state.theme, "light");
+        assert!(!state.minimize_to_tray);
+        assert!(!state.notifications_enabled);
+        assert!(!state.remote_images_enabled);
+    }
+
+    #[test]
+    fn state_decoder_accepts_camel_case_snapshot_fields() {
+        let state = decode_persisted_state(
+            r#"{
+                "schemaVersion": 1,
+                "accounts": [],
+                "theme": "dark",
+                "minimizeToTray": false,
+                "offlineMode": false,
+                "notificationsEnabled": true,
+                "remoteImagesEnabled": true
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(state.schema_version, STATE_SCHEMA_VERSION);
+        assert!(!state.minimize_to_tray);
+        assert!(!state.offline_mode);
+        assert!(state.remote_images_enabled);
+    }
+
+    #[test]
+    fn state_decoder_rejects_future_schema_versions() {
+        let error = decode_persisted_state(
+            r#"{
+                "schema_version": 99,
+                "accounts": []
+            }"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("newer than supported"));
     }
 }
 
