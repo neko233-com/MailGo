@@ -42,10 +42,12 @@ if (-not (Test-Path -LiteralPath $nativeExecutable)) {
 }
 
 $distDestination = Join-Path $stageRoot 'dist'
+$iconDestination = Join-Path $stageRoot 'resources\icons'
 New-Item -ItemType Directory -Force -Path $distDestination | Out-Null
+New-Item -ItemType Directory -Force -Path $iconDestination | Out-Null
 Copy-Item -Path (Join-Path $projectRoot 'dist\*') -Destination $distDestination -Recurse -Force
 Copy-Item -LiteralPath $nativeExecutable -Destination (Join-Path $stageRoot 'MailGo.exe') -Force
-Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\icons\mailgo.ico') -Destination (Join-Path $stageRoot 'mailgo.ico') -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\icons\mailgo.ico') -Destination (Join-Path $iconDestination 'mailgo.ico') -Force
 Compress-Archive -Path (Join-Path $stageRoot '*') -DestinationPath $archivePath -CompressionLevel Optimal
 
 $archive = Get-Item -LiteralPath $archivePath

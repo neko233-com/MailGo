@@ -164,6 +164,7 @@ mod windows_tray {
         let mut candidates = Vec::<PathBuf>::new();
         if let Ok(executable) = std::env::current_exe() {
             if let Some(parent) = executable.parent() {
+                candidates.push(parent.join("mailgo.ico"));
                 candidates.push(parent.join("resources/icons/mailgo.ico"));
                 candidates.push(parent.join("../resources/icons/mailgo.ico"));
             }
