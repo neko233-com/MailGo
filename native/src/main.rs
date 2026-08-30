@@ -29,6 +29,9 @@ const MAX_ATTACHMENT_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
 const MAX_LEGACY_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_ATTACHMENT_DOWNLOADS: usize = 2;
 const ATTACHMENT_DOWNLOAD_TTL: Duration = Duration::from_secs(10 * 60);
+const MAX_IMPORTED_ACCOUNTS: usize = 64;
+const MAX_ACCOUNT_ID_LENGTH: usize = 128;
+const MAX_ACCOUNT_LABEL_LENGTH: usize = 128;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -289,6 +292,14 @@ fn optional_u16_field(payload: &Value, name: &str) -> Option<u16> {
         .and_then(|value| u16::try_from(value).ok())
 }
 
+fn valid_account_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ACCOUNT_ID_LENGTH
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+}
+
 fn purge_expired_attachment_downloads(app: &mut MailGoState) {
     app.attachment_downloads
         .retain(|_, download| download.created_at.elapsed() < ATTACHMENT_DOWNLOAD_TTL);
@@ -414,8 +425,14 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
             }
             "accounts.add" => {
                 let id = string_field(&message.payload, "id")?;
+                if !valid_account_id(&id) {
+                    return Err(anyhow!("invalid account id"));
+                }
                 let provider = string_field(&message.payload, "provider")?;
                 let label = string_field(&message.payload, "label")?;
+                if label.len() > MAX_ACCOUNT_LABEL_LENGTH {
+                    return Err(anyhow!("account label is too long"));
+                }
                 let email = string_field(&message.payload, "email")?;
                 let supplied_credential =
                     optional_string_field(&message.payload, "authorizationCode")
@@ -502,7 +519,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     .ok_or_else(|| anyhow!("accounts must be an array"))?;
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                 let mut imported = 0u32;
-                for raw in accounts {
+                for raw in accounts.iter().take(MAX_IMPORTED_ACCOUNTS) {
                     let id = raw
                         .get("id")
                         .and_then(Value::as_str)
@@ -523,13 +540,23 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .trim();
-                    if id.is_empty() || provider.is_empty() || !email.contains('@') {
+                    let provider_kind = match providers::ProviderKind::parse(provider) {
+                        Ok(provider) => provider,
+                        Err(_) => continue,
+                    };
+                    if !valid_account_id(id)
+                        || label.len() > MAX_ACCOUNT_LABEL_LENGTH
+                        || providers::validate_email(email).is_err()
+                    {
                         continue;
+                    }
+                    if let Ok(entry) = credential_entry(id) {
+                        let _ = entry.delete_credential();
                     }
                     app.state.accounts.retain(|account| account.id != id);
                     app.state.accounts.push(PersistedAccount {
                         id: id.to_string(),
-                        provider: provider.to_string(),
+                        provider: provider_kind.as_str().to_string(),
                         label: label.to_string(),
                         email: email.to_string(),
                         unread: 0,

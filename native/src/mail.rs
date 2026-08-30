@@ -313,6 +313,18 @@ mod tests {
     }
 
     #[test]
+    fn embeds_small_inline_cid_images_without_exposing_raw_mime() {
+        let raw = "From: sender@example.com\r\nSubject: Inline image\r\nContent-Type: multipart/related; boundary=related\r\n\r\n--related\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p><img src=\"cid:logo@example.com\" alt=\"logo\"></p>\r\n--related\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\nContent-Disposition: inline; filename=\"logo.png\"\r\nContent-ID: <logo@example.com>\r\n\r\niVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=\r\n--related--\r\n";
+        let mut message = parse_full("account", "INBOX", 8, false, false, raw.as_bytes()).unwrap();
+        let payloads = extract_attachment_payloads(raw.as_bytes()).unwrap();
+        assert_eq!(payloads.len(), 1);
+        embed_inline_images(&mut message.html_body, &payloads);
+        let html = message.html_body.unwrap();
+        assert!(html.contains("data:image/png;base64,"));
+        assert_eq!(message.attachments.len(), 1);
+    }
+
+    #[test]
     fn legacy_mailbox_cache_defaults_cursor_fields() {
         let mailbox: CachedMailbox = serde_json::from_str(
             r#"{

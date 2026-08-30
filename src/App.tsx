@@ -29,6 +29,10 @@ function providerFor(provider: Provider) {
   return providerDefinitions.find((item) => item.id === provider) ?? providerDefinitions[3]
 }
 
+function isSupportedProvider(value: unknown): value is Provider {
+  return value === 'google' || value === 'qq' || value === 'outlook' || value === 'other'
+}
+
 function formatCount(value: number) {
   return value > 99 ? '99+' : String(value)
 }
@@ -704,10 +708,34 @@ function App() {
     if (!file) return
     setImporting(true)
     try {
-      const parsed = JSON.parse(await file.text()) as { accounts?: MailAccount[]; schemaVersion?: number }
+      const parsed = JSON.parse(await file.text()) as { accounts?: unknown[]; schemaVersion?: number }
       if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.accounts)) throw new Error('不支持的配置格式')
-      const imported = parsed.accounts.filter((account) => account.id && account.email && account.provider).map((account) => ({ ...account, status: 'needs-auth' as const, lastSync: '等待重新授权' }))
-      setAccounts((current) => [...current, ...imported])
+      const imported = parsed.accounts.flatMap((candidate) => {
+        if (!candidate || typeof candidate !== 'object') return []
+        const account = candidate as Partial<MailAccount>
+        if (typeof account.id !== 'string' || typeof account.email !== 'string' || !isSupportedProvider(account.provider)) return []
+        const id = account.id.trim()
+        const email = account.email.trim()
+        if (!id || id.length > 128 || !email.includes('@') || email.length > 320) return []
+        return [{
+          id,
+          provider: account.provider,
+          label: typeof account.label === 'string' && account.label.trim() ? account.label.trim().slice(0, 128) : providerFor(account.provider).label,
+          email,
+          unread: 0,
+          accent: typeof account.accent === 'string' ? account.accent : providerFor(account.provider).accent,
+          status: 'needs-auth' as const,
+          lastSync: '等待重新授权',
+          imapHost: typeof account.imapHost === 'string' ? account.imapHost.trim().slice(0, 512) : undefined,
+          imapPort: typeof account.imapPort === 'number' ? account.imapPort : undefined,
+          imapSecurity: typeof account.imapSecurity === 'string' ? account.imapSecurity.trim().slice(0, 32) : undefined,
+          smtpHost: typeof account.smtpHost === 'string' ? account.smtpHost.trim().slice(0, 512) : undefined,
+          smtpPort: typeof account.smtpPort === 'number' ? account.smtpPort : undefined,
+          smtpSecurity: typeof account.smtpSecurity === 'string' ? account.smtpSecurity.trim().slice(0, 32) : undefined,
+          authentication: typeof account.authentication === 'string' ? account.authentication.trim().slice(0, 32) : undefined,
+        }]
+      }).slice(0, 64)
+      setAccounts((current) => [...current.filter((account) => !imported.some((item) => item.id === account.id)), ...imported])
       try { await invoke('accounts.import', { accounts: imported }) } catch { /* Browser preview fallback. */ }
       pushToast(`已导入 ${imported.length} 个账户，请逐一补充授权码`, 'success')
     } catch (error) {

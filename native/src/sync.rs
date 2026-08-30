@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -216,55 +217,18 @@ fn sync_account_once(
         let Ok(mailbox) = session.select(&folder) else {
             continue;
         };
-        let mut uids = session
-            .uid_search("ALL")
-            .with_context(|| format!("search {folder}"))?
-            .into_iter()
-            .collect::<Vec<_>>();
-        uids.sort_unstable();
-        let total_uids = uids.len();
-        let selected_uids = uids
-            .into_iter()
-            .rev()
-            .take(MAX_HEADER_MESSAGES)
-            .collect::<Vec<_>>();
-        let uid_set = selected_uids
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut messages = Vec::with_capacity(selected_uids.len());
-        if !uid_set.is_empty() {
-            let fetched = session
-                .uid_fetch(uid_set, HEADER_FETCH_QUERY)
-                .with_context(|| format!("fetch {folder} message headers"))?;
-            for item in fetched.iter() {
-                let Some(uid) = item.uid else { continue };
-                let Some(header) = item.header() else {
-                    continue;
-                };
-                let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
-                let starred = item
-                    .flags()
-                    .iter()
-                    .any(|flag| matches!(flag, Flag::Flagged));
-                if let Ok(message) = parse_header(account_id, &folder, uid, unread, starred, header)
-                {
-                    messages.push(message);
-                }
-            }
-        }
-        messages.sort_by_key(|message| std::cmp::Reverse(message.uid));
-        let mut cached = CachedMailbox::empty(account_id, &folder);
-        cached.uid_validity = mailbox.uid_validity;
-        cached.synced_at = synced_at.clone();
-        cached.messages = messages;
-        cached.oldest_uid = cached.messages.iter().map(|message| message.uid).min();
-        cached.has_more = total_uids > MAX_HEADER_MESSAGES;
+        let (cached, fetched) = sync_folder_latest(
+            &mut session,
+            account_id,
+            &folder,
+            mailbox.uid_validity,
+            cache_root,
+            synced_at.clone(),
+        )?;
         let path = save_mailbox(cache_root, account_id, &cached)?;
         if folder.eq_ignore_ascii_case("INBOX") {
             cache_path = path;
-            inbox_fetched = cached.messages.len();
+            inbox_fetched = fetched;
             inbox_unread = cached
                 .messages
                 .iter()
@@ -291,6 +255,125 @@ fn sync_account_once(
         synced_at,
         folders: synced_folders,
     })
+}
+
+fn sync_folder_latest(
+    session: &mut imap::Session<imap::Connection>,
+    account_id: &str,
+    folder: &str,
+    uid_validity: Option<u32>,
+    cache_root: &Path,
+    synced_at: String,
+) -> Result<(CachedMailbox, usize)> {
+    let mut all_uids = session
+        .uid_search("ALL")
+        .with_context(|| format!("search {folder}"))?
+        .into_iter()
+        .collect::<Vec<_>>();
+    all_uids.sort_unstable();
+    let current_uids = all_uids.iter().copied().collect::<HashSet<_>>();
+    let total_uids = all_uids.len();
+    let mut cached = load_mailbox_for_folder(cache_root, account_id, folder)?
+        .unwrap_or_else(|| CachedMailbox::empty(account_id, folder));
+    let uid_validity_changed = cached.uid_validity.is_some() && cached.uid_validity != uid_validity;
+    if uid_validity_changed {
+        cached.messages.clear();
+        cached.oldest_uid = None;
+        cached.has_more = false;
+    }
+
+    // The header window is fetched only for a cold cache or UIDs newer than the newest cached
+    // message. Existing bodies/attachments remain untouched and are refreshed through FLAGS.
+    let newest_cached_uid = cached.messages.iter().map(|message| message.uid).max();
+    let selected_uids = match newest_cached_uid {
+        None => all_uids
+            .iter()
+            .rev()
+            .take(MAX_HEADER_MESSAGES)
+            .copied()
+            .collect::<Vec<_>>(),
+        Some(newest_uid) => all_uids
+            .iter()
+            .filter(|uid| **uid > newest_uid)
+            .rev()
+            .take(MAX_HEADER_MESSAGES)
+            .copied()
+            .collect::<Vec<_>>(),
+    };
+    let uid_set = selected_uids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut fetched_messages = Vec::with_capacity(selected_uids.len());
+    if !uid_set.is_empty() {
+        let fetched = session
+            .uid_fetch(uid_set, HEADER_FETCH_QUERY)
+            .with_context(|| format!("fetch {folder} message headers"))?;
+        for item in fetched.iter() {
+            let Some(uid) = item.uid else { continue };
+            let Some(header) = item.header() else {
+                continue;
+            };
+            let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
+            let starred = item
+                .flags()
+                .iter()
+                .any(|flag| matches!(flag, Flag::Flagged));
+            if let Ok(message) = parse_header(account_id, folder, uid, unread, starred, header) {
+                fetched_messages.push(message);
+            }
+        }
+    }
+    fetched_messages.sort_by_key(|message| std::cmp::Reverse(message.uid));
+
+    cached
+        .messages
+        .retain(|message| current_uids.contains(&message.uid));
+    let refresh_uids = cached
+        .messages
+        .iter()
+        .map(|message| message.uid)
+        .filter(|uid| current_uids.contains(uid))
+        .take(MAX_HEADER_MESSAGES)
+        .collect::<Vec<_>>();
+    let refresh_uid_set = refresh_uids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    if !refresh_uid_set.is_empty() {
+        let fetched = session
+            .uid_fetch(refresh_uid_set, "UID FLAGS")
+            .with_context(|| format!("refresh {folder} message flags"))?;
+        for item in fetched.iter() {
+            let Some(uid) = item.uid else { continue };
+            if let Some(message) = cached
+                .messages
+                .iter_mut()
+                .find(|message| message.uid == uid)
+            {
+                message.unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
+                message.starred = item
+                    .flags()
+                    .iter()
+                    .any(|flag| matches!(flag, Flag::Flagged));
+            }
+        }
+    }
+
+    cached.uid_validity = uid_validity;
+    cached.synced_at = synced_at;
+    cached
+        .messages
+        .retain(|message| !fetched_messages.iter().any(|item| item.uid == message.uid));
+    cached.messages.extend(fetched_messages.iter().cloned());
+    cached
+        .messages
+        .sort_by_key(|message| std::cmp::Reverse(message.uid));
+    cached.oldest_uid = cached.messages.iter().map(|message| message.uid).min();
+    cached.has_more = total_uids > cached.messages.len();
+    Ok((cached, fetched_messages.len()))
 }
 
 /// Fetch one older page for a folder and merge it into the encrypted local cache. The cursor is

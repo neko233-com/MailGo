@@ -19,6 +19,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 13. Mailbox caches retain `UIDVALIDITY`, the oldest UID, and a continuation marker; `sync.page` fetches older UID ranges, merges them idempotently, and resets the affected cache when the server UID space changes.
 14. Background sync can emit a Windows tray notification for newly observed unread mail, with a persisted user-controlled notification policy.
 15. Attachment downloads use a bounded chunked IPC protocol with explicit start/chunk/cancel commands; encrypted cache bytes never cross the WebView in one unbounded payload.
+16. Warm IMAP syncs fetch only UIDs newer than the cached high-water mark, refresh a bounded recent flag window, preserve paged history, and remove messages deleted remotely; UIDVALIDITY changes still force a safe cache reset.
 
 ## Remaining production acceptance work
 
