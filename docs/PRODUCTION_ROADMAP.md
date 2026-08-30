@@ -23,12 +23,14 @@ The repository is deliberately split into a real desktop UI foundation and provi
 17. Batch selection, mark-read, archive, and delete actions use UID-based native IPC; folder mutations update encrypted local caches immediately and replay through a separate encrypted queue when the provider is unavailable. Gmail archive removes the Inbox label through `X-GM-LABELS`.
 18. Compose attachments use bounded chunked upload IPC with per-file/total/count limits, expiry and cancellation; Rust builds multipart MIME messages without persisting outgoing file bytes.
 19. Remote HTML images are blocked by default in the renderer, while CID/data images remain available; the preference is persisted in native metadata and can be explicitly enabled with a privacy warning.
+20. Release packaging has a reproducible Windows portable ZIP path; the native shell resolves renderer assets beside the executable, with an environment override for controlled deployment.
 
 ## Remaining production acceptance work
 
 - Provider-specific incremental delta sync beyond the resumable UID-page path.
 - Provider-specific rate-limit headers/backoff and richer MIME regression fixtures.
 - Tray integration tests on supported Windows versions.
+- Signed installer generation on a trusted Windows release host; the current rdesktop NSIS command is still an upstream placeholder.
 - Encrypted, user-confirmed portable secret transfer if MailGo ever adds credential migration.
 
 Production acceptance requires integration tests against disposable provider fixtures, a Windows WebView2 smoke test, migration tests for every persisted-state schema, and a security review of HTML/MIME parsing before shipping.
