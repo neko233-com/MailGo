@@ -48,6 +48,18 @@ New-Item -ItemType Directory -Force -Path $iconDestination | Out-Null
 Copy-Item -Path (Join-Path $projectRoot 'dist\*') -Destination $distDestination -Recurse -Force
 Copy-Item -LiteralPath $nativeExecutable -Destination (Join-Path $stageRoot 'MailGo.exe') -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\icons\mailgo.ico') -Destination (Join-Path $iconDestination 'mailgo.ico') -Force
+
+$stagedExecutable = Join-Path $stageRoot 'MailGo.exe'
+$executableHeader = [System.IO.File]::ReadAllBytes($stagedExecutable)
+if ($executableHeader.Length -lt 2 -or $executableHeader[0] -ne 0x4d -or $executableHeader[1] -ne 0x5a) {
+    throw 'staged MailGo.exe is not a valid Windows PE executable'
+}
+if (-not (Test-Path -LiteralPath (Join-Path $distDestination 'index.html'))) {
+    throw 'staged renderer is missing dist\index.html'
+}
+if (-not (Test-Path -LiteralPath (Join-Path $iconDestination 'mailgo.ico'))) {
+    throw 'staged tray icon is missing resources\icons\mailgo.ico'
+}
 Compress-Archive -Path (Join-Path $stageRoot '*') -DestinationPath $archivePath -CompressionLevel Optimal
 
 $archive = Get-Item -LiteralPath $archivePath

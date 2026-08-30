@@ -56,6 +56,13 @@ function sanitizeHtml(input: string, allowRemoteImages = false) {
       }
     })
   })
+  documentParser.querySelectorAll('a').forEach((node) => {
+    if (node.getAttribute('target') === '_blank') {
+      node.setAttribute('rel', 'noreferrer noopener')
+    } else {
+      node.removeAttribute('target')
+    }
+  })
   return documentParser.body.innerHTML
 }
 
