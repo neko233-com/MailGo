@@ -20,6 +20,7 @@ mod oauth;
 mod providers;
 mod send;
 mod sync;
+mod transfer;
 mod tray;
 
 const APP_SERVICE: &str = "MailGo";
@@ -341,6 +342,35 @@ fn valid_account_id(value: &str) -> bool {
         && value.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
         })
+}
+
+fn validate_transfer_account(account: &transfer::TransferAccount) -> Result<()> {
+    if !valid_account_id(&account.account.id)
+        || account.account.label.len() > MAX_ACCOUNT_LABEL_LENGTH
+        || account.credential.is_empty()
+        || account.credential.len() > 64 * 1024
+    {
+        return Err(anyhow!("invalid encrypted account record"));
+    }
+    providers::ProviderKind::parse(&account.account.provider)?;
+    providers::validate_email(&account.account.email)?;
+    profile_for_account(&account.account)?;
+    Ok(())
+}
+
+fn restore_credentials(previous: &[(String, Option<String>)]) {
+    for (id, credential) in previous {
+        if let Ok(entry) = credential_entry(id) {
+            match credential {
+                Some(value) => {
+                    let _ = entry.set_password(value);
+                }
+                None => {
+                    let _ = entry.delete_credential();
+                }
+            }
+        }
+    }
 }
 
 fn purge_expired_attachment_downloads(app: &mut MailGoState) {
@@ -719,6 +749,99 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                         "authentication": account.authentication,
                         "status": "requires-reauth", "secretRef": format!("mailgo://{}", account.id),
                     })).collect::<Vec<_>>(),
+                }))
+            }
+            "accounts.export_encrypted" => {
+                let passphrase = message
+                    .payload
+                    .get("passphrase")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("transfer passphrase is required"))?;
+                let accounts = shared
+                    .lock()
+                    .map_err(|_| anyhow!("state lock poisoned"))?
+                    .state
+                    .accounts
+                    .clone();
+                let mut records = Vec::with_capacity(accounts.len());
+                for account in accounts {
+                    let credential = load_credential(&account)
+                        .context("one or more accounts need reauthorization")?;
+                    records.push(transfer::TransferAccount {
+                        account,
+                        credential,
+                    });
+                }
+                let account_count = records.len();
+                let encrypted = transfer::encrypt_accounts(&records, passphrase);
+                transfer::clear_credentials(&mut records);
+                Ok(json!({
+                    "bundle": encrypted?,
+                    "accountCount": account_count,
+                }))
+            }
+            "accounts.import_encrypted" => {
+                let bundle = string_field(&message.payload, "bundle")?;
+                let passphrase = message
+                    .payload
+                    .get("passphrase")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("transfer passphrase is required"))?;
+                let mut records = transfer::decrypt_accounts(&bundle, passphrase)?;
+                let import_result = (|| -> Result<u32> {
+                    let mut seen = HashSet::new();
+                    for record in &records {
+                        validate_transfer_account(record)?;
+                        if !seen.insert(record.account.id.clone()) {
+                            return Err(anyhow!("duplicate account in encrypted bundle"));
+                        }
+                    }
+
+                    let previous = records
+                        .iter()
+                        .map(|record| {
+                            let existing = credential_entry(&record.account.id)
+                                .ok()
+                                .and_then(|entry| entry.get_password().ok());
+                            (record.account.id.clone(), existing)
+                        })
+                        .collect::<Vec<_>>();
+                    for record in &records {
+                        if let Err(error) = credential_entry(&record.account.id).and_then(|entry| {
+                            entry
+                                .set_password(&record.credential)
+                                .map_err(anyhow::Error::from)
+                        }) {
+                            restore_credentials(&previous);
+                            return Err(error).context("save imported account credential");
+                        }
+                    }
+
+                    let state_result = (|| -> Result<u32> {
+                        for record in &records {
+                            sync::remove_account_cache(&cache_dir(), &record.account.id)?;
+                        }
+                        let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                        for record in &records {
+                            let mut account = record.account.clone();
+                            account.unread = 0;
+                            account.status = "synced".to_string();
+                            account.last_sync = "等待首次同步".to_string();
+                            app.state.accounts.retain(|item| item.id != account.id);
+                            app.state.accounts.push(account);
+                        }
+                        app.save()?;
+                        Ok(records.len() as u32)
+                    })();
+                    if state_result.is_err() {
+                        restore_credentials(&previous);
+                    }
+                    state_result
+                })();
+                transfer::clear_credentials(&mut records);
+                Ok(json!({
+                    "imported": import_result?,
+                    "requiresReauth": false,
                 }))
             }
             "sync.account" => {

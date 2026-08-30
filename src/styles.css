@@ -347,6 +347,21 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .danger-button { height: 42px; display: inline-flex; align-items: center; gap: 7px; padding: 0 14px; border: 1px solid rgba(250, 113, 128, .34); border-radius: 8px; color: var(--danger); background: rgba(250, 113, 128, .08); }
 .danger-button:hover { border-color: rgba(250, 113, 128, .58); background: rgba(250, 113, 128, .16); }
 .modal-footer .gradient-button { min-width: 130px; height: 42px; }
+.transfer-modal { width: min(520px, calc(100vw - 60px)); overflow: hidden; border: 1px solid rgba(139, 160, 210, .34); border-radius: 13px; background: linear-gradient(145deg, #121e35, #0d172a); box-shadow: 0 34px 120px rgba(0, 0, 0, .52); }
+:root[data-theme='light'] .transfer-modal { background: #fff; border-color: var(--line-strong); }
+.transfer-modal-body { display: grid; gap: 16px; padding: 20px; }
+.transfer-modal-body > p { margin: 0; color: var(--muted-strong); font-size: 12px; line-height: 1.65; }
+.transfer-modal-body > label { display: grid; gap: 8px; color: var(--text); font-size: 12px; font-weight: 600; }
+.transfer-file { display: flex; align-items: flex-start; gap: 10px; padding: 11px 12px; border: 1px solid rgba(105, 139, 245, .42); border-radius: 8px; color: #9fb2ff; background: rgba(57, 83, 170, .16); }
+.transfer-file > span { min-width: 0; display: grid; gap: 4px; }
+.transfer-file strong { overflow: hidden; color: var(--text); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.transfer-file small { color: var(--muted); font-size: 10px; line-height: 1.45; }
+.transfer-warning { display: flex; align-items: flex-start; gap: 8px; padding: 10px 11px; border: 1px solid rgba(240, 168, 104, .32); border-radius: 8px; color: #e8b37e; background: rgba(240, 168, 104, .08); font-size: 10px; line-height: 1.55; }
+.transfer-warning svg { flex: 0 0 auto; }
+.transfer-error { display: flex; align-items: center; gap: 6px; margin-top: -8px; color: var(--danger); font-size: 10px; }
+.transfer-modal-body .modal-footer { margin: 0 -20px -20px; padding: 15px 20px; }
+.secure-transfer-button { color: #9daeff !important; border-color: rgba(105, 139, 245, .38) !important; background: rgba(87, 112, 217, .12) !important; }
+.secure-transfer-button:hover:not(:disabled) { color: var(--text) !important; background: rgba(87, 112, 217, .22) !important; }
 .help-modal { width: min(560px, calc(100vw - 60px)); overflow: hidden; border: 1px solid rgba(139, 160, 210, .34); border-radius: 13px; background: linear-gradient(145deg, #121e35, #0d172a); box-shadow: 0 34px 120px rgba(0, 0, 0, .52); }
 :root[data-theme='light'] .help-modal { background: #fff; border-color: var(--line-strong); }
 .help-modal-body { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; max-height: min(56vh, 440px); overflow: auto; padding: 18px 20px; }

@@ -8,6 +8,7 @@ The current foundation includes:
 - `motion` transitions with `prefers-reduced-motion` support.
 - Tree-shakeable `reicon-react` icon components.
 - Multiple accounts, including multiple QQ accounts, account switching, and import/export with redacted credentials.
+- Windows desktop also supports password-protected account migration: encrypted export/import keeps provider credentials inside an Argon2id + ChaCha20-Poly1305 bundle and writes them back only to Windows Credential Manager.
 - Local-first UI state with offline cache indicators and a Rust IPC boundary for durable state.
 - Provider quick links and guided authorization-code onboarding.
 - Safe HTML preview mode, attachments, smart categories (including Apple Connect and Apple advertising), search, unread filter, star, reply, compose, theme switching, and user CSS overrides.
@@ -32,6 +33,8 @@ $env:MAILGO_OUTLOOK_REDIRECT_URI = "http://127.0.0.1:8765/oauth/callback"
 ```
 
 The redirect URI must be registered exactly with the provider. MailGo listens once on a configured `127.0.0.1` callback and lets the account assistant exchange the returned code directly; manual code entry remains available when the callback port is unavailable. Outlook uses a native Device Flow path in the account assistant: it opens the verification page, displays the user code, polls with provider-supplied intervals, and keeps the resulting token only in Windows Credential Manager.
+
+Use the settings panel's encrypted account transfer actions when moving fully configured accounts between Windows machines. Choose a strong transfer password of at least 12 characters; the password is never stored, and a bundle cannot be recovered if it is forgotten. The browser preview intentionally disables credential-bearing transfer actions.
 
 ## Run the browser development surface
 
