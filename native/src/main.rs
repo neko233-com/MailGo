@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -308,8 +308,9 @@ fn purge_expired_attachment_downloads(app: &mut MailGoState) {
 fn purge_expired_auth_sessions(app: &mut MailGoState) {
     app.auth_sessions
         .retain(|_, session| !oauth::is_expired(session));
+    let active_sessions = app.auth_sessions.keys().cloned().collect::<HashSet<_>>();
     app.ready_oauth_credentials
-        .retain(|session_id, _| app.auth_sessions.contains_key(session_id));
+        .retain(|session_id, _| active_sessions.contains(session_id));
 }
 
 fn attachment_chunk_bounds(total: usize, offset: usize) -> Result<(usize, bool)> {
