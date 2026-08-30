@@ -20,6 +20,7 @@ The current foundation includes:
 - The desktop cache footer reports the number of encrypted flag/move mutations still waiting for provider replay across all accounts; the renderer receives counts only, never queue contents.
 - Native SMTP sending supports plain text and HTML alternatives through provider-specific TLS/STARTTLS defaults.
 - Compose supports bounded To/CC/BCC recipient lists, safe HTML alternatives, and chunked multi-file attachments without putting attachment bytes in a single IPC request.
+- Native mode automatically saves and restores the latest text draft per account in a DPAPI-protected local store; sending removes the draft, while attachments remain intentionally session-scoped.
 - Windows tray lifecycle is implemented with the generated `resources/icons/mailgo.ico`: close-to-tray, restore on click, deliberate quit, and a five-minute background sync scheduler.
 - Custom IMAP/SMTP onboarding accepts host, port, TLS mode, and password/app-password/OAuth2 settings without putting credentials in metadata.
 

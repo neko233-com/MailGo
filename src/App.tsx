@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Icon, type IconName } from './components/Icon'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
 import { invoke, readNativeState } from './lib/ipc'
-import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeMailboxResponse, NativeMessageResponse, NativeQueueStatus, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
+import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeDraft, NativeMailboxResponse, NativeMessageResponse, NativeQueueStatus, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 type ToastTone = 'info' | 'success' | 'error'
 type Toast = { id: number; message: string; tone: ToastTone }
@@ -1429,6 +1429,9 @@ function ComposeModal({ accountId, onClose, onSent, onError }: { accountId?: str
   const [subject, setSubject] = useState('')
   const [body, setBody] = useState('')
   const [htmlMode, setHtmlMode] = useState(false)
+  const [draftId, setDraftId] = useState<string | undefined>()
+  const [draftStatus, setDraftStatus] = useState('')
+  const [draftReady, setDraftReady] = useState(false)
   const [attachments, setAttachments] = useState<File[]>([])
   const [isSending, setSending] = useState(false)
   const [uploadingName, setUploadingName] = useState('')
@@ -1436,6 +1439,53 @@ function ComposeModal({ accountId, onClose, onSent, onError }: { accountId?: str
   const isNativeRuntime = Boolean(window.ipc?.postMessage)
   const maxAttachmentBytes = 25 * 1024 * 1024
   const maxTotalAttachmentBytes = 50 * 1024 * 1024
+
+  useEffect(() => {
+    let cancelled = false
+    setDraftReady(false)
+    setDraftStatus('')
+    if (!isNativeRuntime || !accountId) {
+      setDraftReady(true)
+      return () => { cancelled = true }
+    }
+    void invoke<NativeDraft[]>('drafts.list', { accountId }, 30_000).then((drafts) => {
+      if (cancelled || !drafts.length) return
+      const draft = drafts[0]
+      setDraftId(draft.id)
+      setTo(draft.to)
+      setCc(draft.cc)
+      setBcc(draft.bcc)
+      setShowCopyFields(Boolean(draft.cc || draft.bcc))
+      setSubject(draft.subject)
+      setBody(draft.body)
+      setHtmlMode(draft.htmlMode)
+      setDraftStatus('已恢复最近草稿')
+    }).catch(() => undefined).finally(() => {
+      if (!cancelled) setDraftReady(true)
+    })
+    return () => { cancelled = true }
+  }, [accountId, isNativeRuntime])
+
+  useEffect(() => {
+    if (!isNativeRuntime || !accountId || !draftReady || isSending) return
+    if (![to, cc, bcc, subject, body].some((value) => value.trim())) return
+    const timer = window.setTimeout(() => {
+      void invoke<NativeDraft>('drafts.save', {
+        ...(draftId ? { id: draftId } : {}),
+        accountId,
+        to,
+        cc,
+        bcc,
+        subject,
+        body,
+        htmlMode,
+      }, 30_000).then((draft) => {
+        setDraftId(draft.id)
+        setDraftStatus('草稿已自动保存')
+      }).catch(() => setDraftStatus('草稿保存失败，将在下次输入时重试'))
+    }, 700)
+    return () => window.clearTimeout(timer)
+  }, [accountId, bcc, body, cc, draftId, draftReady, htmlMode, isNativeRuntime, isSending, subject, to])
 
   const addFiles = (event: React.ChangeEvent<HTMLInputElement>) => {
     const incoming = Array.from(event.target.files ?? [])
@@ -1523,6 +1573,9 @@ function ComposeModal({ accountId, onClose, onSent, onError }: { accountId?: str
       } else {
         await new Promise((resolve) => window.setTimeout(resolve, 700))
       }
+      if (isNativeRuntime && accountId && draftId) {
+        await invoke('drafts.remove', { accountId, id: draftId }, 30_000).catch(() => undefined)
+      }
       onSent()
     } catch (error) {
       await Promise.all(uploadIds.map((uploadId) => invoke('mail.attachment.upload.cancel', { uploadId }).catch(() => undefined)))
@@ -1533,7 +1586,7 @@ function ComposeModal({ accountId, onClose, onSent, onError }: { accountId?: str
     }
   }
 
-  return <motion.div className="modal-backdrop compose-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="compose-modal" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1 }} exit={{ opacity: 0, y: 20 }}><div className="compose-header"><strong>新邮件</strong><div><TooltipButton label="最小化撰写窗口"><span className="window-minimize" /></TooltipButton><TooltipButton label="关闭撰写窗口" onClick={onClose}><Icon name="close" size={17} /></TooltipButton></div></div><div className="compose-recipient-row"><label>收件人<input autoFocus value={to} onChange={(event) => setTo(event.target.value)} placeholder="name@example.com，可用逗号分隔多个地址" /></label><button type="button" className="copy-fields-button" onClick={() => setShowCopyFields((value) => !value)} aria-expanded={showCopyFields}>{showCopyFields ? '隐藏抄送' : '抄送 / 密送'}</button></div>{showCopyFields && <><label>抄送<input value={cc} onChange={(event) => setCc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label><label>密送<input value={bcc} onChange={(event) => setBcc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label></>}<label>主题<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="主题" /></label><textarea className="compose-body" value={body} onChange={(event) => setBody(event.target.value)} placeholder={htmlMode ? '输入内容，将以 HTML + 纯文本双格式发送…' : '写下你的邮件…'} />{htmlMode && <div className="compose-format-note"><Icon name="grid" size={14} />此邮件将附带安全的 HTML 版本，同时保留纯文本版本</div>}{attachments.length > 0 && <div className="compose-attachments" aria-label="待发送附件">{attachments.map((file, index) => <div className="compose-attachment" key={file.name + '-' + file.size + '-' + index}><span>{file.name}</span><small>{Math.max(1, Math.round(file.size / 1024))} KB</small><button type="button" onClick={() => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))} aria-label={'移除附件 ' + file.name}>×</button></div>)}</div>}{uploadingName && <div className="compose-uploading" aria-live="polite"><Icon name="rotate" size={14} />{uploadingName}</div>}<div className="compose-footer"><div><TooltipButton label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={19} /></TooltipButton><input ref={fileInputRef} type="file" multiple hidden onChange={addFiles} /><TooltipButton label="插入图片" onClick={() => fileInputRef.current?.click()}><Icon name="image" size={19} /></TooltipButton><TooltipButton label={htmlMode ? '关闭 HTML 格式' : '启用 HTML 格式'} active={htmlMode} onClick={() => setHtmlMode((value) => !value)}><span className="reply-a">A</span></TooltipButton></div><button type="button" className="gradient-button" onClick={send} disabled={isSending}>{isSending ? (uploadingName || '发送中…') : '发送'}<Icon name="send" size={17} /></button></div></motion.div></motion.div>
+  return <motion.div className="modal-backdrop compose-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="compose-modal" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1 }} exit={{ opacity: 0, y: 20 }}><div className="compose-header"><strong>新邮件</strong><div><TooltipButton label="最小化撰写窗口"><span className="window-minimize" /></TooltipButton><TooltipButton label="关闭撰写窗口" onClick={onClose}><Icon name="close" size={17} /></TooltipButton></div></div><div className="compose-recipient-row"><label>收件人<input autoFocus value={to} onChange={(event) => setTo(event.target.value)} placeholder="name@example.com，可用逗号分隔多个地址" /></label><button type="button" className="copy-fields-button" onClick={() => setShowCopyFields((value) => !value)} aria-expanded={showCopyFields}>{showCopyFields ? '隐藏抄送' : '抄送 / 密送'}</button></div>{showCopyFields && <><label>抄送<input value={cc} onChange={(event) => setCc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label><label>密送<input value={bcc} onChange={(event) => setBcc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label></>}<label>主题<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="主题" /></label><textarea className="compose-body" value={body} onChange={(event) => setBody(event.target.value)} placeholder={htmlMode ? '输入内容，将以 HTML + 纯文本双格式发送…' : '写下你的邮件…'} />{draftStatus && <div className="compose-draft-status" aria-live="polite"><Icon name="cloud" size={14} />{draftStatus}</div>}{htmlMode && <div className="compose-format-note"><Icon name="grid" size={14} />此邮件将附带安全的 HTML 版本，同时保留纯文本版本</div>}{attachments.length > 0 && <div className="compose-attachments" aria-label="待发送附件">{attachments.map((file, index) => <div className="compose-attachment" key={file.name + '-' + file.size + '-' + index}><span>{file.name}</span><small>{Math.max(1, Math.round(file.size / 1024))} KB</small><button type="button" onClick={() => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))} aria-label={'移除附件 ' + file.name}>×</button></div>)}</div>}{uploadingName && <div className="compose-uploading" aria-live="polite"><Icon name="rotate" size={14} />{uploadingName}</div>}<div className="compose-footer"><div><TooltipButton label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={19} /></TooltipButton><input ref={fileInputRef} type="file" multiple hidden onChange={addFiles} /><TooltipButton label="插入图片" onClick={() => fileInputRef.current?.click()}><Icon name="image" size={19} /></TooltipButton><TooltipButton label={htmlMode ? '关闭 HTML 格式' : '启用 HTML 格式'} active={htmlMode} onClick={() => setHtmlMode((value) => !value)}><span className="reply-a">A</span></TooltipButton></div><button type="button" className="gradient-button" onClick={send} disabled={isSending}>{isSending ? (uploadingName || '发送中…') : '发送'}<Icon name="send" size={17} /></button></div></motion.div></motion.div>
 }
 
 export default App

@@ -109,6 +109,18 @@ export interface NativeQueueStatus {
   total: number
 }
 
+export interface NativeDraft {
+  id: string
+  accountId: string
+  to: string
+  cc: string
+  bcc: string
+  subject: string
+  body: string
+  htmlMode: boolean
+  updatedAt: number
+}
+
 export interface NativeCachedAttachment {
   index: number
   fileName: string

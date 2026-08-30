@@ -392,6 +392,7 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .compose-recipient-row input { height: 30px; padding: 0; border: 0; background: transparent; box-shadow: none; font-size: 12px; }
 .compose-body { width: 100%; min-height: 245px; display: block; resize: vertical; padding: 17px; border: 0; outline: 0; color: var(--text); background: transparent; font-size: 13px; line-height: 1.7; }
 .compose-body::placeholder { color: var(--muted); }
+.compose-draft-status { display: flex; align-items: center; gap: 6px; padding: 0 17px 9px; color: var(--muted); font-size: 10px; }
 .compose-format-note { display: flex; align-items: center; gap: 6px; padding: 0 17px 10px; color: var(--accent); font-size: 11px; }
 .compose-attachments { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 17px 10px; }
 .compose-attachment { min-width: 0; display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: 7px; color: var(--muted-strong); background: var(--surface-strong); font-size: 11px; }

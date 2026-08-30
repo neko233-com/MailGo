@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use zeroize::{Zeroize, Zeroizing};
 
 mod classifier;
+mod drafts;
 mod instance;
 mod mail;
 mod oauth;
@@ -423,6 +424,17 @@ fn bounded_string_field(payload: &Value, name: &str, max_bytes: usize) -> Result
         return Err(anyhow!("field {name} exceeds the safe size limit"));
     }
     Ok(value)
+}
+
+fn text_field(payload: &Value, name: &str, max_bytes: usize) -> Result<String> {
+    let value = payload
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing field: {name}"))?;
+    if value.len() > max_bytes {
+        return Err(anyhow!("field {name} exceeds the safe size limit"));
+    }
+    Ok(value.to_string())
 }
 
 fn u32_field(payload: &Value, name: &str) -> Result<u32> {
@@ -888,6 +900,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     return Err(anyhow!("invalid account id"));
                 }
                 sync::remove_account_cache(&cache_dir(), &id)?;
+                let _ = drafts::remove_account(&cache_dir(), &id);
                 let _ = credential_entry(&id)
                     .and_then(|entry| entry.delete_credential().map_err(anyhow::Error::from));
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
@@ -1003,6 +1016,48 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 Ok(json!({
                     "imported": import_result?,
                     "requiresReauth": false,
+                }))
+            }
+            "drafts.list" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
+                Ok(serde_json::to_value(drafts::list(
+                    &cache_dir(),
+                    &account_id,
+                )?)?)
+            }
+            "drafts.save" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
+                let draft = drafts::Draft {
+                    id: optional_string_field(&message.payload, "id").unwrap_or_default(),
+                    account_id,
+                    to: text_field(&message.payload, "to", MAX_RECIPIENT_BYTES)?,
+                    cc: optional_bounded_string_field(&message.payload, "cc", MAX_RECIPIENT_BYTES)?
+                        .unwrap_or_default(),
+                    bcc: optional_bounded_string_field(
+                        &message.payload,
+                        "bcc",
+                        MAX_RECIPIENT_BYTES,
+                    )?
+                    .unwrap_or_default(),
+                    subject: text_field(&message.payload, "subject", MAX_SUBJECT_BYTES)?,
+                    body: text_field(&message.payload, "body", MAX_MESSAGE_BODY_BYTES)?,
+                    html_mode: message
+                        .payload
+                        .get("htmlMode")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    updated_at: 0,
+                };
+                Ok(serde_json::to_value(drafts::save(&cache_dir(), draft)?)?)
+            }
+            "drafts.remove" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
+                let draft_id = string_field(&message.payload, "id")?;
+                Ok(json!({
+                    "removed": drafts::remove(&cache_dir(), &account_id, &draft_id)?,
                 }))
             }
             "sync.queue_status" => {

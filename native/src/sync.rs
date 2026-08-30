@@ -1447,7 +1447,7 @@ fn save_mailbox(cache_root: &Path, account_id: &str, mailbox: &CachedMailbox) ->
 }
 
 #[cfg(target_os = "windows")]
-fn protect_cache(payload: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn protect_cache(payload: &[u8]) -> Result<Vec<u8>> {
     use std::mem::zeroed;
     use std::slice::from_raw_parts;
     use windows_sys::Win32::Foundation::LocalFree;
@@ -1480,12 +1480,12 @@ fn protect_cache(payload: &[u8]) -> Result<Vec<u8>> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn protect_cache(payload: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn protect_cache(payload: &[u8]) -> Result<Vec<u8>> {
     Ok(payload.to_vec())
 }
 
 #[cfg(target_os = "windows")]
-fn unprotect_cache(payload: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn unprotect_cache(payload: &[u8]) -> Result<Vec<u8>> {
     use std::mem::zeroed;
     use std::slice::from_raw_parts;
     use windows_sys::Win32::Foundation::LocalFree;
@@ -1518,7 +1518,7 @@ fn unprotect_cache(payload: &[u8]) -> Result<Vec<u8>> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn unprotect_cache(payload: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn unprotect_cache(payload: &[u8]) -> Result<Vec<u8>> {
     Ok(payload.to_vec())
 }
 
