@@ -101,6 +101,12 @@ export interface NativeSyncResponse {
   failed: { accountId: string; message: string }[]
 }
 
+export interface NativeQueueStatus {
+  flags: number
+  moves: number
+  total: number
+}
+
 export interface NativeCachedAttachment {
   index: number
   fileName: string

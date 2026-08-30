@@ -31,6 +31,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 25. Native MIME sanitization now removes remote image sources and tracking-related attributes before caching while preserving safe HTTPS/mailto links and inline CID images.
 26. Sync retry handling honors numeric `Retry-After` hints that survive transport errors, with a bounded 1–300 second cap and exponential fallback for providers that omit the hint.
 27. Offline flag and move queues are covered by executable regression tests for coalescing semantics and immediate encrypted-cache consistency; temporary test state is process-scoped and cleaned up after each case.
+28. The native queue-status IPC exposes only encrypted-queue counts, and the desktop cache footer reports pending local operations across all configured accounts after mutations and sync.
 
 ## Remaining production acceptance work
 

@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Icon, type IconName } from './components/Icon'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
 import { invoke, readNativeState } from './lib/ipc'
-import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeMailboxResponse, NativeMessageResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
+import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeMailboxResponse, NativeMessageResponse, NativeQueueStatus, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 type ToastTone = 'info' | 'success' | 'error'
 type Toast = { id: number; message: string; tone: ToastTone }
@@ -219,6 +219,7 @@ function App() {
   const [minimizeToTray, setMinimizeToTray] = useState(true)
   const [notificationsEnabled, setNotificationsEnabled] = useState(true)
   const [remoteImagesEnabled, setRemoteImagesEnabled] = useState(loadRemoteImages)
+  const [pendingOperations, setPendingOperations] = useState(0)
   const [provider, setProvider] = useState<Provider>('qq')
   const [accountEmail, setAccountEmail] = useState('')
   const [editingAccountId, setEditingAccountId] = useState<string | null>(null)
@@ -251,6 +252,19 @@ function App() {
     const id = Date.now() + Math.random()
     setToasts((current) => [...current.slice(-2), { id, message, tone }])
     window.setTimeout(() => setToasts((current) => current.filter((toast) => toast.id !== id)), 3600)
+  }
+
+  const refreshPendingOperations = async (accountList: MailAccount[] = accounts) => {
+    if (!isNativeRuntime) {
+      setPendingOperations(0)
+      return
+    }
+    try {
+      const statuses = await Promise.all(accountList.map((account) => invoke<NativeQueueStatus>('sync.queue_status', { accountId: account.id })))
+      setPendingOperations(statuses.reduce((total, status) => total + status.total, 0))
+    } catch {
+      // Queue status is telemetry for the local UI; a transient read failure must not interrupt mail actions.
+    }
   }
 
   const changeProvider = (nextProvider: Provider) => {
@@ -323,6 +337,7 @@ function App() {
       setMinimizeToTray(nativeState.minimizeToTray)
       setNotificationsEnabled(nativeState.notificationsEnabled ?? true)
       setRemoteImagesEnabled(nativeState.remoteImagesEnabled ?? false)
+      void refreshPendingOperations(nativeState.accounts)
       if (!isNativeRuntime) return
       await Promise.all(nativeState.accounts.map(async (account) => {
         try {
@@ -449,7 +464,7 @@ function App() {
     setSelectedMailId(mail.id)
     if (mail.unread) setMails((current) => current.map((item) => item.id === mail.id ? { ...item, unread: false } : item))
     if (isNativeRuntime && mail.nativeUid) {
-      void invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: false }).catch(() => undefined)
+      void invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: false }).then(() => refreshPendingOperations()).catch(() => undefined)
       try {
         const result = await invoke<NativeMessageResponse>('mail.get', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid })
         const account = accounts.find((item) => item.id === mail.accountId)
@@ -468,7 +483,7 @@ function App() {
     setMails((current) => current.map((item) => item.id === mail.id ? { ...item, starred: nextStarred } : item))
     setSelectedMailId(mail.id)
     if (isNativeRuntime && mail.nativeUid) {
-      void invoke('mail.star', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: nextStarred }).catch(() => pushToast('星标同步失败，可稍后重试', 'error'))
+      void invoke('mail.star', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: nextStarred }).then(() => refreshPendingOperations()).catch(() => pushToast('星标同步失败，可稍后重试', 'error'))
     }
     pushToast(nextStarred ? '已添加到星标' : '已移出星标', 'success')
   }
@@ -497,6 +512,7 @@ function App() {
       : account))
     if (isNativeRuntime && mail.nativeUid) {
       await invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: unread })
+      await refreshPendingOperations()
     }
   }
 
@@ -523,6 +539,7 @@ function App() {
         }
       }))
       failed = results.filter((result) => !result).length
+      await refreshPendingOperations()
     }
     setSelectedMailIds([])
     setOpenMenu(null)
@@ -550,6 +567,7 @@ function App() {
         }
       }))
       failed = results.filter((result) => !result).length
+      await refreshPendingOperations()
     }
     setSelectedMailIds([])
     setOpenMenu(null)
@@ -572,6 +590,7 @@ function App() {
         ...(targetFolder ? { targetFolder } : {}),
       })
       queued = Boolean(result.queued)
+      await refreshPendingOperations()
     }
     if (isPermanentDelete) {
       setMails((current) => current.filter((item) => item.id !== mail.id))
@@ -825,6 +844,7 @@ function App() {
             // Preserve the previous offline copy if one account has a transient cache error.
           }
         }))
+        await refreshPendingOperations(accounts)
       }
     } catch {
       // Browser preview has no account transport. Keep the design-time demo responsive.
@@ -1187,7 +1207,7 @@ function App() {
           <div className="storage-bar">
             <div className="storage-meta"><span>本地缓存</span><span>4.2 GB / 15 GB</span></div>
             <div className="storage-track"><span /></div>
-            <div className="storage-foot"><span><Icon name="cloud" size={13} /> 离线可查看最近邮件</span><button type="button" onClick={handleSync}><Icon name="rotate" size={13} /> {isSyncing ? '同步中…' : '立即同步'}</button></div>
+            <div className="storage-foot"><span aria-live="polite"><Icon name={pendingOperations ? 'rotate' : 'cloud'} size={13} /> {pendingOperations ? `${pendingOperations} 项操作待同步` : '离线可查看最近邮件'}</span><button type="button" onClick={handleSync}><Icon name="rotate" size={13} /> {isSyncing ? '同步中…' : '立即同步'}</button></div>
           </div>
 
           <div className="sidebar-footer">

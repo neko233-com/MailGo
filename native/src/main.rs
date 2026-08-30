@@ -915,6 +915,14 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     "requiresReauth": false,
                 }))
             }
+            "sync.queue_status" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
+                Ok(serde_json::to_value(sync::pending_mutation_counts(
+                    &cache_dir(),
+                    &account_id,
+                )?)?)
+            }
             "sync.account" => {
                 let account_id = string_field(&message.payload, "accountId")?;
                 let account = account_for(shared, &account_id)?;

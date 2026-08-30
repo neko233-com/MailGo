@@ -52,6 +52,14 @@ pub struct SyncResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PendingMutationCounts {
+    pub flags: usize,
+    pub moves: usize,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MailDetail {
     pub message: CachedMessage,
 }
@@ -1133,6 +1141,23 @@ pub fn remove_queued_move(
     Ok(())
 }
 
+/// Return the number of locally applied mutations that still need provider replay. The queue
+/// files are DPAPI-protected on Windows, so the renderer only receives counts, never mutation
+/// details or mailbox contents.
+pub fn pending_mutation_counts(
+    cache_root: &Path,
+    account_id: &str,
+) -> Result<PendingMutationCounts> {
+    let directory = cache_root.join(safe_component(account_id));
+    let flags = load_mutations(&directory.join(MUTATION_FILE))?.len();
+    let moves = load_move_mutations(&directory.join(MOVE_MUTATION_FILE))?.len();
+    Ok(PendingMutationCounts {
+        flags,
+        moves,
+        total: flags.saturating_add(moves),
+    })
+}
+
 fn flush_queued_moves(
     session: &mut imap::Session<imap::Connection>,
     cache_root: &Path,
@@ -1809,6 +1834,27 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(moved.messages[0].folder, "[Gmail]/All Mail");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_mutation_counts_report_only_queue_sizes() {
+        let root =
+            std::env::temp_dir().join(format!("mailgo-queue-counts-test-{}", std::process::id()));
+        queue_flag_mutation(&root, "fixture-account", "INBOX", 9, "\\Seen", false).unwrap();
+        queue_move_mutation(
+            &root,
+            "fixture-account",
+            "archive",
+            "INBOX",
+            10,
+            Some("Archive"),
+        )
+        .unwrap();
+        let counts = pending_mutation_counts(&root, "fixture-account").unwrap();
+        assert_eq!(counts.flags, 1);
+        assert_eq!(counts.moves, 1);
+        assert_eq!(counts.total, 2);
         let _ = fs::remove_dir_all(root);
     }
 }
