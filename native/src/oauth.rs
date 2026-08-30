@@ -10,6 +10,7 @@ use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::form_urlencoded::Serializer;
+use zeroize::Zeroize;
 
 use crate::providers::ProviderKind;
 
@@ -34,10 +35,37 @@ pub struct PendingSession {
     callback: Arc<Mutex<Option<CallbackResult>>>,
 }
 
+impl Drop for PendingSession {
+    fn drop(&mut self) {
+        self.state.zeroize();
+        self.code_verifier.zeroize();
+        if let Some(client_secret) = &mut self.client_secret {
+            client_secret.zeroize();
+        }
+        if let Some(device_code) = &mut self.device_code {
+            device_code.zeroize();
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum CallbackResult {
     Code { code: String, state: Option<String> },
     Error(String),
+}
+
+impl Drop for CallbackResult {
+    fn drop(&mut self) {
+        match self {
+            Self::Code { code, state } => {
+                code.zeroize();
+                if let Some(state) = state {
+                    state.zeroize();
+                }
+            }
+            Self::Error(error) => error.zeroize(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -325,9 +353,13 @@ pub fn take_callback(session: &PendingSession) -> Result<Option<(String, Option<
     let Some(result) = callback.take() else {
         return Ok(None);
     };
-    match result {
-        CallbackResult::Code { code, state } => Ok(Some((code, state))),
-        CallbackResult::Error(error) => Err(anyhow!("OAuth provider returned an error: {error}")),
+    let mut result = result;
+    match &mut result {
+        CallbackResult::Code { code, state } => Ok(Some((std::mem::take(code), state.take()))),
+        CallbackResult::Error(error) => Err(anyhow!(
+            "OAuth provider returned an error: {}",
+            std::mem::take(error)
+        )),
     }
 }
 

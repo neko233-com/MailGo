@@ -11,6 +11,11 @@ use crate::classifier::{classify, SmartCategory};
 
 const MAX_CACHED_HTML_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PREVIEW_CHARS: usize = 240;
+pub const MAX_FULL_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ATTACHMENTS_PER_MESSAGE: usize = 64;
+const MAX_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ATTACHMENT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ATTACHMENT_NAME_CHARS: usize = 255;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,6 +114,9 @@ pub fn parse_full(
     starred: bool,
     raw: &[u8],
 ) -> Result<CachedMessage> {
+    if raw.len() > MAX_FULL_MESSAGE_BYTES {
+        return Err(anyhow!("message exceeds the safe MIME size limit"));
+    }
     let parsed = MessageParser::default()
         .parse(raw)
         .ok_or_else(|| anyhow!("message could not be parsed"))?;
@@ -156,17 +164,8 @@ fn build_message(
         .enumerate()
         .map(|part| CachedAttachment {
             index: part.0,
-            file_name: part.1.attachment_name().unwrap_or("attachment").to_string(),
-            content_type: part
-                .1
-                .content_type()
-                .map(|kind| {
-                    kind.c_subtype
-                        .as_ref()
-                        .map(|subtype| format!("{}/{}", kind.c_type, subtype))
-                        .unwrap_or_else(|| kind.c_type.to_string())
-                })
-                .unwrap_or_else(|| "application/octet-stream".into()),
+            file_name: safe_attachment_name(part.1.attachment_name().unwrap_or("attachment")),
+            content_type: content_type_for_part(part.1),
             content_id: part.1.content_id().map(str::to_string),
             size: part_size(part.1),
             cache_path: None,
@@ -202,25 +201,32 @@ fn build_message(
 }
 
 pub fn extract_attachment_payloads(raw: &[u8]) -> Result<Vec<AttachmentPayload>> {
+    if raw.len() > MAX_FULL_MESSAGE_BYTES {
+        return Err(anyhow!("message exceeds the safe MIME size limit"));
+    }
     let parsed = MessageParser::default()
         .parse(raw)
         .ok_or_else(|| anyhow!("message could not be parsed"))?;
-    Ok(parsed
-        .attachments()
-        .map(|part| AttachmentPayload {
-            content_type: part
-                .content_type()
-                .map(|kind| {
-                    kind.c_subtype
-                        .as_ref()
-                        .map(|subtype| format!("{}/{}", kind.c_type, subtype))
-                        .unwrap_or_else(|| kind.c_type.to_string())
-                })
-                .unwrap_or_else(|| "application/octet-stream".into()),
+    let mut payloads = Vec::new();
+    let mut total_bytes = 0usize;
+    for (index, part) in parsed.attachments().enumerate() {
+        if index >= MAX_ATTACHMENTS_PER_MESSAGE {
+            return Err(anyhow!("message contains too many attachments"));
+        }
+        let size = part_size(part);
+        if size > MAX_ATTACHMENT_BYTES
+            || total_bytes.saturating_add(size) > MAX_ATTACHMENT_TOTAL_BYTES
+        {
+            return Err(anyhow!("message attachments exceed the safe size limit"));
+        }
+        total_bytes = total_bytes.saturating_add(size);
+        payloads.push(AttachmentPayload {
+            content_type: content_type_for_part(part),
             content_id: part.content_id().map(str::to_string),
             bytes: part_bytes(part),
-        })
-        .collect())
+        });
+    }
+    Ok(payloads)
 }
 
 pub fn embed_inline_images(html: &mut Option<String>, payloads: &[AttachmentPayload]) {
@@ -263,6 +269,44 @@ fn part_size(part: &mail_parser::MessagePart<'_>) -> usize {
         PartType::Message(message) => message.raw_message().len(),
         PartType::Multipart(_) => 0,
     }
+}
+
+fn content_type_for_part(part: &mail_parser::MessagePart<'_>) -> String {
+    part.content_type()
+        .map(|kind| {
+            kind.c_subtype
+                .as_ref()
+                .map(|subtype| format!("{}/{}", kind.c_type, subtype))
+                .unwrap_or_else(|| kind.c_type.to_string())
+        })
+        .filter(|value| {
+            value.len() <= 128
+                && value
+                    .chars()
+                    .all(|character| !matches!(character, '\r' | '\n' | '\0'))
+        })
+        .unwrap_or_else(|| "application/octet-stream".into())
+}
+
+fn safe_attachment_name(value: &str) -> String {
+    let mut name = value
+        .chars()
+        .map(|character| {
+            if character == '/' || character == '\\' || character.is_control() {
+                '_'
+            } else {
+                character
+            }
+        })
+        .take(MAX_ATTACHMENT_NAME_CHARS)
+        .collect::<String>()
+        .trim()
+        .trim_matches('.')
+        .to_string();
+    if name.is_empty() {
+        name = "attachment".into();
+    }
+    name
 }
 
 fn part_bytes(part: &mail_parser::MessagePart<'_>) -> Vec<u8> {
@@ -352,6 +396,17 @@ mod tests {
         let html = message.html_body.unwrap();
         assert!(html.contains("data:image/png;base64,"));
         assert_eq!(message.attachments.len(), 1);
+    }
+
+    #[test]
+    fn normalizes_untrusted_attachment_names() {
+        let raw = "From: sender@example.com\r\nSubject: Attachment\r\nContent-Type: multipart/mixed; boundary=mixed\r\n\r\n--mixed\r\nContent-Type: text/plain; charset=utf-8\r\n\r\ntext\r\n--mixed\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"../../private.txt\"\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n--mixed--\r\n";
+        let message = parse_full("account", "INBOX", 9, false, false, raw.as_bytes()).unwrap();
+        assert_eq!(message.attachments.len(), 1);
+        let name = &message.attachments[0].file_name;
+        assert!(!name.contains('/'));
+        assert!(!name.contains('\\'));
+        assert!(!name.starts_with('.'));
     }
 
     #[test]

@@ -1518,24 +1518,28 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     }
                     attachments
                 };
-                let account = account_for(shared, &account_id)?;
-                let profile = profile_for_account(&account)?;
-                let credential = load_credential(&account)?;
-                send::send_message(
-                    profile,
-                    &account.email,
-                    &credential,
-                    &to,
-                    &subject,
-                    &text_body,
-                    html_body.as_deref(),
-                    &attachments,
-                )?;
+                let send_result = (|| -> Result<()> {
+                    let account = account_for(shared, &account_id)?;
+                    let profile = profile_for_account(&account)?;
+                    let credential = load_credential(&account)?;
+                    send::send_message(
+                        profile,
+                        &account.email,
+                        &credential,
+                        &to,
+                        &subject,
+                        &text_body,
+                        html_body.as_deref(),
+                        &attachments,
+                    )?;
+                    Ok(())
+                })();
                 if let Ok(mut app) = shared.lock() {
                     for upload_id in &attachment_ids {
                         app.attachment_uploads.remove(upload_id);
                     }
                 }
+                send_result?;
                 Ok(json!({ "sent": true, "accountId": account_id }))
             }
             _ => Err(anyhow!("unknown command: {}", message.cmd)),
