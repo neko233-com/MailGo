@@ -931,10 +931,20 @@ function App() {
       accent: selectedProvider.accent,
       status: 'syncing',
       lastSync: '正在同步…',
+      authentication: customAuthentication,
+      ...(provider === 'other' ? {
+        imapHost: customImapHost.trim(),
+        imapPort: Number(customImapPort),
+        imapSecurity: customImapSecurity,
+        smtpHost: customSmtpHost.trim(),
+        smtpPort: Number(customSmtpPort),
+        smtpSecurity: customSmtpSecurity,
+      } : {}),
     }
     setAccounts((current) => existingAccount
       ? current.map((account) => account.id === id ? newAccount : account)
       : [...current, newAccount])
+    let accountStored = false
     try {
       await invoke('accounts.add', {
         id,
@@ -955,6 +965,7 @@ function App() {
           authentication: customAuthentication,
         } : {}),
       })
+      accountStored = true
       const result = await invoke<{ unread?: number }>('sync.account', { accountId: id }, 60_000)
       setAccounts((current) => current.map((account) => account.id === id ? { ...account, unread: result.unread ?? 0, status: 'synced', lastSync: '刚刚同步' } : account))
       if (isNativeRuntime) {
@@ -966,13 +977,31 @@ function App() {
         setMails((current) => [...current.filter((mail) => mail.accountId !== id), ...converted])
         if (converted.length) setSelectedMailId(converted[0].id)
       }
-    } catch {
+    } catch (error) {
+      if (accountStored) {
+        const message = error instanceof Error ? error.message : ''
+        const needsAuth = /auth|credential|login|password|authorization/i.test(message)
+        setAccounts((current) => current.map((account) => account.id === id
+          ? { ...newAccount, status: needsAuth ? 'needs-auth' : 'offline', lastSync: needsAuth ? '等待重新授权' : '首次同步失败，可重试' }
+          : account))
+        setAuthorizationCode('')
+        setOauthSessionId('')
+        setOauthState('')
+        setDeviceFlow(null)
+        setAccountEmail('')
+        setEditingAccountId(null)
+        setAccountModalOpen(false)
+        setSelectedAccountId(id)
+        pushToast(needsAuth ? '账户已保存，但需要重新授权' : '账户已保存，首次同步失败；可稍后点击账户重试', needsAuth ? 'error' : 'info')
+        return
+      }
       setAccounts((current) => existingAccount
         ? current.map((account) => account.id === existingAccount.id ? existingAccount : account)
         : current.filter((account) => account.id !== id))
       pushToast(existingAccount ? '账户重新授权失败，已保留原账户配置' : '账户添加失败，请检查授权码、OAuth 配置或服务器设置', 'error')
       return
     }
+    await refreshPendingOperations([...accounts.filter((account) => account.id !== id), newAccount])
     setAuthorizationCode('')
     setOauthSessionId('')
     setOauthState('')

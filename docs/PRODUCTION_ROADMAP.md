@@ -32,6 +32,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 26. Sync retry handling honors numeric `Retry-After` hints that survive transport errors, with a bounded 1–300 second cap and exponential fallback for providers that omit the hint.
 27. Offline flag and move queues are covered by executable regression tests for coalescing semantics and immediate encrypted-cache consistency; temporary test state is process-scoped and cleaned up after each case.
 28. The native queue-status IPC exposes only encrypted-queue counts, and the desktop cache footer reports pending local operations across all configured accounts after mutations and sync.
+29. Account onboarding distinguishes credential-save failure from first-sync failure, preserving a successfully stored account as offline/reauthorization-needed instead of rolling back only the renderer state.
 
 ## Remaining production acceptance work
 
