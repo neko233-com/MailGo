@@ -1115,9 +1115,8 @@ fn flush_queued_moves(
     }
     let mut remaining = Vec::new();
     for mutation in mutations {
-        let applied = session
-            .select(&mutation.folder)
-            .and_then(|_| match mutation.operation.as_str() {
+        let applied = match session.select(&mutation.folder) {
+            Ok(_) => match mutation.operation.as_str() {
                 "archive" => mutation
                     .target_folder
                     .as_deref()
@@ -1144,8 +1143,10 @@ fn flush_queued_moves(
                     .ok_or_else(|| anyhow!("queued move has no target folder"))
                     .and_then(|target| move_uid(session, mutation.uid, target)),
                 _ => Err(anyhow!("unsupported queued mail operation")),
-            })
-            .is_ok();
+            },
+            Err(error) => Err(anyhow!("select queued mutation folder: {error}")),
+        }
+        .is_ok();
         if applied {
             let cache_result = if mutation.operation == "delete"
                 && (mutation.target_folder.is_none()

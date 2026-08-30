@@ -54,6 +54,7 @@ npm run native:run
 ```
 
 The native shell loads `dist/` through the framework-owned `rdesktop://` protocol. Run `npm run build` before compiling Rust.
+The Windows npm scripts place Cargo's target directory under `%LOCALAPPDATA%\MailGo\cargo-target` so application-control policies do not block dependency build scripts in the repository checkout.
 
 ## Publishing
 

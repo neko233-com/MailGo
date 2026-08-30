@@ -129,7 +129,7 @@ pub fn start(provider: ProviderKind, email: &str) -> Result<(PendingSession, Sta
         id: session_id.clone(),
         provider,
         email: email.trim().to_string(),
-        state,
+        state: state.clone(),
         code_verifier,
         client_id: config.client_id,
         client_secret: config.client_secret,

@@ -8,8 +8,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "native:build": "npm run build && cargo build --manifest-path native/Cargo.toml",
-    "native:run": "npm run build && cargo run --manifest-path native/Cargo.toml"
+    "native:build": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1",
+    "native:run": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1 -Run"
   },
   "dependencies": {
     "motion": "^13.1.1",
