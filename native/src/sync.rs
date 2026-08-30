@@ -780,6 +780,17 @@ pub fn load_mailbox_for_folder(
     Ok(None)
 }
 
+pub fn remove_account_cache(cache_root: &Path, account_id: &str) -> Result<()> {
+    let directory = cache_root.join(safe_component(account_id));
+    match fs::remove_dir_all(&directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("remove account cache {}", directory.display()))
+        }
+    }
+}
+
 pub fn load_cached_message(
     cache_root: &Path,
     account_id: &str,
@@ -1571,6 +1582,20 @@ mod tests {
     fn cache_component_cannot_escape_account_directory() {
         assert_eq!(safe_component("../../secret"), ".._.._secret");
         assert_eq!(safe_component("account-1"), "account-1");
+    }
+
+    #[test]
+    fn removing_account_cache_is_scoped_and_idempotent() {
+        let root =
+            std::env::temp_dir().join(format!("mailgo-sync-cache-test-{}", std::process::id()));
+        let account_dir = root.join(safe_component("account-1"));
+        fs::create_dir_all(&account_dir).unwrap();
+        fs::write(account_dir.join("inbox.bin"), b"cache").unwrap();
+
+        remove_account_cache(&root, "account-1").unwrap();
+        assert!(!account_dir.exists());
+        remove_account_cache(&root, "account-1").unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

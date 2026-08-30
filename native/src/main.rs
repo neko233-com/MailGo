@@ -695,6 +695,10 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
             }
             "accounts.remove" => {
                 let id = string_field(&message.payload, "id")?;
+                if !valid_account_id(&id) {
+                    return Err(anyhow!("invalid account id"));
+                }
+                sync::remove_account_cache(&cache_dir(), &id)?;
                 let _ = credential_entry(&id)
                     .and_then(|entry| entry.delete_credential().map_err(anyhow::Error::from));
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;

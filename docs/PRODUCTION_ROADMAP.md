@@ -24,6 +24,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 18. Compose attachments use bounded chunked upload IPC with per-file/total/count limits, expiry and cancellation; Rust builds multipart MIME messages without persisting outgoing file bytes.
 19. Remote HTML images are blocked by default in the renderer, while CID/data images remain available; the preference is persisted in native metadata and can be explicitly enabled with a privacy warning.
 20. Release packaging has a reproducible Windows portable ZIP path; the native shell resolves renderer assets beside the executable, with an environment override for controlled deployment.
+21. Existing accounts can re-enter the authorization flow without changing their stable account ID, and native account removal clears the protected credential plus the account-scoped offline cache.
 
 ## Remaining production acceptance work
 
