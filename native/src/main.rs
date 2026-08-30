@@ -134,7 +134,7 @@ fn decode_persisted_state(contents: &str) -> Result<PersistedState> {
     }
     Ok(PersistedState {
         schema_version: STATE_SCHEMA_VERSION,
-        accounts: disk.accounts,
+        accounts: sanitize_persisted_accounts(disk.accounts),
         theme: if disk.theme == "light" {
             "light".to_string()
         } else {
@@ -146,6 +146,21 @@ fn decode_persisted_state(contents: &str) -> Result<PersistedState> {
         remote_images_enabled: disk.remote_images_enabled,
         hide_ads: disk.hide_ads,
     })
+}
+
+fn sanitize_persisted_accounts(accounts: Vec<PersistedAccount>) -> Vec<PersistedAccount> {
+    let mut seen_ids = HashSet::new();
+    accounts
+        .into_iter()
+        .filter(|account| {
+            valid_account_id(&account.id)
+                && account.label.len() <= MAX_ACCOUNT_LABEL_LENGTH
+                && providers::validate_email(&account.email).is_ok()
+                && profile_for_account(account).is_ok()
+                && seen_ids.insert(account.id.clone())
+        })
+        .take(MAX_IMPORTED_ACCOUNTS)
+        .collect()
 }
 
 impl Default for PersistedState {
@@ -1862,6 +1877,24 @@ mod tests {
         assert!(!valid_account_id("."));
         assert!(!valid_account_id(".."));
         assert!(valid_account_id("qq-account-1"));
+    }
+
+    #[test]
+    fn state_decoder_drops_unsafe_or_duplicate_accounts() {
+        let state = decode_persisted_state(
+            r##"{
+                "accounts": [
+                    {"id":"..","provider":"qq","label":"bad","email":"bad@example.invalid","unread":0,"accent":"#111","status":"offline","lastSync":"never"},
+                    {"id":"safe","provider":"qq","label":"first","email":"first@example.invalid","unread":0,"accent":"#111","status":"offline","lastSync":"never"},
+                    {"id":"safe","provider":"qq","label":"duplicate","email":"second@example.invalid","unread":0,"accent":"#222","status":"offline","lastSync":"never"},
+                    {"id":"unsafe","provider":"other","label":"bad custom","email":"custom@example.invalid","unread":0,"accent":"#333","status":"offline","lastSync":"never","imapHost":"bad host","imapPort":993,"smtpHost":"smtp.example.invalid","smtpPort":465}
+                ]
+            }"##,
+        )
+        .unwrap();
+        assert_eq!(state.accounts.len(), 1);
+        assert_eq!(state.accounts[0].id, "safe");
+        assert_eq!(state.accounts[0].label, "first");
     }
 }
 

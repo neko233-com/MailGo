@@ -810,31 +810,61 @@ pub fn load_mailbox_for_folder(
     validate_mailbox_name(folder)?;
     let directory = cache_root.join(safe_component(account_id));
     let encrypted_path = directory.join(cache_file_name(folder));
-    let legacy_path = directory.join("inbox.json");
-    let paths: Vec<&Path> = if folder.eq_ignore_ascii_case("INBOX") {
-        vec![encrypted_path.as_path(), legacy_path.as_path()]
-    } else {
-        vec![encrypted_path.as_path()]
-    };
-    for path in paths {
-        match fs::read(path) {
-            Ok(contents) => {
-                let decoded = if path == encrypted_path.as_path() {
-                    unprotect_cache(&contents)
-                        .with_context(|| format!("decrypt {}", path.display()))?
-                } else {
-                    contents
-                };
-                return Ok(Some(
-                    serde_json::from_slice(&decoded)
-                        .with_context(|| format!("parse {}", path.display()))?,
-                ));
+    let mut candidates = vec![
+        (encrypted_path.clone(), true),
+        (encrypted_path.with_extension("bin.bak"), true),
+    ];
+    if folder.eq_ignore_ascii_case("INBOX") {
+        let legacy_path = directory.join("inbox.json");
+        candidates.push((legacy_path.clone(), false));
+        candidates.push((legacy_path.with_extension("json.bak"), false));
+    }
+    let mut first_error = None;
+    for (path, encrypted) in candidates {
+        match load_mailbox_file(&path, account_id, folder, encrypted) {
+            Ok(mailbox) => {
+                if first_error.is_some() {
+                    tracing::warn!(
+                        account_id = %account_id,
+                        folder = %folder,
+                        "mailbox cache primary was invalid; recovered from backup"
+                    );
+                }
+                return Ok(Some(mailbox));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
         }
     }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
     Ok(None)
+}
+
+fn load_mailbox_file(
+    path: &Path,
+    account_id: &str,
+    folder: &str,
+    encrypted: bool,
+) -> Result<CachedMailbox> {
+    let contents = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let decoded = if encrypted {
+        unprotect_cache(&contents).with_context(|| format!("decrypt {}", path.display()))?
+    } else {
+        contents
+    };
+    let mailbox: CachedMailbox =
+        serde_json::from_slice(&decoded).with_context(|| format!("parse {}", path.display()))?;
+    if mailbox.account_id != account_id || !mailbox.folder.eq_ignore_ascii_case(folder) {
+        return Err(anyhow!("cache identity mismatch in {}", path.display()));
+    }
+    Ok(mailbox)
 }
 
 pub fn remove_account_cache(cache_root: &Path, account_id: &str) -> Result<()> {
@@ -1812,6 +1842,41 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!updated.messages[0].unread);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mailbox_cache_recovers_from_previous_atomic_snapshot() {
+        let root =
+            std::env::temp_dir().join(format!("mailgo-cache-backup-test-{}", std::process::id()));
+        let first = CachedMailbox {
+            schema_version: 1,
+            account_id: "fixture-account".into(),
+            folder: "INBOX".into(),
+            uid_validity: Some(1),
+            synced_at: now_stamp(),
+            messages: vec![fixture_message(1, "INBOX")],
+            oldest_uid: Some(1),
+            has_more: false,
+        };
+        let mut second = first.clone();
+        second.messages[0].uid = 2;
+        save_mailbox(&root, "fixture-account", &first).unwrap();
+        let directory = root.join(safe_component("fixture-account"));
+        let primary = directory.join(CACHE_FILE);
+        let backup = directory.join(format!("{CACHE_FILE}.bak"));
+        fs::rename(&primary, &backup).unwrap();
+        fs::write(
+            &primary,
+            protect_cache(&serde_json::to_vec_pretty(&second).unwrap()).unwrap(),
+        )
+        .unwrap();
+        fs::write(&primary, b"corrupt cache").unwrap();
+
+        let recovered = load_mailbox_for_folder(&root, "fixture-account", "INBOX")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.messages[0].uid, 1);
         let _ = fs::remove_dir_all(root);
     }
 
