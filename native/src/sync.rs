@@ -144,6 +144,28 @@ pub fn sync_account(
     credential: &str,
     cache_root: &Path,
 ) -> Result<SyncResult> {
+    let mut attempt = 0u32;
+    loop {
+        match sync_account_once(account_id, profile.clone(), email, credential, cache_root) {
+            Ok(result) => return Ok(result),
+            Err(error) if attempt < 2 && is_retryable_sync_error(&error) => {
+                let delay = 1u64 << attempt;
+                attempt += 1;
+                tracing::warn!(account_id = %account_id, attempt, delay, "transient IMAP sync failure; retrying");
+                thread::sleep(Duration::from_secs(delay));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn sync_account_once(
+    account_id: &str,
+    profile: ProviderProfile,
+    email: &str,
+    credential: &str,
+    cache_root: &Path,
+) -> Result<SyncResult> {
     if credential.trim().is_empty() {
         return Err(anyhow!("account requires authorization before syncing"));
     }
@@ -251,6 +273,19 @@ pub fn sync_account(
     })
 }
 
+fn is_retryable_sync_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    ![
+        "authentication",
+        "authorization",
+        "invalid credential",
+        "unsupported",
+        "requires authorization",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
 /// Download and parse one full message only when the reader asks for it. The raw message can be
 /// retained by a caller in an account cache, but the returned representation is sanitized.
 pub fn fetch_message(
@@ -295,7 +330,7 @@ pub fn fetch_message(
     let mut message = parse_full(account_id, folder, uid, unread, starred, raw)?;
     let payloads = crate::mail::extract_attachment_payloads(raw)?;
     crate::mail::embed_inline_images(&mut message.html_body, &payloads);
-    store_attachment_payloads(cache_root, account_id, uid, &mut message, &payloads)?;
+    store_attachment_payloads(cache_root, account_id, folder, uid, &mut message, &payloads)?;
     session.logout().ok();
     Ok(MailDetail { message })
 }
@@ -303,6 +338,7 @@ pub fn fetch_message(
 fn store_attachment_payloads(
     cache_root: &Path,
     account_id: &str,
+    folder: &str,
     uid: u32,
     message: &mut CachedMessage,
     payloads: &[crate::mail::AttachmentPayload],
@@ -312,7 +348,8 @@ fn store_attachment_payloads(
     }
     let directory = cache_root
         .join(safe_component(account_id))
-        .join("attachments");
+        .join("attachments")
+        .join(safe_component(folder));
     fs::create_dir_all(&directory).with_context(|| format!("create {}", directory.display()))?;
     for (index, payload) in payloads.iter().enumerate() {
         let path = directory.join(format!("{uid}-{index}.bin"));
@@ -337,12 +374,18 @@ fn store_attachment_payloads(
 pub fn load_attachment(
     cache_root: &Path,
     account_id: &str,
+    folder: &str,
     uid: u32,
     index: usize,
 ) -> Result<AttachmentDownload> {
-    let mailbox = load_cached_message(cache_root, account_id, uid)?
+    let mailbox = load_mailbox_for_folder(cache_root, account_id, folder)?
         .ok_or_else(|| anyhow!("message is not cached"))?;
-    let metadata = mailbox
+    let message = mailbox
+        .messages
+        .iter()
+        .find(|message| message.uid == uid)
+        .ok_or_else(|| anyhow!("message is not cached"))?;
+    let metadata = message
         .attachments
         .iter()
         .find(|attachment| attachment.index == index)
@@ -350,6 +393,7 @@ pub fn load_attachment(
     let path = cache_root
         .join(safe_component(account_id))
         .join("attachments")
+        .join(safe_component(folder))
         .join(format!("{uid}-{index}.bin"));
     let encrypted =
         fs::read(&path).with_context(|| format!("read attachment {}", path.display()))?;
@@ -812,5 +856,18 @@ mod tests {
         let payload = String::from_utf8(auth.process(b"")).unwrap();
         assert!(payload.contains("user=person@example.com"));
         assert!(payload.contains("auth=Bearer token-value"));
+    }
+
+    #[test]
+    fn sync_retries_transport_failures_but_not_auth_failures() {
+        assert!(is_retryable_sync_error(&anyhow!(
+            "connect IMAP host timed out"
+        )));
+        assert!(!is_retryable_sync_error(&anyhow!(
+            "IMAP authentication failed"
+        )));
+        assert!(!is_retryable_sync_error(&anyhow!(
+            "unsupported mail provider"
+        )));
     }
 }

@@ -29,7 +29,7 @@ $env:MAILGO_OUTLOOK_CLIENT_ID = "your-registered-microsoft-client-id"
 $env:MAILGO_OUTLOOK_REDIRECT_URI = "http://127.0.0.1:8765/oauth/callback"
 ```
 
-The redirect URI must be registered exactly with the provider. A loopback callback listener and device-flow UX remain planned; until then, paste the provider-returned authorization code into the account assistant.
+The redirect URI must be registered exactly with the provider. MailGo listens once on a configured `127.0.0.1` callback and lets the account assistant exchange the returned code directly; manual code entry remains available when the callback port is unavailable. Device-flow UX remains planned.
 
 ## Run the browser development surface
 

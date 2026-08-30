@@ -321,7 +321,9 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 let provider = string_field(&message.payload, "provider")?;
                 let label = string_field(&message.payload, "label")?;
                 let email = string_field(&message.payload, "email")?;
-                let supplied_credential = string_field(&message.payload, "authorizationCode")?;
+                let supplied_credential =
+                    optional_string_field(&message.payload, "authorizationCode")
+                        .unwrap_or_default();
                 let provider_kind = providers::ProviderKind::parse(&provider)?;
                 providers::validate_email(&email)?;
                 let new_account = PersistedAccount {
@@ -343,8 +345,11 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 };
                 let profile = profile_for_account(&new_account)?;
 
-                let credential = if profile.authentication == providers::Authentication::OAuth2 {
-                    let session_id = string_field(&message.payload, "oauthSessionId")?;
+                let oauth_session_id = optional_string_field(&message.payload, "oauthSessionId");
+                let credential = if profile.authentication == providers::Authentication::OAuth2
+                    && oauth_session_id.is_some()
+                {
+                    let session_id = oauth_session_id.expect("checked above");
                     let returned_state = optional_string_field(&message.payload, "oauthState");
                     let pending = shared
                         .lock()
@@ -357,8 +362,18 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     {
                         return Err(anyhow!("OAuth sign-in session does not match this account"));
                     }
-                    oauth::exchange_code(&pending, &supplied_credential, returned_state.as_deref())?
+                    let (code, callback_state) = if supplied_credential.is_empty() {
+                        oauth::take_callback(&pending)?.ok_or_else(|| {
+                            anyhow!("OAuth callback is not ready; finish sign-in or paste the code")
+                        })?
+                    } else {
+                        (supplied_credential, returned_state)
+                    };
+                    oauth::exchange_code(&pending, &code, callback_state.as_deref())?
                 } else {
+                    if supplied_credential.is_empty() {
+                        return Err(anyhow!("account authorization is required"));
+                    }
                     supplied_credential
                 };
 
@@ -584,6 +599,8 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
             "mail.get" => {
                 let account_id = string_field(&message.payload, "accountId")?;
                 let uid = u32_field(&message.payload, "uid")?;
+                let folder = optional_string_field(&message.payload, "folder")
+                    .unwrap_or_else(|| "INBOX".to_string());
                 if let Some(message) = sync::load_cached_message(&cache_dir(), &account_id, uid)? {
                     if !message.text_body.is_empty() || message.html_body.is_some() {
                         return Ok(json!({ "offline": true, "message": message }));
@@ -592,8 +609,6 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 let account = account_for(shared, &account_id)?;
                 let profile = profile_for_account(&account)?;
                 let credential = load_credential(&account)?;
-                let folder = optional_string_field(&message.payload, "folder")
-                    .unwrap_or_else(|| "INBOX".to_string());
                 let detail = sync::fetch_message(
                     &account.id,
                     profile,
@@ -613,6 +628,8 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
             "mail.attachment" => {
                 let account_id = string_field(&message.payload, "accountId")?;
                 let uid = u32_field(&message.payload, "uid")?;
+                let folder = optional_string_field(&message.payload, "folder")
+                    .unwrap_or_else(|| "INBOX".to_string());
                 let index = message
                     .payload
                     .get("index")
@@ -622,6 +639,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 Ok(serde_json::to_value(sync::load_attachment(
                     &cache_dir(),
                     &account_id,
+                    &folder,
                     uid,
                     index,
                 )?)?)

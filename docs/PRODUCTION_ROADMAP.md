@@ -14,10 +14,11 @@ The repository is deliberately split into a real desktop UI foundation and provi
 8. Windows tray lifecycle, single-instance activation, crash-safe state recovery, and a five-minute background sync scheduler are implemented without blocking the rdesktop event loop.
 9. Native OAuth2 + PKCE exchange and refresh-token rotation are available when registered client IDs are provided through environment configuration; codes and tokens remain outside metadata.
 10. Provider folder mappings, DPAPI-protected attachment storage, inline CID image embedding, and an offline flag-mutation queue are implemented.
+11. Bounded exponential retry is applied to transient IMAP synchronization failures while authentication/configuration failures fail fast.
 
 ## Remaining production acceptance work
 
-- Local loopback callback listener/device-flow UX, provider capability discovery, resumable pagination, UIDVALIDITY migration policy, and backoff/rate-limit handling.
+- Device-flow UX, provider capability discovery, resumable pagination, UIDVALIDITY migration policy, and server rate-limit handling.
 - Attachment download progress/cancellation and richer MIME regression fixtures; the current path is bounded and encrypted but intentionally returns a single IPC payload.
 - Notification policy and tray integration tests on supported Windows versions.
 - Encrypted, user-confirmed portable secret transfer if MailGo ever adds credential migration.

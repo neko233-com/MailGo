@@ -313,6 +313,7 @@ function App() {
     try {
       const response = await invoke<NativeAttachmentResponse>('mail.attachment', {
         accountId: selectedMail.accountId,
+        folder: selectedMail.nativeFolder ?? 'INBOX',
         uid: selectedMail.nativeUid,
         index: attachment.nativeIndex,
       }, 60_000)
@@ -428,7 +429,7 @@ function App() {
       pushToast('请输入有效的邮箱地址', 'error')
       return
     }
-    if (!authorizationCode.trim()) {
+    if (!authorizationCode.trim() && (customAuthentication !== 'oauth2' || !oauthSessionId)) {
       pushToast('请输入授权码，凭据只会交给本地安全存储', 'error')
       return
     }
