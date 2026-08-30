@@ -403,6 +403,8 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .compose-uploading { display: flex; align-items: center; gap: 6px; padding: 0 17px 10px; color: var(--accent); font-size: 11px; }
 .compose-footer { display: flex; align-items: center; justify-content: space-between; padding: 9px 12px; border-top: 1px solid var(--line); }
 .compose-footer > div { display: flex; gap: 3px; }
+.compose-send-actions { align-items: center; gap: 8px !important; }
+.compose-send-actions .danger-button { height: 37px; padding: 0 11px; font-size: 11px; }
 .compose-footer .gradient-button { min-width: 82px; min-height: 37px; }
 
 .settings-popover { position: fixed; left: 18px; bottom: 58px; z-index: 35; width: 330px; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 11px; background: var(--surface); box-shadow: var(--shadow); }

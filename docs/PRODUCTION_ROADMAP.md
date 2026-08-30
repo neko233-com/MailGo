@@ -44,6 +44,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 36. Cache-reading IPC now verifies account ownership, account IDs reject filesystem traversal segments, custom IMAP/SMTP hosts reject control characters and path separators, and mailbox cache reads validate folder names before deriving paths.
 
 37. Native mode stores up to 100 bounded per-account drafts in a DPAPI-protected cache, restores the most recent draft when composing, debounces saves, and removes the draft after a successful send; attachments remain session-scoped by design.
+38. Native mode aggregates encrypted local drafts into the desktop 草稿箱 view, keeps its count current, opens the selected draft by ID, and exposes an explicit discard action so multiple accounts cannot restore or delete the wrong draft.
 
 ## Remaining production acceptance work
 
