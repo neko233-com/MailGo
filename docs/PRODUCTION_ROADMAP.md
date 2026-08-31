@@ -78,6 +78,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 69. Redacted import distinguishes an absent credential (normal reauthorization) from an unavailable Credential Manager, failing closed before committing state in the latter case.
 70. Account reauthorization now snapshots and restores the prior state/credential when persistence fails, while committed accounts remain usable if local outbox resumption needs a later retry.
 71. Account removal now snapshots the prior account state and credential, aborts before state mutation when cleanup fails, and restores both when final persistence fails.
+72. Credential reads, OAuth refresh results, transfer records, and rollback snapshots now use zeroizing wrappers so secret-bearing intermediate values are cleared on drop, including encrypted transfer serialization.
 
 ## Remaining production acceptance work
 

@@ -379,9 +379,9 @@ fn credential_entry(account_id: &str) -> Result<keyring::Entry> {
         .map_err(|error| anyhow!("credential store unavailable: {error}"))
 }
 
-fn snapshot_credential(account_id: &str) -> Result<Option<String>> {
+fn snapshot_credential(account_id: &str) -> Result<Option<Zeroizing<String>>> {
     match credential_entry(account_id)?.get_password() {
-        Ok(value) => Ok(Some(value)),
+        Ok(value) => Ok(Some(Zeroizing::new(value))),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => Err(anyhow!("credential store unavailable: {error}")),
     }
@@ -394,19 +394,19 @@ fn delete_credential_if_present(account_id: &str) -> Result<()> {
     }
 }
 
-fn load_credential(account: &PersistedAccount) -> Result<String> {
+fn load_credential(account: &PersistedAccount) -> Result<Zeroizing<String>> {
     let entry = credential_entry(&account.id)?;
-    let raw = entry.get_password().map_err(|error| match error {
+    let raw = Zeroizing::new(entry.get_password().map_err(|error| match error {
         keyring::Error::NoEntry => {
             anyhow!("account credential is missing; reauthorization required")
         }
         error => anyhow!("credential store unavailable: {error}"),
-    })?;
+    })?);
     let provider = providers::ProviderKind::parse(&account.provider)?;
-    let refreshed = oauth::refresh_if_needed(provider, &raw)?;
-    if refreshed != raw {
+    let refreshed = oauth::refresh_if_needed(provider, raw.as_str())?;
+    if refreshed.as_str() != raw.as_str() {
         entry
-            .set_password(&refreshed)
+            .set_password(refreshed.as_str())
             .map_err(|error| anyhow!("save refreshed credential: {error}"))?;
     }
     Ok(refreshed)
@@ -633,7 +633,7 @@ fn validate_transfer_account(account: &transfer::TransferAccount) -> Result<()> 
     Ok(())
 }
 
-fn clear_credential_snapshots(previous: &mut [(String, Option<String>)]) {
+fn clear_credential_snapshots(previous: &mut [(String, Option<Zeroizing<String>>)]) {
     for (_, credential) in previous {
         if let Some(value) = credential {
             value.zeroize();
@@ -641,12 +641,12 @@ fn clear_credential_snapshots(previous: &mut [(String, Option<String>)]) {
     }
 }
 
-fn restore_credentials(previous: &mut [(String, Option<String>)]) {
+fn restore_credentials(previous: &mut [(String, Option<Zeroizing<String>>)]) {
     for (id, credential) in &mut *previous {
         if let Ok(entry) = credential_entry(id) {
             match credential {
                 Some(value) => {
-                    let _ = entry.set_password(value);
+                    let _ = entry.set_password(value.as_str());
                 }
                 None => {
                     let _ = entry.delete_credential();
@@ -922,7 +922,7 @@ fn handle_ipc(
                     oauth::DevicePollResult::Complete { credential } => {
                         let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                         app.ready_oauth_credentials
-                            .insert(session_id.clone(), Zeroizing::new(credential));
+                            .insert(session_id.clone(), credential);
                         Ok(json!({ "sessionId": session_id, "status": "complete" }))
                     }
                 }
@@ -938,12 +938,14 @@ fn handle_ipc(
                     return Err(anyhow!("account label is too long"));
                 }
                 let email = string_field(&message.payload, "email")?;
-                let supplied_credential = optional_bounded_string_field(
-                    &message.payload,
-                    "authorizationCode",
-                    MAX_CREDENTIAL_BYTES,
-                )?
-                .unwrap_or_default();
+                let supplied_credential = Zeroizing::new(
+                    optional_bounded_string_field(
+                        &message.payload,
+                        "authorizationCode",
+                        MAX_CREDENTIAL_BYTES,
+                    )?
+                    .unwrap_or_default(),
+                );
                 let provider_kind = providers::ProviderKind::parse(&provider)?;
                 providers::validate_email(&email)?;
                 let offline_mode = offline_mode_enabled(shared)?;
@@ -1002,27 +1004,31 @@ fn handle_ipc(
                     }
                     if let Some(credential) = ready_credential {
                         credential
-                    } else {
-                        let (code, callback_state) = if supplied_credential.is_empty() {
+                    } else if supplied_credential.is_empty() {
+                        let (code, callback_state) =
                             oauth::take_callback(&pending)?.ok_or_else(|| {
                                 anyhow!(
                                     "OAuth callback is not ready; finish sign-in or paste the code"
                                 )
-                            })?
-                        } else {
-                            (supplied_credential, returned_state)
-                        };
-                        Zeroizing::new(oauth::exchange_code(
+                            })?;
+                        oauth::exchange_code(
                             &pending,
-                            &code,
-                            callback_state.as_deref(),
-                        )?)
+                            code.as_str(),
+                            callback_state.as_deref().map(|value| value.as_str()),
+                        )?
+                    } else {
+                        let returned_state = returned_state.map(Zeroizing::new);
+                        oauth::exchange_code(
+                            &pending,
+                            supplied_credential.as_str(),
+                            returned_state.as_deref().map(|value| value.as_str()),
+                        )?
                     }
                 } else {
                     if supplied_credential.is_empty() {
                         return Err(anyhow!("account authorization is required"));
                     }
-                    Zeroizing::new(supplied_credential)
+                    supplied_credential
                 };
 
                 // Authorization codes and access tokens never enter PersistedState or logs. The
@@ -1304,14 +1310,14 @@ fn handle_ipc(
                         .map(|record| {
                             let existing = credential_entry(&record.account.id)
                                 .ok()
-                                .and_then(|entry| entry.get_password().ok());
+                                .and_then(|entry| entry.get_password().ok().map(Zeroizing::new));
                             (record.account.id.clone(), existing)
                         })
                         .collect::<Vec<_>>();
                     for record in &records {
                         if let Err(error) = credential_entry(&record.account.id).and_then(|entry| {
                             entry
-                                .set_password(&record.credential)
+                                .set_password(record.credential.as_str())
                                 .map_err(anyhow::Error::from)
                         }) {
                             restore_credentials(&mut previous);

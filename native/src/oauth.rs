@@ -11,7 +11,7 @@ use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::form_urlencoded::Serializer;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::providers::ProviderKind;
 
@@ -84,6 +84,8 @@ enum CallbackResult {
     Error(String),
 }
 
+type CallbackCode = (Zeroizing<String>, Option<Zeroizing<String>>);
+
 impl Drop for CallbackResult {
     fn drop(&mut self) {
         match self {
@@ -122,7 +124,7 @@ pub struct DeviceStartResponse {
 #[derive(Debug, Clone)]
 pub enum DevicePollResult {
     Pending { retry_after: u64 },
-    Complete { credential: String },
+    Complete { credential: Zeroizing<String> },
 }
 
 pub fn is_expired(session: &PendingSession) -> bool {
@@ -369,7 +371,7 @@ pub fn poll_device(session: &PendingSession) -> Result<DevicePollResult> {
     })
 }
 
-pub fn take_callback(session: &PendingSession) -> Result<Option<(String, Option<String>)>> {
+pub fn take_callback(session: &PendingSession) -> Result<Option<CallbackCode>> {
     let mut callback = session
         .callback
         .lock()
@@ -379,7 +381,10 @@ pub fn take_callback(session: &PendingSession) -> Result<Option<(String, Option<
     };
     let mut result = result;
     match &mut result {
-        CallbackResult::Code { code, state } => Ok(Some((std::mem::take(code), state.take()))),
+        CallbackResult::Code { code, state } => Ok(Some((
+            Zeroizing::new(std::mem::take(code)),
+            state.take().map(Zeroizing::new),
+        ))),
         CallbackResult::Error(error) => Err(anyhow!(
             "OAuth provider returned an error: {}",
             std::mem::take(error)
@@ -391,7 +396,7 @@ pub fn exchange_code(
     session: &PendingSession,
     code: &str,
     returned_state: Option<&str>,
-) -> Result<String> {
+) -> Result<Zeroizing<String>> {
     if now_seconds().saturating_sub(session.created_at) > SESSION_TTL_SECONDS {
         return Err(anyhow!("OAuth sign-in session expired; start again"));
     }
@@ -429,7 +434,7 @@ pub fn exchange_code(
     serialize_token(token)
 }
 
-fn serialize_token(token: TokenResponse) -> Result<String> {
+fn serialize_token(token: TokenResponse) -> Result<Zeroizing<String>> {
     if token.access_token.trim().is_empty() {
         return Err(anyhow!(
             "OAuth token response did not contain an access token"
@@ -438,13 +443,15 @@ fn serialize_token(token: TokenResponse) -> Result<String> {
     let expires_at = token
         .expires_in
         .map(|seconds| now_seconds().saturating_add(seconds));
-    serde_json::to_string(&StoredCredential {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token,
-        token_type: token.token_type.unwrap_or_else(|| "Bearer".into()),
-        expires_at,
-    })
-    .context("serialize OAuth credential")
+    Ok(Zeroizing::new(
+        serde_json::to_string(&StoredCredential {
+            access_token: token.access_token,
+            refresh_token: token.refresh_token,
+            token_type: token.token_type.unwrap_or_else(|| "Bearer".into()),
+            expires_at,
+        })
+        .context("serialize OAuth credential")?,
+    ))
 }
 
 pub fn access_token(raw: &str) -> String {
@@ -453,16 +460,16 @@ pub fn access_token(raw: &str) -> String {
         .unwrap_or_else(|_| raw.to_string())
 }
 
-pub fn refresh_if_needed(provider: ProviderKind, raw: &str) -> Result<String> {
+pub fn refresh_if_needed(provider: ProviderKind, raw: &str) -> Result<Zeroizing<String>> {
     let Ok(stored) = serde_json::from_str::<StoredCredential>(raw) else {
-        return Ok(raw.to_string());
+        return Ok(Zeroizing::new(raw.to_string()));
     };
     let should_refresh = stored
         .expires_at
         .map(|expires_at| expires_at <= now_seconds().saturating_add(60))
         .unwrap_or(false);
     if !should_refresh {
-        return Ok(raw.to_string());
+        return Ok(Zeroizing::new(raw.to_string()));
     }
     let Some(refresh_token) = stored.refresh_token.as_deref() else {
         return Err(anyhow!(
@@ -491,15 +498,17 @@ pub fn refresh_if_needed(provider: ProviderKind, raw: &str) -> Result<String> {
             "OAuth refresh response did not contain an access token"
         ));
     }
-    serde_json::to_string(&StoredCredential {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token.or(stored.refresh_token),
-        token_type: token.token_type.unwrap_or(stored.token_type),
-        expires_at: token
-            .expires_in
-            .map(|seconds| now_seconds().saturating_add(seconds)),
-    })
-    .context("serialize refreshed OAuth credential")
+    Ok(Zeroizing::new(
+        serde_json::to_string(&StoredCredential {
+            access_token: token.access_token,
+            refresh_token: token.refresh_token.or(stored.refresh_token),
+            token_type: token.token_type.unwrap_or(stored.token_type),
+            expires_at: token
+                .expires_in
+                .map(|seconds| now_seconds().saturating_add(seconds)),
+        })
+        .context("serialize refreshed OAuth credential")?,
+    ))
 }
 
 fn provider_config(provider: ProviderKind) -> Result<ProviderOAuthConfig> {

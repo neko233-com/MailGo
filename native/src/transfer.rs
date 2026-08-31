@@ -20,13 +20,7 @@ const TRANSFER_AAD: &[u8] = b"MailGo encrypted account bundle v1";
 #[derive(Debug, Clone)]
 pub struct TransferAccount {
     pub account: crate::PersistedAccount,
-    pub credential: String,
-}
-
-impl Drop for TransferAccount {
-    fn drop(&mut self) {
-        self.credential.zeroize();
-    }
+    pub credential: Zeroizing<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,7 +35,7 @@ struct TransferPayload {
 #[derive(Debug, Serialize, Deserialize)]
 struct TransferPayloadAccount {
     account: crate::PersistedAccount,
-    credential: String,
+    credential: Zeroizing<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -237,14 +231,14 @@ mod tests {
     fn encrypted_bundle_round_trips_without_plaintext_secret() {
         let accounts = vec![TransferAccount {
             account: fixture_account(),
-            credential: "fixture-token-value".to_string(),
+            credential: "fixture-token-value".to_string().into(),
         }];
         let bundle = encrypt_accounts(&accounts, "correct horse battery").unwrap();
         assert!(!bundle.contains("fixture-token-value"));
         let mut restored = decrypt_accounts(&bundle, "correct horse battery").unwrap();
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].account.id, "fixture-google");
-        assert_eq!(restored[0].credential, "fixture-token-value");
+        assert_eq!(restored[0].credential.as_str(), "fixture-token-value");
         clear_credentials(&mut restored);
         assert!(restored[0].credential.is_empty());
     }
@@ -253,7 +247,7 @@ mod tests {
     fn wrong_passphrase_is_rejected() {
         let accounts = vec![TransferAccount {
             account: fixture_account(),
-            credential: "fixture-token-value".to_string(),
+            credential: "fixture-token-value".to_string().into(),
         }];
         let bundle = encrypt_accounts(&accounts, "correct horse battery").unwrap();
         assert!(decrypt_accounts(&bundle, "incorrect horse battery").is_err());
@@ -263,7 +257,7 @@ mod tests {
     fn weak_passphrases_are_rejected() {
         let accounts = vec![TransferAccount {
             account: fixture_account(),
-            credential: "fixture-token-value".to_string(),
+            credential: "fixture-token-value".to_string().into(),
         }];
         assert!(encrypt_accounts(&accounts, "too-short").is_err());
     }
