@@ -105,6 +105,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 96. IMAP folder discovery now retains only a bounded selectable-folder index while preserving provider-preferred folders; the underlying IMAP library response buffer remains a release-host integration limitation for UID result sets.
 97. The portable deployment script now verifies the release manifest, rejects ZIP traversal and oversized extraction, checks WebView2, deploys through a temporary directory, creates shortcuts, and retains the prior install for rollback; signed MSIX remains the production distribution path.
 98. The OAuth loopback listener now reads a bounded complete HTTP header instead of assuming one TCP read contains the browser request, with regression coverage for split callback packets.
+99. Desktop widths from 1100–1400px now reserve the authorization assistant as a fourth column, keeping reading actions such as rich HTML rendering reachable while narrower layouts retain drawer behavior.
 
 ## Remaining production acceptance work
 
