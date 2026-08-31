@@ -6,6 +6,9 @@ param()
 $ErrorActionPreference = 'Stop'
 $cargo = Get-Command cargo -ErrorAction Stop
 $repository = 'https://github.com/neko233-com/rdesktop'
+# Keep the updater on the exact rdesktop revision audited by this workspace. Move this
+# trust root only as part of a reviewed dependency update; never follow an unpinned branch.
+$trustedRevision = 'e9b2ba8d7a6c22138d37ca0cccfc41bbfeb28439'
 $releaseApi = 'https://api.github.com/repos/neko233-com/rdesktop/releases/latest'
 
 function Get-InstalledRdesktop {
@@ -56,7 +59,7 @@ function Try-InstallVerifiedRelease($installed) {
 
 Write-Host "Updating rdesktop-cli from $repository"
 try {
-    & $cargo.Source install rdesktop-cli --git $repository --locked --force
+    & $cargo.Source install rdesktop-cli --git $repository --rev $trustedRevision --locked --force
     if ($LASTEXITCODE -ne 0) {
         throw "cargo install rdesktop-cli failed with exit code $LASTEXITCODE"
     }

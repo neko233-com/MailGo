@@ -46,6 +46,10 @@ export async function invoke<T>(cmd: string, payload: Record<string, unknown> = 
     })
   }
 
+  if (!import.meta.env.DEV) {
+    throw new Error('Native IPC is unavailable in this packaged renderer')
+  }
+
   const response = await fetch('/__rdesktop__/agent/ipc', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

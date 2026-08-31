@@ -1728,8 +1728,10 @@ pub(crate) fn protect_cache(payload: &[u8]) -> Result<Vec<u8>> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn protect_cache(payload: &[u8]) -> Result<Vec<u8>> {
-    Ok(payload.to_vec())
+pub(crate) fn protect_cache(_payload: &[u8]) -> Result<Vec<u8>> {
+    Err(anyhow!(
+        "MailGo requires Windows data protection for local cache storage"
+    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -1766,8 +1768,10 @@ pub(crate) fn unprotect_cache(payload: &[u8]) -> Result<Vec<u8>> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn unprotect_cache(payload: &[u8]) -> Result<Vec<u8>> {
-    Ok(payload.to_vec())
+pub(crate) fn unprotect_cache(_payload: &[u8]) -> Result<Vec<u8>> {
+    Err(anyhow!(
+        "MailGo requires Windows data protection for local cache storage"
+    ))
 }
 
 fn safe_component(value: &str) -> String {

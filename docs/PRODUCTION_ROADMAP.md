@@ -26,7 +26,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 20. Release packaging has a reproducible Windows portable ZIP path; the native shell resolves renderer assets beside the executable, with an environment override for controlled deployment.
 21. Existing accounts can re-enter the authorization flow without changing their stable account ID, and native account removal clears the protected credential plus the account-scoped offline cache.
 22. Windows desktop can export/import fully configured accounts through a password-protected Argon2id + ChaCha20-Poly1305 bundle; decrypted credentials are written only to Windows Credential Manager and imported account caches are reset before the next sync.
-23. The per-user rdesktop updater preserves a working installation when local application-control policy blocks source builds and only accepts a checksum-verified official binary fallback when it is newer.
+23. The per-user rdesktop updater is pinned to the reviewed upstream commit, preserves a working installation when local application-control policy blocks source builds, and only accepts a checksum-verified official binary fallback when it is newer.
 24. Persisted state loading explicitly migrates legacy missing fields and both snake_case/camelCase spellings, normalizes the current schema version, and rejects future unsupported versions before touching the backup state.
 25. Native MIME sanitization now retains only safe HTTPS image sources and removes tracking-related attributes before caching; the renderer blocks remote images by default while preserving safe HTTPS/mailto links and inline CID images.
 26. Sync retry handling honors numeric `Retry-After` hints that survive transport errors, with a bounded 1–300 second cap and exponential fallback for providers that omit the hint.
@@ -58,6 +58,6 @@ The repository is deliberately split into a real desktop UI foundation and provi
 - Disposable-provider acceptance tests for OAuth/IMAP/SMTP, including reconnect, UIDVALIDITY changes, folder mappings, and server-side mutation conflicts.
 - Tray integration tests on supported Windows versions.
 - Signed installer generation on a trusted Windows release host; the current rdesktop NSIS command is still an upstream placeholder.
-- Independent authentication of the floating rdesktop updater trust root, packaged IPC caller isolation, and a protected non-Windows cache backend.
+- Independent authentication of the pinned rdesktop updater trust root, packaged IPC caller isolation beyond the renderer build guard, and a protected non-Windows cache backend.
 
 Production acceptance requires integration tests against disposable provider fixtures, a Windows WebView2 smoke test, migration tests for every persisted-state schema, and a security review of HTML/MIME parsing before shipping.
