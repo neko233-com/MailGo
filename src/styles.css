@@ -48,7 +48,7 @@
 html, body, #root { width: 100%; height: 100%; margin: 0; }
 
 body {
-  min-width: 960px;
+  min-width: 0;
   overflow: hidden;
   background: var(--bg);
   color: var(--text);
@@ -415,6 +415,12 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .compose-attachment small { flex: 0 0 auto; color: var(--muted); font-size: 10px; }
 .compose-attachment button { flex: 0 0 auto; width: 18px; height: 18px; border-radius: 50%; color: var(--muted); background: transparent; font-size: 15px; line-height: 16px; }
 .compose-attachment button:hover { color: var(--text); background: var(--surface-hover); }
+.compose-inline-images { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 17px 10px; }
+.compose-inline-image { position: relative; width: 76px; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-strong); }
+.compose-inline-image img { width: 100%; height: 56px; display: block; object-fit: cover; }
+.compose-inline-image span { display: block; overflow: hidden; padding: 4px 5px; color: var(--muted-strong); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.compose-inline-image button { position: absolute; top: 3px; right: 3px; width: 18px; height: 18px; border-radius: 50%; color: #fff; background: rgba(15, 22, 40, .78); font-size: 14px; line-height: 16px; }
+.compose-inline-image button:hover { background: var(--danger); }
 .compose-uploading { display: flex; align-items: center; gap: 6px; padding: 0 17px 10px; color: var(--accent); font-size: 11px; }
 .compose-footer { display: flex; align-items: center; justify-content: space-between; padding: 9px 12px; border-top: 1px solid var(--line); }
 .compose-footer > div { display: flex; gap: 3px; }
@@ -447,14 +453,14 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .toast-error svg { color: var(--danger); }
 .toast-info svg { color: #8ba1ff; }
 
-@media (max-width: 1240px) {
-  .workspace { grid-template-columns: 226px minmax(320px, 375px) minmax(420px, 1fr); }
+@media (max-width: 1400px) {
+  .workspace { grid-template-columns: 230px minmax(320px, 380px) minmax(0, 1fr); }
   .auth-panel { position: fixed; top: 64px; right: 0; bottom: 0; z-index: 12; width: 284px; box-shadow: var(--shadow); }
   .titlebar-brand { min-width: 210px; }
 }
 
 @media (max-width: 1040px) {
-  .workspace { grid-template-columns: 210px minmax(290px, 350px) minmax(390px, 1fr); }
+  .workspace { grid-template-columns: 210px minmax(290px, 350px) minmax(0, 1fr); }
   .reading-actions > span { display: none; }
   .reading-scroll { padding-inline: 22px; }
 }

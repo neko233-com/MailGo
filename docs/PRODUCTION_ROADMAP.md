@@ -62,6 +62,9 @@ The repository is deliberately split into a real desktop UI foundation and provi
 53. Narrow Windows windows now switch between a single-column mail list and reading view, with drawer navigation, drawer-based authorization help, title-bar compose access, and full-screen compose bounds instead of allowing the four-pane desktop grid to overflow the viewport.
 54. Theme changes now persist through the native state after hydration, and user CSS is bounded to 64 KiB with a storage-failure fallback so customization cannot grow without limit or make the settings surface unusable.
 55. Browser/WebView preference reads and writes now tolerate unavailable local storage, and global compose/reply shortcuts ignore inputs, selects, textareas, and contenteditable controls without assuming every keyboard event target is an HTML element.
+56. Compose now supports bounded image selection with local previews and generated safe CID references; native SMTP builds `multipart/related` HTML mail, while retryable sends preserve inline resources in the encrypted outbox.
+57. Medium desktop widths now move the authorization assistant into its existing drawer boundary and relax the reading-column minimum, eliminating horizontal overflow at 1280px and tighter laptop widths while keeping the four-pane large-screen layout.
+58. The desktop shell no longer imposes a 960px body minimum, so the responsive grid can honor the actual viewport before switching to the single-column mobile layout.
 
 ## Remaining production acceptance work
 

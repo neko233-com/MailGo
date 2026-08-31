@@ -250,6 +250,7 @@ struct AttachmentDownloadSession {
 struct AttachmentUploadSession {
     file_name: String,
     content_type: String,
+    content_id: Option<String>,
     expected_size: usize,
     bytes: Vec<u8>,
     created_at: Instant,
@@ -668,6 +669,20 @@ fn valid_upload_content_type(value: Option<String>) -> Result<String> {
         return Err(anyhow!("invalid attachment content type"));
     }
     Ok(content_type)
+}
+
+fn valid_upload_content_id(value: Option<String>) -> Result<Option<String>> {
+    let Some(content_id) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if content_id.len() > 128
+        || !content_id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '@')
+        })
+    {
+        return Err(anyhow!("invalid inline attachment content id"));
+    }
+    Ok(Some(content_id))
 }
 
 fn purge_expired_auth_sessions(app: &mut MailGoState) {
@@ -1585,6 +1600,8 @@ fn handle_ipc(
                     &message.payload,
                     "contentType",
                 ))?;
+                let content_id =
+                    valid_upload_content_id(optional_string_field(&message.payload, "contentId"))?;
                 let size = message
                     .payload
                     .get("size")
@@ -1618,6 +1635,7 @@ fn handle_ipc(
                     AttachmentUploadSession {
                         file_name,
                         content_type,
+                        content_id,
                         expected_size: size,
                         bytes: Vec::with_capacity(size),
                         created_at: Instant::now(),
@@ -2014,6 +2032,7 @@ fn handle_ipc(
                         attachments.push(send::OutgoingAttachment {
                             file_name: upload.file_name.clone(),
                             content_type: upload.content_type.clone(),
+                            content_id: upload.content_id.clone(),
                             bytes: upload.bytes.clone(),
                         });
                     }
@@ -2057,6 +2076,7 @@ fn handle_ipc(
                                     .map(|attachment| outbox::QueuedAttachment {
                                         file_name: attachment.file_name,
                                         content_type: attachment.content_type,
+                                        content_id: attachment.content_id,
                                         bytes: attachment.bytes,
                                     })
                                     .collect(),

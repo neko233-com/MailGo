@@ -41,6 +41,8 @@ fn outbox_guard() -> std::sync::MutexGuard<'static, ()> {
 pub struct QueuedAttachment {
     pub file_name: String,
     pub content_type: String,
+    #[serde(default)]
+    pub content_id: Option<String>,
     pub bytes: Vec<u8>,
 }
 
@@ -251,6 +253,7 @@ pub fn flush_due(
             .map(|attachment| crate::send::OutgoingAttachment {
                 file_name: attachment.file_name.clone(),
                 content_type: attachment.content_type.clone(),
+                content_id: attachment.content_id.clone(),
                 bytes: attachment.bytes.clone(),
             })
             .collect::<Vec<_>>();
@@ -430,6 +433,16 @@ fn validate(message: &QueuedMessage) -> Result<()> {
         {
             return Err(anyhow!("outbox attachment content type is unsafe"));
         }
+        if let Some(content_id) = &attachment.content_id {
+            if content_id.is_empty()
+                || content_id.len() > 128
+                || !content_id.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '@')
+                })
+            {
+                return Err(anyhow!("outbox inline attachment content id is unsafe"));
+            }
+        }
         if attachment.bytes.len() > MAX_ATTACHMENT_BYTES {
             return Err(anyhow!("outbox attachment is too large"));
         }
@@ -533,6 +546,7 @@ mod tests {
             attachments: vec![QueuedAttachment {
                 file_name: "hello.txt".into(),
                 content_type: "text/plain".into(),
+                content_id: None,
                 bytes: b"hello".to_vec(),
             }],
             created_at: 1,

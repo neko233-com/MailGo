@@ -64,6 +64,7 @@ pub fn retry_after_seconds(error: &anyhow::Error) -> Option<u64> {
 pub struct OutgoingAttachment {
     pub file_name: String,
     pub content_type: String,
+    pub content_id: Option<String>,
     pub bytes: Vec<u8>,
 }
 
@@ -88,62 +89,7 @@ pub fn send_message(
     if message.credential.trim().is_empty() {
         return Err(anyhow!("account requires authorization before sending"));
     }
-    let from_mailbox: Mailbox = message.from.parse().context("invalid sender address")?;
-    let to_mailboxes = parse_recipients(message.to, "recipient")?;
-    let cc_mailboxes = parse_optional_recipients(message.cc, "CC recipient")?;
-    let bcc_mailboxes = parse_optional_recipients(message.bcc, "BCC recipient")?;
-    if to_mailboxes.len() + cc_mailboxes.len() + bcc_mailboxes.len() > MAX_RECIPIENTS_PER_MESSAGE {
-        return Err(anyhow!(
-            "a message can contain at most {MAX_RECIPIENTS_PER_MESSAGE} recipients"
-        ));
-    }
-    let builder = to_mailboxes
-        .into_iter()
-        .fold(Message::builder().from(from_mailbox), |builder, mailbox| {
-            builder.to(mailbox)
-        });
-    let builder = cc_mailboxes
-        .into_iter()
-        .fold(builder, |builder, mailbox| builder.cc(mailbox));
-    let builder = bcc_mailboxes
-        .into_iter()
-        .fold(builder, |builder, mailbox| builder.bcc(mailbox))
-        .subject(message.subject);
-    let built_message = if attachments.is_empty() {
-        match message.html_body.filter(|body| !body.trim().is_empty()) {
-            Some(html) => builder.multipart(MultiPart::alternative_plain_html(
-                message.text_body.to_string(),
-                html.to_string(),
-            ))?,
-            None => builder.body(message.text_body.to_string())?,
-        }
-    } else {
-        let body = match message.html_body.filter(|body| !body.trim().is_empty()) {
-            Some(html) => {
-                MultiPart::alternative_plain_html(message.text_body.to_string(), html.to_string())
-            }
-            None => MultiPart::mixed().singlepart(lettre::message::SinglePart::plain(
-                message.text_body.to_string(),
-            )),
-        };
-        let multipart = attachments.iter().try_fold(
-            MultiPart::mixed().multipart(body),
-            |multipart, attachment| {
-                let content_type =
-                    ContentType::parse(&attachment.content_type).unwrap_or_else(|_| {
-                        ContentType::parse("application/octet-stream")
-                            .expect("valid fallback MIME type")
-                    });
-                Ok::<_, anyhow::Error>(
-                    multipart.singlepart(
-                        Attachment::new(attachment.file_name.clone())
-                            .body(attachment.bytes.clone(), content_type),
-                    ),
-                )
-            },
-        )?;
-        builder.multipart(multipart)?
-    };
+    let built_message = build_message(message, attachments)?;
 
     let credentials = Credentials::new(
         message.from.to_string(),
@@ -168,6 +114,125 @@ pub fn send_message(
         .build()
         .send(&built_message)
         .context("send message")?;
+    Ok(())
+}
+
+fn build_message(
+    message: &OutgoingMessage<'_>,
+    attachments: &[OutgoingAttachment],
+) -> Result<Message> {
+    let from_mailbox: Mailbox = message.from.parse().context("invalid sender address")?;
+    let to_mailboxes = parse_recipients(message.to, "recipient")?;
+    let cc_mailboxes = parse_optional_recipients(message.cc, "CC recipient")?;
+    let bcc_mailboxes = parse_optional_recipients(message.bcc, "BCC recipient")?;
+    if to_mailboxes.len() + cc_mailboxes.len() + bcc_mailboxes.len() > MAX_RECIPIENTS_PER_MESSAGE {
+        return Err(anyhow!(
+            "a message can contain at most {MAX_RECIPIENTS_PER_MESSAGE} recipients"
+        ));
+    }
+    let builder = to_mailboxes
+        .into_iter()
+        .fold(Message::builder().from(from_mailbox), |builder, mailbox| {
+            builder.to(mailbox)
+        });
+    let builder = cc_mailboxes
+        .into_iter()
+        .fold(builder, |builder, mailbox| builder.cc(mailbox));
+    let builder = bcc_mailboxes
+        .into_iter()
+        .fold(builder, |builder, mailbox| builder.bcc(mailbox))
+        .subject(message.subject);
+    let html_body = message.html_body.filter(|body| !body.trim().is_empty());
+    for attachment in attachments {
+        if let Some(content_id) = attachment.content_id.as_deref() {
+            validate_content_id(content_id)?;
+        }
+    }
+    let inline_attachments = attachments
+        .iter()
+        .filter(|attachment| html_body.is_some() && attachment.content_id.is_some())
+        .collect::<Vec<_>>();
+    let regular_attachments = attachments
+        .iter()
+        .filter(|attachment| html_body.is_none() || attachment.content_id.is_none())
+        .collect::<Vec<_>>();
+
+    let built_message = if attachments.is_empty() {
+        match html_body {
+            Some(html) => builder.multipart(MultiPart::alternative_plain_html(
+                message.text_body.to_string(),
+                html.to_string(),
+            ))?,
+            None => builder.body(message.text_body.to_string())?,
+        }
+    } else {
+        let body = match html_body {
+            Some(html) if !inline_attachments.is_empty() => inline_attachments.iter().try_fold(
+                MultiPart::related().multipart(MultiPart::alternative_plain_html(
+                    message.text_body.to_string(),
+                    html.to_string(),
+                )),
+                |multipart, attachment| {
+                    let content_id = attachment
+                        .content_id
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("inline attachment is missing a content id"))?;
+                    let content_type = content_type_or_octet_stream(&attachment.content_type);
+                    Ok::<_, anyhow::Error>(
+                        multipart.singlepart(
+                            Attachment::new_inline_with_name(
+                                content_id.to_string(),
+                                attachment.file_name.clone(),
+                            )
+                            .body(attachment.bytes.clone(), content_type),
+                        ),
+                    )
+                },
+            )?,
+            Some(html) => {
+                MultiPart::alternative_plain_html(message.text_body.to_string(), html.to_string())
+            }
+            None => MultiPart::mixed().singlepart(lettre::message::SinglePart::plain(
+                message.text_body.to_string(),
+            )),
+        };
+        if regular_attachments.is_empty() {
+            builder.multipart(body)?
+        } else {
+            let multipart = regular_attachments.iter().try_fold(
+                MultiPart::mixed().multipart(body),
+                |multipart, attachment| {
+                    let content_type = content_type_or_octet_stream(&attachment.content_type);
+                    Ok::<_, anyhow::Error>(
+                        multipart.singlepart(
+                            Attachment::new(attachment.file_name.clone())
+                                .body(attachment.bytes.clone(), content_type),
+                        ),
+                    )
+                },
+            )?;
+            builder.multipart(multipart)?
+        }
+    };
+
+    Ok(built_message)
+}
+
+fn content_type_or_octet_stream(value: &str) -> ContentType {
+    ContentType::parse(value).unwrap_or_else(|_| {
+        ContentType::parse("application/octet-stream").expect("valid fallback MIME type")
+    })
+}
+
+fn validate_content_id(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '@')
+        })
+    {
+        return Err(anyhow!("inline attachment content id is unsafe"));
+    }
     Ok(())
 }
 
@@ -243,6 +308,63 @@ mod tests {
             .formatted()
             .windows(5)
             .any(|window| window == b"hello"));
+    }
+
+    #[test]
+    fn builds_related_mime_for_inline_images_and_keeps_regular_attachments() {
+        let message = OutgoingMessage {
+            from: "person@example.com",
+            credential: "unused-in-unit-test",
+            to: "recipient@example.com",
+            cc: None,
+            bcc: None,
+            subject: "Inline image",
+            text_body: "body",
+            html_body: Some("<p><img src=\"cid:mailgo-inline-1\"></p>"),
+        };
+        let attachments = vec![
+            OutgoingAttachment {
+                file_name: "pixel.png".into(),
+                content_type: "image/png".into(),
+                content_id: Some("mailgo-inline-1".into()),
+                bytes: vec![0, 1, 2],
+            },
+            OutgoingAttachment {
+                file_name: "notes.txt".into(),
+                content_type: "text/plain".into(),
+                content_id: None,
+                bytes: b"notes".to_vec(),
+            },
+        ];
+        let formatted =
+            String::from_utf8_lossy(&build_message(&message, &attachments).unwrap().formatted())
+                .into_owned();
+        assert!(formatted.contains("multipart/mixed"));
+        assert!(formatted.contains("multipart/related"));
+        assert!(formatted.contains("cid:mailgo-inline-1"));
+        assert!(formatted.contains("Content-ID: <mailgo-inline-1>"));
+        assert!(formatted.contains("filename=\"notes.txt\""));
+    }
+
+    #[test]
+    fn rejects_unsafe_inline_content_ids() {
+        let message = OutgoingMessage {
+            from: "person@example.com",
+            credential: "unused-in-unit-test",
+            to: "recipient@example.com",
+            cc: None,
+            bcc: None,
+            subject: "Inline image",
+            text_body: "body",
+            html_body: Some("<p>body</p>"),
+        };
+        let attachment = OutgoingAttachment {
+            file_name: "pixel.png".into(),
+            content_type: "image/png".into(),
+            content_id: Some("bad\r\nid".into()),
+            bytes: vec![0, 1, 2],
+        };
+        assert!(build_message(&message, &[attachment]).is_err());
     }
 
     #[test]

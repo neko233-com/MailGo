@@ -208,6 +208,7 @@ function draftToUi(draft: NativeDraft, account: MailAccount): MailMessage {
 }
 
 type ComposeMode = 'new' | 'reply' | 'reply-all' | 'forward'
+type ComposeInlineImage = { file: File; contentId: string; previewUrl: string }
 
 function composeSubject(mode: ComposeMode, subject: string) {
   const trimmed = subject.trim() || '(无主题)'
@@ -244,6 +245,23 @@ function composeSeed(mode: ComposeMode, source: MailMessage | undefined, ownEmai
     subject: composeSubject(mode, source.subject),
     body: quoteMail(source, mode),
   }
+}
+
+function createInlineContentId() {
+  const randomPart = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  return `mailgo-inline-${randomPart.replace(/[^a-zA-Z0-9-]/g, '')}`
+}
+
+function composeHtmlBody(body: string, inlineImages: ComposeInlineImage[]) {
+  const textBlock = body.trim()
+    ? `<div>${escapeHtml(body).replace(/\r?\n/g, '<br>')}</div>`
+    : '<div></div>'
+  const imageBlocks = inlineImages.map(({ file, contentId }) => (
+    `<p><img src="cid:${escapeHtml(contentId)}" alt="${escapeHtml(file.name)}" style="max-width:100%;height:auto"></p>`
+  )).join('')
+  return textBlock + imageBlocks
 }
 
 function readLocalStorageValue(key: string) {
@@ -1857,12 +1875,30 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
   const [draftStatus, setDraftStatus] = useState('')
   const [draftReady, setDraftReady] = useState(false)
   const [attachments, setAttachments] = useState<File[]>([])
+  const [inlineImages, setInlineImages] = useState<ComposeInlineImage[]>([])
   const [isSending, setSending] = useState(false)
   const [uploadingName, setUploadingName] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const imageInputRef = useRef<HTMLInputElement>(null)
+  const inlineImagesRef = useRef<ComposeInlineImage[]>([])
   const isNativeRuntime = Boolean(window.ipc?.postMessage)
   const maxAttachmentBytes = 25 * 1024 * 1024
   const maxTotalAttachmentBytes = 50 * 1024 * 1024
+
+  useEffect(() => {
+    inlineImagesRef.current = inlineImages
+  }, [inlineImages])
+
+  useEffect(() => () => {
+    inlineImagesRef.current.forEach((image) => URL.revokeObjectURL(image.previewUrl))
+  }, [])
+
+  const clearInlineImages = () => {
+    setInlineImages((current) => {
+      current.forEach((image) => URL.revokeObjectURL(image.previewUrl))
+      return []
+    })
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -1877,6 +1913,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
     setSubject(seed.subject)
     setBody(seed.body)
     setHtmlMode(false)
+    clearInlineImages()
     if (!isNativeRuntime || !accountId || (!openDraftId && mode !== 'new')) {
       setDraftReady(true)
       return () => { cancelled = true }
@@ -1926,9 +1963,10 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
     const incoming = Array.from(event.target.files ?? [])
     event.target.value = ''
     let total = attachments.reduce((sum, file) => sum + file.size, 0)
+      + inlineImages.reduce((sum, image) => sum + image.file.size, 0)
     const accepted: File[] = []
     for (const file of incoming) {
-      if (attachments.length + accepted.length >= 10) {
+      if (attachments.length + inlineImages.length + accepted.length >= 10) {
         onError('单封邮件最多添加 10 个附件')
         break
       }
@@ -1946,11 +1984,44 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
     if (accepted.length) setAttachments((current) => [...current, ...accepted])
   }
 
-  const uploadAttachment = async (file: File) => {
+  const addInlineImages = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const incoming = Array.from(event.target.files ?? [])
+    event.target.value = ''
+    let total = attachments.reduce((sum, file) => sum + file.size, 0)
+      + inlineImages.reduce((sum, image) => sum + image.file.size, 0)
+    const accepted: ComposeInlineImage[] = []
+    for (const file of incoming) {
+      if (!file.type.toLowerCase().startsWith('image/')) {
+        onError(`${file.name} 不是受支持的图片格式`)
+        continue
+      }
+      if (attachments.length + inlineImages.length + accepted.length >= 10) {
+        onError('单封邮件最多添加 10 个附件或内嵌图片')
+        break
+      }
+      if (file.size > maxAttachmentBytes) {
+        onError(file.name + ' 超过单个图片 25 MB 限制')
+        continue
+      }
+      if (total + file.size > maxTotalAttachmentBytes) {
+        onError('附件和内嵌图片总大小不能超过 50 MB')
+        break
+      }
+      accepted.push({ file, contentId: createInlineContentId(), previewUrl: URL.createObjectURL(file) })
+      total += file.size
+    }
+    if (accepted.length) {
+      setInlineImages((current) => [...current, ...accepted])
+      setHtmlMode(true)
+    }
+  }
+
+  const uploadAttachment = async (file: File, contentId?: string) => {
     const start = await invoke<NativeAttachmentUploadStartResponse>('mail.attachment.upload.start', {
       fileName: file.name,
       contentType: file.type || 'application/octet-stream',
       size: file.size,
+      ...(contentId ? { contentId } : {}),
     }, 60_000)
     if (start.done) return start.uploadId
     const chunkSize = Math.min(Math.max(1, start.chunkSize), 192 * 1024)
@@ -2015,6 +2086,11 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
           setUploadingName('正在上传 ' + file.name)
           uploadIds.push(await uploadAttachment(file))
         }
+        for (const image of inlineImages) {
+          setUploadingName('正在上传内嵌图片 ' + image.file.name)
+          uploadIds.push(await uploadAttachment(image.file, image.contentId))
+        }
+        const effectiveHtml = htmlMode || inlineImages.length > 0
         const result = await invoke<{ queued?: boolean }>('mail.send', {
           accountId,
           to: to.trim(),
@@ -2022,7 +2098,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
           ...(bcc.trim() ? { bcc: bcc.trim() } : {}),
           subject: subject.trim() || '(无主题)',
           textBody: body,
-          ...(htmlMode && body.trim() ? { htmlBody: `<div>${escapeHtml(body).replace(/\r?\n/g, '<br>')}</div>` } : {}),
+          ...(effectiveHtml && (body.trim() || inlineImages.length) ? { htmlBody: composeHtmlBody(body, inlineImages) } : {}),
           ...(uploadIds.length ? { attachmentIds: uploadIds } : {}),
         })
         queued = Boolean(result.queued)
@@ -2044,7 +2120,8 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
   }
 
   const composeTitle = mode === 'reply' ? '回复邮件' : mode === 'reply-all' ? '回复全部' : mode === 'forward' ? '转发邮件' : '新邮件'
-  return <motion.div className="modal-backdrop compose-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="compose-modal" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1 }} exit={{ opacity: 0, y: 20 }}><div className="compose-header"><strong>{composeTitle}</strong><div><TooltipButton label="最小化撰写窗口"><span className="window-minimize" /></TooltipButton><TooltipButton label="关闭撰写窗口" onClick={onClose}><Icon name="close" size={17} /></TooltipButton></div></div><div className="compose-recipient-row"><label>收件人<input autoFocus value={to} onChange={(event) => setTo(event.target.value)} placeholder="name@example.com，可用逗号分隔多个地址" /></label><button type="button" className="copy-fields-button" onClick={() => setShowCopyFields((value) => !value)} aria-expanded={showCopyFields}>{showCopyFields ? '隐藏抄送' : '抄送 / 密送'}</button></div>{showCopyFields && <><label>抄送<input value={cc} onChange={(event) => setCc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label><label>密送<input value={bcc} onChange={(event) => setBcc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label></>}<label>主题<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="主题" /></label><textarea className="compose-body" value={body} onChange={(event) => setBody(event.target.value)} placeholder={htmlMode ? '输入内容，将以 HTML + 纯文本双格式发送…' : '写下你的邮件…'} />{draftStatus && <div className="compose-draft-status" aria-live="polite"><Icon name="cloud" size={14} />{draftStatus}</div>}{htmlMode && <div className="compose-format-note"><Icon name="grid" size={14} />此邮件将附带安全的 HTML 版本，同时保留纯文本版本</div>}{attachments.length > 0 && <div className="compose-attachments" aria-label="待发送附件">{attachments.map((file, index) => <div className="compose-attachment" key={file.name + '-' + file.size + '-' + index}><span>{file.name}</span><small>{Math.max(1, Math.round(file.size / 1024))} KB</small><button type="button" onClick={() => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))} aria-label={'移除附件 ' + file.name}>×</button></div>)}</div>}{uploadingName && <div className="compose-uploading" aria-live="polite"><Icon name="rotate" size={14} />{uploadingName}</div>}<div className="compose-footer"><div><TooltipButton label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={19} /></TooltipButton><input ref={fileInputRef} type="file" multiple hidden onChange={addFiles} /><TooltipButton label="插入图片" onClick={() => fileInputRef.current?.click()}><Icon name="image" size={19} /></TooltipButton><TooltipButton label={htmlMode ? '关闭 HTML 格式' : '启用 HTML 格式'} active={htmlMode} onClick={() => setHtmlMode((value) => !value)}><span className="reply-a">A</span></TooltipButton></div><div className="compose-send-actions">{draftId && <button type="button" className="danger-button" onClick={() => { void discard() }} disabled={isSending}><Icon name="trash" size={16} />丢弃草稿</button>}<button type="button" className="gradient-button" onClick={send} disabled={isSending}>{isSending ? (uploadingName || '发送中…') : '发送'}<Icon name="send" size={17} /></button></div></div></motion.div></motion.div>
+  const htmlEnabled = htmlMode || inlineImages.length > 0
+  return <motion.div className="modal-backdrop compose-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="compose-modal" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1 }} exit={{ opacity: 0, y: 20 }}><div className="compose-header"><strong>{composeTitle}</strong><div><TooltipButton label="最小化撰写窗口"><span className="window-minimize" /></TooltipButton><TooltipButton label="关闭撰写窗口" onClick={onClose}><Icon name="close" size={17} /></TooltipButton></div></div><div className="compose-recipient-row"><label>收件人<input autoFocus value={to} onChange={(event) => setTo(event.target.value)} placeholder="name@example.com，可用逗号分隔多个地址" /></label><button type="button" className="copy-fields-button" onClick={() => setShowCopyFields((value) => !value)} aria-expanded={showCopyFields}>{showCopyFields ? '隐藏抄送' : '抄送 / 密送'}</button></div>{showCopyFields && <><label>抄送<input value={cc} onChange={(event) => setCc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label><label>密送<input value={bcc} onChange={(event) => setBcc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label></>}<label>主题<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="主题" /></label><textarea className="compose-body" value={body} onChange={(event) => setBody(event.target.value)} placeholder={htmlEnabled ? '输入内容，将以 HTML + 纯文本双格式发送…' : '写下你的邮件…'} />{draftStatus && <div className="compose-draft-status" aria-live="polite"><Icon name="cloud" size={14} />{draftStatus}</div>}{htmlEnabled && <div className="compose-format-note"><Icon name="grid" size={14} />将发送安全的 HTML + 纯文本版本{inlineImages.length > 0 ? '，内嵌图片会显示在正文末尾' : ''}</div>}{inlineImages.length > 0 && <div className="compose-inline-images" aria-label="待发送内嵌图片">{inlineImages.map((image) => <div className="compose-inline-image" key={image.contentId}><img src={image.previewUrl} alt={image.file.name} /><span>{image.file.name}</span><button type="button" onClick={() => { URL.revokeObjectURL(image.previewUrl); setInlineImages((current) => current.filter((item) => item.contentId !== image.contentId)) }} aria-label={'移除内嵌图片 ' + image.file.name}>×</button></div>)}</div>}{attachments.length > 0 && <div className="compose-attachments" aria-label="待发送附件">{attachments.map((file, index) => <div className="compose-attachment" key={file.name + '-' + file.size + '-' + index}><span>{file.name}</span><small>{Math.max(1, Math.round(file.size / 1024))} KB</small><button type="button" onClick={() => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))} aria-label={'移除附件 ' + file.name}>×</button></div>)}</div>}{uploadingName && <div className="compose-uploading" aria-live="polite"><Icon name="rotate" size={14} />{uploadingName}</div>}<div className="compose-footer"><div><TooltipButton label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={19} /></TooltipButton><input ref={fileInputRef} type="file" multiple hidden onChange={addFiles} /><TooltipButton label="插入图片" onClick={() => imageInputRef.current?.click()}><Icon name="image" size={19} /></TooltipButton><input ref={imageInputRef} type="file" accept="image/*" multiple hidden onChange={addInlineImages} /><TooltipButton label={htmlEnabled ? (inlineImages.length > 0 ? '内嵌图片需要 HTML 格式' : '关闭 HTML 格式') : '启用 HTML 格式'} active={htmlEnabled} onClick={() => { if (inlineImages.length > 0) { onError('已插入内嵌图片，HTML 格式必须保持开启'); return } setHtmlMode((value) => !value) }}><span className="reply-a">A</span></TooltipButton></div><div className="compose-send-actions">{draftId && <button type="button" className="danger-button" onClick={() => { void discard() }} disabled={isSending}><Icon name="trash" size={16} />丢弃草稿</button>}<button type="button" className="gradient-button" onClick={send} disabled={isSending}>{isSending ? (uploadingName || '发送中…') : '发送'}<Icon name="send" size={17} /></button></div></div></motion.div></motion.div>
 }
 
 export default App
