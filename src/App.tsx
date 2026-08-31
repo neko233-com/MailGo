@@ -11,6 +11,7 @@ type DeviceFlowState = { sessionId: string; userCode: string; verificationUri: s
 type ActionMenu = 'bulk' | 'message'
 type TransferMode = 'export-encrypted' | 'import-encrypted'
 type MobilePane = 'list' | 'reading'
+const MAX_CUSTOM_CSS_LENGTH = 64 * 1024
 
 const smartCategories: { id: SmartCategory; label: string; icon: IconName; color: string }[] = [
   { id: 'apple-connect', label: 'Apple Connect', icon: 'shieldCheck', color: '#9ca6ba' },
@@ -258,6 +259,14 @@ function loadHideAds() {
   return window.localStorage.getItem('mailgo-hide-ads') === 'true'
 }
 
+function loadCustomCss() {
+  try {
+    return (window.localStorage.getItem('mailgo-custom-css') ?? '').slice(0, MAX_CUSTOM_CSS_LENGTH)
+  } catch {
+    return ''
+  }
+}
+
 function ProviderMark({ provider, size = 'md' }: { provider: Provider; size?: 'sm' | 'md' | 'lg' }) {
   const definition = providerFor(provider)
   return (
@@ -342,7 +351,7 @@ function App() {
   const [oauthState, setOauthState] = useState('')
   const [deviceFlow, setDeviceFlow] = useState<DeviceFlowState | null>(null)
   const [showAuthorizationCode, setShowAuthorizationCode] = useState(false)
-  const [customCss, setCustomCss] = useState(() => window.localStorage.getItem('mailgo-custom-css') ?? '')
+  const [customCss, setCustomCss] = useState(loadCustomCss)
   const [customImapHost, setCustomImapHost] = useState('imap.example.com')
   const [customImapPort, setCustomImapPort] = useState('993')
   const [customImapSecurity, setCustomImapSecurity] = useState('tls')
@@ -357,6 +366,7 @@ function App() {
   const selectedMailRef = useRef<MailMessage | undefined>(undefined)
   const attachmentCancelsRef = useRef(new Map<string, () => void>())
   const isNativeRuntime = Boolean(window.ipc?.postMessage)
+  const [nativeStateReady, setNativeStateReady] = useState(!isNativeRuntime)
 
   useEffect(() => () => {
     attachmentCancelsRef.current.forEach((cancel) => cancel())
@@ -494,12 +504,19 @@ function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = theme
     window.localStorage.setItem('mailgo-theme', theme)
-  }, [theme])
+    if (isNativeRuntime && nativeStateReady) {
+      void invoke('app.set_theme', { theme }).catch(() => undefined)
+    }
+  }, [isNativeRuntime, nativeStateReady, theme])
 
   useEffect(() => {
     let cancelled = false
     void readNativeState().then(async (nativeState) => {
-      if (cancelled || !nativeState) return
+      if (cancelled) return
+      if (!nativeState) {
+        setNativeStateReady(true)
+        return
+      }
       if (isNativeRuntime) setAccounts(nativeState.accounts)
       if (isNativeRuntime) setNativeFolders(nativeState.folders ?? {})
       setTheme(nativeState.theme)
@@ -507,6 +524,7 @@ function App() {
       setNotificationsEnabled(nativeState.notificationsEnabled ?? true)
       setRemoteImagesEnabled(nativeState.remoteImagesEnabled ?? false)
       setHideAds(nativeState.hideAds ?? false)
+      setNativeStateReady(true)
       void refreshPendingOperations(nativeState.accounts)
       void refreshOutbox(nativeState.accounts)
       void refreshNativeDrafts(nativeState.accounts)
@@ -602,8 +620,19 @@ function App() {
       style.id = styleId
       document.head.appendChild(style)
     }
-    style.textContent = customCss
-    window.localStorage.setItem('mailgo-custom-css', customCss)
+    const boundedCss = customCss.slice(0, MAX_CUSTOM_CSS_LENGTH)
+    style.textContent = boundedCss
+    try {
+      window.localStorage.setItem('mailgo-custom-css', boundedCss)
+    } catch {
+      // The visual override remains active for this session if WebView storage is unavailable.
+    }
+  }, [customCss])
+
+  useEffect(() => {
+    if (customCss.length > MAX_CUSTOM_CSS_LENGTH) {
+      setCustomCss((current) => current.slice(0, MAX_CUSTOM_CSS_LENGTH))
+    }
   }, [customCss])
 
   useEffect(() => {

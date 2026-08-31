@@ -59,6 +59,8 @@ The repository is deliberately split into a real desktop UI foundation and provi
 50. OAuth device, authorization-code, and refresh requests now retain bounded numeric `Retry-After` guidance for HTTP 429 responses without exposing response bodies or credentials.
 51. Incremental and UID fallback syncs retain the previous delta cursor while bounded header windows are incomplete, fetch unseen UIDs oldest-first, and only advance the cursor after every requested header parses successfully.
 52. Packaged native RPC now requires a per-launch capability carried by the trusted app URL, while the renderer also ships a restrictive CSP that blocks executable HTML, frames, plugins, and unapproved network destinations.
+53. Narrow Windows windows now switch between a single-column mail list and reading view, with drawer navigation, drawer-based authorization help, title-bar compose access, and full-screen compose bounds instead of allowing the four-pane desktop grid to overflow the viewport.
+54. Theme changes now persist through the native state after hydration, and user CSS is bounded to 64 KiB with a storage-failure fallback so customization cannot grow without limit or make the settings surface unusable.
 
 ## Remaining production acceptance work
 

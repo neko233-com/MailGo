@@ -5,6 +5,7 @@ MailGo is a Windows-first local-first email workspace for multiple Google, QQ, O
 The current foundation includes:
 
 - React + Vite desktop UI with three-pane unified inbox.
+- Resizable Windows windows stay usable below the desktop four-pane breakpoint: mail list and reading view become a single-column flow, with drawer navigation, authorization help, and a title-bar compose entry.
 - `motion` transitions with `prefers-reduced-motion` support.
 - Tree-shakeable `reicon-react` icon components.
 - Multiple accounts, including multiple QQ accounts, account switching, and import/export with redacted credentials.
@@ -15,6 +16,7 @@ The current foundation includes:
 - Local-only advertising classification can optionally hide ads from normal lists while keeping Apple Connect security mail and smart-category access visible.
 - Rust `neko233-com/rdesktop` WebView2 shell with custom frameless title bar and preserved WebView data directory under `%LOCALAPPDATA%\\MailGo\\WebView2`.
 - Windows Credential Manager integration through `keyring` for authorization-code storage; secrets never enter `state.json` or account exports.
+- Theme changes are written to the native state after startup hydration, and user CSS is capped at 64 KiB with a session-only fallback when WebView storage is unavailable.
 - Packaged native RPC calls carry a per-launch capability from the trusted app URL; forged or navigated-away renderer messages are rejected before any account, credential, filesystem, or network operation.
 - Native IMAP sync uses capability-driven `QRESYNC`/`CONDSTORE` deltas when a server exposes them (including `HIGHESTMODSEQ` cursors, `VANISHED` deletions, and UID-only new-mail discovery), with a UID-based incremental header fallback across provider folder mappings. Bounded `UID FLAGS` refreshes, lazy full-message retrieval, replayable offline flag mutations, local flag updates, and protected mailbox/attachment caches keep the offline view safe: Windows uses DPAPI, while non-Windows builds use an OS keyring-held XChaCha20-Poly1305 key. Attachment downloads use bounded start/chunk/cancel IPC with progress and cancellation support.
 - Native sync discovers selectable IMAP mailboxes (including custom folders), persists a bounded per-account folder index, and exposes those folders in the desktop sidebar for offline browsing and UID pagination.
