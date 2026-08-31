@@ -39,6 +39,7 @@ The current foundation includes:
 - Redacted account imports preflight every record and commit the state change only after cache and credential cleanup succeeds; a failed import restores the prior in-memory state and credentials.
 - Missing credentials are treated as an expected reauthorization state during redacted import, while unexpected Credential Manager failures abort the import before state is committed.
 - Account reauthorization now commits the new credential and metadata as one recoverable operation; a persistence failure restores the previous account state and credential, and outbox-resume errors cannot falsely report the account as unsaved.
+- Account removal uses the same recovery boundary: cache, draft, outbox, and Credential Manager cleanup must finish before the account list is committed, and failures restore the prior credential/state snapshot.
 - Windows tray lifecycle is implemented with the generated `resources/icons/mailgo.ico`: close-to-tray, restore on click, deliberate quit, and a five-minute background sync scheduler.
 - The tray icon re-registers itself after Windows Explorer/taskbar restarts, so a hidden MailGo window remains recoverable without restarting the app.
 - Custom IMAP/SMTP onboarding accepts host, port, TLS mode, and password/app-password/OAuth2 settings without putting credentials in metadata.

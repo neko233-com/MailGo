@@ -1199,15 +1199,30 @@ fn handle_ipc(
                 if !valid_account_id(&id) {
                     return Err(anyhow!("invalid account id"));
                 }
-                sync::remove_account_cache(&cache_dir(), &id)?;
-                let _ = drafts::remove_account(&cache_dir(), &id);
-                let _ = outbox::remove_account(&cache_dir(), &id);
-                let _ = credential_entry(&id)
-                    .and_then(|entry| entry.delete_credential().map_err(anyhow::Error::from));
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                let previous_accounts = app.state.accounts.clone();
+                let previous_folders = app.state.folder_names.clone();
+                let mut previous_credentials = vec![(id.clone(), snapshot_credential(&id)?)];
+                let cleanup_result = (|| -> Result<()> {
+                    sync::remove_account_cache(&cache_dir(), &id)?;
+                    drafts::remove_account(&cache_dir(), &id)?;
+                    outbox::remove_account(&cache_dir(), &id)?;
+                    delete_credential_if_present(&id)?;
+                    Ok(())
+                })();
+                if let Err(error) = cleanup_result {
+                    restore_credentials(&mut previous_credentials);
+                    return Err(error);
+                }
                 app.state.accounts.retain(|account| account.id != id);
                 app.state.folder_names.remove(&id);
-                app.save()?;
+                if let Err(error) = app.save() {
+                    app.state.accounts = previous_accounts;
+                    app.state.folder_names = previous_folders;
+                    restore_credentials(&mut previous_credentials);
+                    return Err(error);
+                }
+                clear_credential_snapshots(&mut previous_credentials);
                 Ok(json!({ "removed": id }))
             }
             "accounts.export" => {

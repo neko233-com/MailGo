@@ -77,6 +77,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 68. Redacted account import now preflights and de-duplicates records, performs cache/credential cleanup before state mutation, and restores the prior account state and credentials if cleanup or persistence fails.
 69. Redacted import distinguishes an absent credential (normal reauthorization) from an unavailable Credential Manager, failing closed before committing state in the latter case.
 70. Account reauthorization now snapshots and restores the prior state/credential when persistence fails, while committed accounts remain usable if local outbox resumption needs a later retry.
+71. Account removal now snapshots the prior account state and credential, aborts before state mutation when cleanup fails, and restores both when final persistence fails.
 
 ## Remaining production acceptance work
 
