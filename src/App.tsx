@@ -10,6 +10,7 @@ type Toast = { id: number; message: string; tone: ToastTone }
 type DeviceFlowState = { sessionId: string; userCode: string; verificationUri: string; message?: string; retryAfter: number; status: 'pending' | 'complete' | 'error' }
 type ActionMenu = 'bulk' | 'message'
 type TransferMode = 'export-encrypted' | 'import-encrypted'
+type MobilePane = 'list' | 'reading'
 
 const smartCategories: { id: SmartCategory; label: string; icon: IconName; color: string }[] = [
   { id: 'apple-connect', label: 'Apple Connect', icon: 'shieldCheck', color: '#9ca6ba' },
@@ -301,6 +302,9 @@ function App() {
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null)
   const [selectedMailId, setSelectedMailId] = useState('launch-plan')
   const [selectedMailIds, setSelectedMailIds] = useState<string[]>([])
+  const [mobilePane, setMobilePane] = useState<MobilePane>('list')
+  const [isMobileSidebarOpen, setMobileSidebarOpen] = useState(false)
+  const [isMobileAuthOpen, setMobileAuthOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [filterUnread, setFilterUnread] = useState(false)
   const [isComposeOpen, setComposeOpen] = useState(false)
@@ -750,6 +754,7 @@ function App() {
 
   const selectMail = async (mail: MailMessage) => {
     setSelectedMailId(mail.id)
+    setMobilePane('reading')
     const localDraft = nativeDrafts.find((draft) => mail.id === `local-draft:${draft.accountId}:${draft.id}`)
     if (localDraft) {
       setSelectedAccountId(localDraft.accountId)
@@ -1042,6 +1047,8 @@ function App() {
 
   const selectFolder = (folder: FolderId) => {
     setSelectedFolder(folder)
+    setMobilePane('list')
+    setMobileSidebarOpen(false)
     setSelectedNativeFolder(null)
     setSelectedCategory(null)
     setSelectedAccountId(null)
@@ -1073,6 +1080,8 @@ function App() {
 
   const selectNativeFolder = (account: MailAccount, folder: string) => {
     setSelectedFolder('archive')
+    setMobilePane('list')
+    setMobileSidebarOpen(false)
     setSelectedNativeFolder({ accountId: account.id, name: folder })
     setSelectedCategory(null)
     setSelectedAccountId(account.id)
@@ -1134,6 +1143,8 @@ function App() {
 
   const selectCategory = (category: SmartCategory) => {
     setSelectedCategory(category)
+    setMobilePane('list')
+    setMobileSidebarOpen(false)
     setSelectedFolder('inbox')
     setSelectedNativeFolder(null)
     setSelectedAccountId(null)
@@ -1584,14 +1595,18 @@ function App() {
         <div className="titlebar-brand"><BrandMark /><span>MailGo</span></div>
         <div className="titlebar-center">统一收件箱</div>
         <div className="window-controls" data-no-drag="true">
+          <TooltipButton label="打开导航" className="mobile-only-button" ariaExpanded={isMobileSidebarOpen} onClick={() => setMobileSidebarOpen((value) => !value)}><Icon name="menu" size={17} /></TooltipButton>
+          <TooltipButton label="打开授权码助手" className="mobile-only-button" ariaExpanded={isMobileAuthOpen} onClick={() => { setMobileAuthOpen(true); setAuthPanelOpen(true) }}><Icon name="key" size={17} /></TooltipButton>
+          <TooltipButton label="写邮件" className="mobile-only-button" onClick={() => openCompose()}><Icon name="edit" size={17} /></TooltipButton>
           <TooltipButton label="最小化" onClick={() => window.__RDESKTOP_WINDOW__?.minimize()}><span className="window-minimize" /></TooltipButton>
           <TooltipButton label="最大化" onClick={() => window.__RDESKTOP_WINDOW__?.maximize()}><Icon name="maximize" size={16} /></TooltipButton>
           <TooltipButton label={minimizeToTray ? '缩小到托盘' : '关闭 MailGo'} onClick={handleCloseWindow} className="close-button"><Icon name="close" size={17} /></TooltipButton>
         </div>
       </header>
 
-      <div className="workspace">
-        <aside className="sidebar">
+      <div className={`workspace mobile-pane-${mobilePane}`}>
+        {isMobileSidebarOpen && <button className="mobile-overlay" type="button" aria-label="关闭导航" onClick={() => setMobileSidebarOpen(false)} />}
+        <aside className={`sidebar ${isMobileSidebarOpen ? 'is-mobile-open' : ''}`}>
           <div className="sidebar-top">
             <button className="compose-button" type="button" onClick={() => openCompose()}><Icon name="edit" size={19} /><span>写邮件</span><span className="compose-shortcut">C</span></button>
             <nav className="folder-nav" aria-label="邮件文件夹">
@@ -1634,7 +1649,7 @@ function App() {
             <div className="section-label-row"><span>账户</span><TooltipButton label="添加账户" onClick={openNewAccount}><Icon name="add" size={16} /></TooltipButton></div>
             <div className="account-list">
               {accounts.map((account) => (
-                <button key={account.id} type="button" className={`account-row ${selectedAccountId === account.id && !selectedNativeFolder ? 'is-selected' : ''}`} onClick={() => { setSelectedAccountId(account.id); setSelectedCategory(null); setSelectedNativeFolder(null); setSelectedFolder('inbox'); setSelectedMailIds([]) }}>
+                <button key={account.id} type="button" className={`account-row ${selectedAccountId === account.id && !selectedNativeFolder ? 'is-selected' : ''}`} onClick={() => { setSelectedAccountId(account.id); setSelectedCategory(null); setSelectedNativeFolder(null); setSelectedFolder('inbox'); setSelectedMailIds([]); setMobilePane('list'); setMobileSidebarOpen(false) }}>
                   <ProviderMark provider={account.provider} size="sm" />
                   <span className="account-copy"><strong>{account.label}</strong><small>{account.email}</small></span>
                   {account.unread > 0 && <span className="account-count">{account.unread}</span>}
@@ -1708,7 +1723,7 @@ function App() {
 
         <section className="reading-panel" aria-label="邮件阅读区">
           <div className="reading-toolbar">
-            <div className="reading-actions"><TooltipButton label="回复" onClick={() => openCompose(undefined, 'reply', selectedMail)}><Icon name="reply" size={18} /></TooltipButton><span>回复</span><TooltipButton label="回复全部" onClick={() => openCompose(undefined, 'reply-all', selectedMail)}><Icon name="reply" size={18} /></TooltipButton><span>回复全部</span><TooltipButton label="转发" onClick={() => openCompose(undefined, 'forward', selectedMail)}><Icon name="forward" size={18} /></TooltipButton><span>转发</span><TooltipButton label="归档" onClick={() => { void runMove(selectedMail, 'archive') }}><Icon name="archive" size={18} /></TooltipButton><span>归档</span><TooltipButton label="删除" onClick={() => { void runMove(selectedMail, 'delete') }}><Icon name="trash" size={18} /></TooltipButton><span>删除</span></div>
+            <div className="reading-actions"><TooltipButton label="返回邮件列表" className="mobile-only-button reading-back-button" onClick={() => setMobilePane('list')}><span className="mobile-back-label">列表</span></TooltipButton><TooltipButton label="回复" onClick={() => openCompose(undefined, 'reply', selectedMail)}><Icon name="reply" size={18} /></TooltipButton><span>回复</span><TooltipButton label="回复全部" onClick={() => openCompose(undefined, 'reply-all', selectedMail)}><Icon name="reply" size={18} /></TooltipButton><span>回复全部</span><TooltipButton label="转发" onClick={() => openCompose(undefined, 'forward', selectedMail)}><Icon name="forward" size={18} /></TooltipButton><span>转发</span><TooltipButton label="归档" onClick={() => { void runMove(selectedMail, 'archive') }}><Icon name="archive" size={18} /></TooltipButton><span>归档</span><TooltipButton label="删除" onClick={() => { void runMove(selectedMail, 'delete') }}><Icon name="trash" size={18} /></TooltipButton><span>删除</span></div>
             <div className="menu-anchor">
               <TooltipButton label="更多邮件操作" active={openMenu === 'message'} ariaExpanded={openMenu === 'message'} onClick={() => setOpenMenu((current) => current === 'message' ? null : 'message')}><Icon name="more" size={19} /></TooltipButton>
               {openMenu === 'message' && <div className="action-menu" role="menu" aria-label="更多邮件操作">
@@ -1731,8 +1746,8 @@ function App() {
         </section>
 
         <AnimatePresence initial={false}>
-          {isAuthPanelOpen && <motion.aside className="auth-panel" initial={prefersReducedMotion ? false : { x: 24, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: 24, opacity: 0 }} transition={{ duration: 0.24 }}>
-            <div className="auth-panel-header"><div><Icon name="key" size={20} /><strong>授权码助手</strong></div><TooltipButton label="关闭授权码助手" onClick={() => setAuthPanelOpen(false)}><Icon name="close" size={18} /></TooltipButton></div>
+          {isAuthPanelOpen && <motion.aside className={`auth-panel ${isMobileAuthOpen ? 'is-mobile-open' : ''}`} initial={prefersReducedMotion ? false : { x: 24, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: 24, opacity: 0 }} transition={{ duration: 0.24 }}>
+            <div className="auth-panel-header"><div><Icon name="key" size={20} /><strong>授权码助手</strong></div><TooltipButton label="关闭授权码助手" onClick={() => { setAuthPanelOpen(false); setMobileAuthOpen(false) }}><Icon name="close" size={18} /></TooltipButton></div>
             <div className="auth-tabs"><button type="button" className="is-active"><Icon name="lock" size={16} />授权码</button><button type="button" onClick={openNewAccount}><Icon name="settings" size={16} />设置</button></div>
             <div className="auth-card"><div className="auth-illustration"><Icon name="shieldCheck" size={40} /></div><h2>快速获取授权码</h2><p>用于第三方服务登录验证</p><button className="gradient-button" type="button" onClick={openNewAccount}><Icon name="copy" size={17} />管理授权码</button><div className="auth-validity"><Icon name="clock" size={16} />授权码仅保存在本机安全存储</div></div>
             <div className="auth-panel-section"><div className="panel-section-title">账户</div>{accounts.map((account) => <button type="button" className="auth-account-row" key={account.id} onClick={() => { setEditingAccountId(account.id); changeProvider(account.provider); setAccountEmail(account.email); setCustomImapHost(account.imapHost ?? 'imap.example.com'); setCustomImapPort(String(account.imapPort ?? 993)); setCustomImapSecurity(account.imapSecurity ?? 'tls'); setCustomSmtpHost(account.smtpHost ?? 'smtp.example.com'); setCustomSmtpPort(String(account.smtpPort ?? 465)); setCustomSmtpSecurity(account.smtpSecurity ?? 'tls'); setCustomAuthentication(account.authentication ?? (account.provider === 'outlook' ? 'oauth2' : 'app-password')); setAccountModalOpen(true) }}><ProviderMark provider={account.provider} size="sm" /><span><strong>{account.label}</strong><small>{account.email}</small></span><span className="auth-chevron">›</span></button>)}</div>
@@ -1740,7 +1755,7 @@ function App() {
             <div className="auth-panel-foot"><button type="button" onClick={handleOpenProvider}><Icon name="link" size={15} />打开 {selectedProvider.label} 设置</button></div>
           </motion.aside>}
         </AnimatePresence>
-        {!isAuthPanelOpen && <button className="auth-panel-reopen" type="button" onClick={() => setAuthPanelOpen(true)}><Icon name="key" size={18} />授权码助手</button>}
+        {!isAuthPanelOpen && <button className="auth-panel-reopen" type="button" onClick={() => { setAuthPanelOpen(true); setMobileAuthOpen(true) }}><Icon name="key" size={18} />授权码助手</button>}
       </div>
 
       <AnimatePresence>
