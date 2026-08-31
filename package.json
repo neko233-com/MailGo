@@ -10,6 +10,7 @@
     "preview": "vite preview",
     "native:build": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1",
     "native:run": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1 -Run",
+    "test:custom-css": "node scripts/test-custom-css.mjs",
     "package:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1",
     "release:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1"
   },

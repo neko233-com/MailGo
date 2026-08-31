@@ -84,6 +84,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 75. Native startup now begins with an empty account/cache view instead of browser-demo data; the first-run empty state distinguishes local-state loading, no configured accounts, and an empty mailbox, with a direct add-account action.
 76. Google and Outlook OAuth redirect configuration now fails closed unless it is an explicit `http://127.0.0.1:<port>/<path>` callback without userinfo, query, or fragment components; this keeps authorization returns local to the desktop process.
 77. The native scheduler performs one delayed startup sync before entering its five-minute background cadence, so a resumed desktop refreshes stale cached headers promptly while offline-only mode still prevents all network work.
+78. User CSS is bounded, persisted only after sanitization, and cannot load `@import`, `url()`, script protocols, legacy behavior properties, CSS comments, or escape-obfuscated equivalents; theme variables, layout rules, gradients, media queries, and animations remain supported.
 
 ## Remaining production acceptance work
 

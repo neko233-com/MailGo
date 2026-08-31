@@ -1,6 +1,7 @@
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Icon, type IconName } from './components/Icon'
+import { sanitizeCustomCss } from './customCss'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
 import { invoke, readNativeState } from './lib/ipc'
 import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeDraft, NativeMailboxResponse, NativeMessageResponse, NativeOutboxStatus, NativeQueueStatus, NativeSearchResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
@@ -298,7 +299,8 @@ function loadOfflineMode() {
 }
 
 function loadCustomCss() {
-  return (readLocalStorageValue('mailgo-custom-css') ?? '').slice(0, MAX_CUSTOM_CSS_LENGTH)
+  const stored = (readLocalStorageValue('mailgo-custom-css') ?? '').slice(0, MAX_CUSTOM_CSS_LENGTH)
+  return sanitizeCustomCss(stored).css
 }
 
 function ProviderMark({ provider, size = 'md' }: { provider: Provider; size?: 'sm' | 'md' | 'lg' }) {
@@ -398,6 +400,7 @@ function App() {
   const [deviceFlow, setDeviceFlow] = useState<DeviceFlowState | null>(null)
   const [showAuthorizationCode, setShowAuthorizationCode] = useState(false)
   const [customCss, setCustomCss] = useState(loadCustomCss)
+  const sanitizedCustomCss = useMemo(() => sanitizeCustomCss(customCss), [customCss])
   const [customImapHost, setCustomImapHost] = useState('imap.example.com')
   const [customImapPort, setCustomImapPort] = useState('993')
   const [customImapSecurity, setCustomImapSecurity] = useState('tls')
@@ -700,10 +703,10 @@ function App() {
       style.id = styleId
       document.head.appendChild(style)
     }
-    const boundedCss = customCss.slice(0, MAX_CUSTOM_CSS_LENGTH)
+    const boundedCss = sanitizedCustomCss.css.slice(0, MAX_CUSTOM_CSS_LENGTH)
     style.textContent = boundedCss
     writeLocalStorageValue('mailgo-custom-css', boundedCss)
-  }, [customCss])
+  }, [sanitizedCustomCss])
 
   useEffect(() => {
     if (customCss.length > MAX_CUSTOM_CSS_LENGTH) {
@@ -1887,7 +1890,7 @@ function App() {
       </div>
 
       <AnimatePresence>
-        {isSettingsOpen && <motion.div className="settings-popover" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}><div className="settings-title"><span><Icon name="settings" size={17} />偏好设置</span><TooltipButton label="关闭设置" onClick={() => setSettingsOpen(false)}><Icon name="close" size={17} /></TooltipButton></div><div className="settings-row"><span><Icon name={theme === 'dark' ? 'moon' : 'theme'} size={17} /><span>外观主题<small>{theme === 'dark' ? '深色 · 午夜蓝' : '浅色 · 雪白'}</small></span></span><button type="button" className="theme-switch" onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}><span className={theme === 'light' ? 'is-light' : ''}>{theme === 'dark' ? '深' : '浅'}</span></button></div><label className="settings-row css-row"><span><Icon name="brush" size={17} /><span>用户 CSS<small>可覆盖 MailGo 视觉变量</small></span></span><textarea value={customCss} onChange={(event) => setCustomCss(event.target.value)} placeholder="例如：:root { --accent: #ff6b8a; }" /></label><div className="settings-row"><span><Icon name="cloud" size={17} /><span>关闭时后台运行<small>最小化到系统托盘并继续同步</small></span></span><button type="button" className={`toggle-switch ${minimizeToTray ? 'is-on' : ''}`} onClick={() => { const next = !minimizeToTray; setMinimizeToTray(next); void invoke('app.set_minimize_to_tray', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-row"><span><Icon name="image" size={17} /><span>加载远程图片<small>{remoteImagesEnabled ? '已允许 HTTPS 图片，可能包含追踪像素' : '默认屏蔽，保护隐私；CID 内嵌图片不受影响'}</small></span></span><button type="button" aria-label="加载远程图片" className={`toggle-switch ${remoteImagesEnabled ? 'is-on' : ''}`} onClick={() => { const next = !remoteImagesEnabled; setRemoteImagesEnabled(next); void invoke('app.set_remote_images', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-row"><span><Icon name="bell" size={17} /><span>后台新邮件提醒<small>窗口隐藏时发送 Windows 托盘通知</small></span></span><button type="button" aria-label="后台新邮件提醒" className={`toggle-switch ${notificationsEnabled ? 'is-on' : ''}`} onClick={() => { const next = !notificationsEnabled; setNotificationsEnabled(next); void invoke('app.set_notifications', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-actions"><button type="button" onClick={exportAccounts}><Icon name="download" size={16} />导出脱敏配置</button><button type="button" onClick={() => importInputRef.current?.click()} disabled={isImporting}><Icon name="folder" size={16} />{isImporting ? '导入中…' : '导入脱敏配置'}</button><button type="button" className="secure-transfer-button" onClick={openEncryptedExport} disabled={!isNativeRuntime || isImporting}><Icon name="shieldCheck" size={16} />导出加密配置</button><button type="button" className="secure-transfer-button" onClick={openEncryptedImport} disabled={!isNativeRuntime || isImporting}><Icon name="key" size={16} />导入加密配置</button></div><input ref={importInputRef} type="file" accept="application/json,.json" hidden onChange={importAccounts} /><input ref={encryptedTransferInputRef} type="file" accept="application/json,.json" hidden onChange={selectEncryptedTransferFile} /></motion.div>}
+        {isSettingsOpen && <motion.div className="settings-popover" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}><div className="settings-title"><span><Icon name="settings" size={17} />偏好设置</span><TooltipButton label="关闭设置" onClick={() => setSettingsOpen(false)}><Icon name="close" size={17} /></TooltipButton></div><div className="settings-row"><span><Icon name={theme === 'dark' ? 'moon' : 'theme'} size={17} /><span>外观主题<small>{theme === 'dark' ? '深色 · 午夜蓝' : '浅色 · 雪白'}</small></span></span><button type="button" className="theme-switch" onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}><span className={theme === 'light' ? 'is-light' : ''}>{theme === 'dark' ? '深' : '浅'}</span></button></div><label className="settings-row css-row"><span><Icon name="brush" size={17} /><span>用户 CSS<small>{sanitizedCustomCss.removedUnsafeSyntax ? '已过滤外部资源与危险语法' : '可覆盖 MailGo 视觉变量；不加载外部资源'}</small></span></span><textarea value={customCss} onChange={(event) => setCustomCss(event.target.value)} placeholder="例如：:root { --accent: #ff6b8a; }" /></label><div className="settings-row"><span><Icon name="cloud" size={17} /><span>关闭时后台运行<small>最小化到系统托盘并继续同步</small></span></span><button type="button" className={`toggle-switch ${minimizeToTray ? 'is-on' : ''}`} onClick={() => { const next = !minimizeToTray; setMinimizeToTray(next); void invoke('app.set_minimize_to_tray', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-row"><span><Icon name="image" size={17} /><span>加载远程图片<small>{remoteImagesEnabled ? '已允许 HTTPS 图片，可能包含追踪像素' : '默认屏蔽，保护隐私；CID 内嵌图片不受影响'}</small></span></span><button type="button" aria-label="加载远程图片" className={`toggle-switch ${remoteImagesEnabled ? 'is-on' : ''}`} onClick={() => { const next = !remoteImagesEnabled; setRemoteImagesEnabled(next); void invoke('app.set_remote_images', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-row"><span><Icon name="bell" size={17} /><span>后台新邮件提醒<small>窗口隐藏时发送 Windows 托盘通知</small></span></span><button type="button" aria-label="后台新邮件提醒" className={`toggle-switch ${notificationsEnabled ? 'is-on' : ''}`} onClick={() => { const next = !notificationsEnabled; setNotificationsEnabled(next); void invoke('app.set_notifications', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-actions"><button type="button" onClick={exportAccounts}><Icon name="download" size={16} />导出脱敏配置</button><button type="button" onClick={() => importInputRef.current?.click()} disabled={isImporting}><Icon name="folder" size={16} />{isImporting ? '导入中…' : '导入脱敏配置'}</button><button type="button" className="secure-transfer-button" onClick={openEncryptedExport} disabled={!isNativeRuntime || isImporting}><Icon name="shieldCheck" size={16} />导出加密配置</button><button type="button" className="secure-transfer-button" onClick={openEncryptedImport} disabled={!isNativeRuntime || isImporting}><Icon name="key" size={16} />导入加密配置</button></div><input ref={importInputRef} type="file" accept="application/json,.json" hidden onChange={importAccounts} /><input ref={encryptedTransferInputRef} type="file" accept="application/json,.json" hidden onChange={selectEncryptedTransferFile} /></motion.div>}
       </AnimatePresence>
 
       <AnimatePresence>{isHelpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}</AnimatePresence>
