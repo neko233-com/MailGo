@@ -21,6 +21,7 @@ const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const HTTP_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const CALLBACK_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PENDING_CALLBACKS: usize = 16;
+const MAX_CALLBACK_REQUEST_BYTES: usize = 16 * 1024;
 
 static HTTP_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
@@ -755,9 +756,22 @@ fn run_loopback_listener(listener: TcpListener, state: Arc<LoopbackListener>) {
 }
 
 fn read_request_target(stream: &mut TcpStream) -> Option<String> {
-    let mut buffer = [0u8; 16 * 1024];
-    let size = stream.read(&mut buffer).ok()?;
-    let request = std::str::from_utf8(&buffer[..size]).ok()?;
+    let mut buffer = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        let size = stream.read(&mut chunk).ok()?;
+        if size == 0 {
+            break;
+        }
+        if buffer.len().saturating_add(size) > MAX_CALLBACK_REQUEST_BYTES {
+            return None;
+        }
+        buffer.extend_from_slice(&chunk[..size]);
+        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let request = std::str::from_utf8(&buffer).ok()?;
     let mut fields = request.lines().next()?.split_whitespace();
     let method = fields.next()?;
     let target = fields.next()?;
@@ -902,5 +916,29 @@ mod tests {
             validate_loopback_redirect_uri("http://user:pass@127.0.0.1:8765/oauth/callback")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn request_target_handles_split_http_headers_with_a_bound() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("callback fixture listener");
+        let address = listener.local_addr().expect("callback fixture address");
+        let writer = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("callback fixture connection");
+            stream
+                .write_all(b"GET /oauth/call")
+                .expect("first request chunk");
+            stream
+                .write_all(b"back?code=abc&state=xyz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\nignored")
+                .expect("second request chunk");
+        });
+        let (mut stream, _) = listener.accept().expect("callback fixture accept");
+        stream
+            .set_read_timeout(Some(CALLBACK_SOCKET_TIMEOUT))
+            .expect("callback fixture timeout");
+        assert_eq!(
+            read_request_target(&mut stream).as_deref(),
+            Some("/oauth/callback?code=abc&state=xyz")
+        );
+        writer.join().expect("callback fixture writer");
     }
 }
