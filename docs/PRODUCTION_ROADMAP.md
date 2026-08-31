@@ -53,6 +53,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 44. Search now keeps local filtering instant while a debounced native IMAP query searches the full discovered folder set across selected or all accounts; bounded header hits are merged into UIDVALIDITY-aware encrypted caches so they remain actionable offline.
 45. Network transport now has explicit deadlines: IMAP uses bounded address connection attempts plus TLS/STARTTLS and socket read/write timeouts, OAuth HTTP requests use bounded connect/read/write timeouts, and SMTP delivery has a bounded transport timeout for predictable background/offline behavior.
 46. OAuth loopback callbacks now use a bounded shared listener per configured port/path and route successful or failed returns by validated `state`, so simultaneous Google/Outlook authorization flows do not compete for one-shot `accept` ownership.
+47. Account onboarding and import enforce a shared 64-account ceiling, while pending OAuth sessions are capped and expired sessions are purged before new flows start.
 
 ## Remaining production acceptance work
 

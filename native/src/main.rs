@@ -39,6 +39,7 @@ const MAX_OUTGOING_ATTACHMENTS: usize = 10;
 const MAX_ACTIVE_ATTACHMENT_UPLOADS: usize = 4;
 const ATTACHMENT_UPLOAD_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_IMPORTED_ACCOUNTS: usize = 64;
+const MAX_AUTH_SESSIONS: usize = 16;
 const MAX_FOLDERS_PER_ACCOUNT: usize = 64;
 const MAX_ACCOUNT_ID_LENGTH: usize = 128;
 const MAX_ACCOUNT_LABEL_LENGTH: usize = 128;
@@ -674,6 +675,20 @@ fn purge_expired_auth_sessions(app: &mut MailGoState) {
         .retain(|session_id, _| active_sessions.contains(session_id));
 }
 
+fn ensure_auth_session_capacity(app: &mut MailGoState) -> Result<()> {
+    purge_expired_auth_sessions(app);
+    if app.auth_sessions.len() >= MAX_AUTH_SESSIONS {
+        return Err(anyhow!(
+            "too many pending authorization sessions; finish or restart one before continuing"
+        ));
+    }
+    Ok(())
+}
+
+fn account_capacity_available(accounts: &[PersistedAccount], id: &str) -> bool {
+    accounts.iter().any(|account| account.id == id) || accounts.len() < MAX_IMPORTED_ACCOUNTS
+}
+
 fn attachment_chunk_bounds(total: usize, offset: usize) -> Result<(usize, bool)> {
     if offset > total {
         return Err(anyhow!("attachment download offset is invalid"));
@@ -761,9 +776,13 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     providers::ProviderKind::parse(&string_field(&message.payload, "provider")?)?;
                 let email = string_field(&message.payload, "email")?;
                 providers::validate_email(&email)?;
+                {
+                    let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                    ensure_auth_session_capacity(&mut app)?;
+                }
                 let (session, response) = oauth::start(provider, &email)?;
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-                purge_expired_auth_sessions(&mut app);
+                ensure_auth_session_capacity(&mut app)?;
                 app.auth_sessions.insert(session.id.clone(), session);
                 Ok(serde_json::to_value(response)?)
             }
@@ -772,9 +791,13 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     providers::ProviderKind::parse(&string_field(&message.payload, "provider")?)?;
                 let email = string_field(&message.payload, "email")?;
                 providers::validate_email(&email)?;
+                {
+                    let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                    ensure_auth_session_capacity(&mut app)?;
+                }
                 let (session, response) = oauth::start_device(provider, &email)?;
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-                purge_expired_auth_sessions(&mut app);
+                ensure_auth_session_capacity(&mut app)?;
                 app.auth_sessions.insert(session.id.clone(), session);
                 Ok(serde_json::to_value(response)?)
             }
@@ -844,6 +867,14 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     authentication: optional_string_field(&message.payload, "authentication"),
                 };
                 let profile = profile_for_account(&new_account)?;
+                {
+                    let app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                    if !account_capacity_available(&app.state.accounts, &id) {
+                        return Err(anyhow!(
+                            "MailGo supports at most {MAX_IMPORTED_ACCOUNTS} accounts"
+                        ));
+                    }
+                }
 
                 let oauth_session_id = optional_string_field(&message.payload, "oauthSessionId");
                 let credential = if let Some(session_id) = oauth_session_id
@@ -982,6 +1013,9 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     };
                     if profile_for_account(&imported_account).is_err() {
                         continue;
+                    }
+                    if !account_capacity_available(&app.state.accounts, id) {
+                        break;
                     }
                     sync::remove_account_cache(&cache_dir(), id)?;
                     let _ = drafts::remove_account(&cache_dir(), id);
