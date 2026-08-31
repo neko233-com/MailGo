@@ -100,6 +100,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 91. Non-INBOX mailbox caches and attachment directories now use SHA-256 folder keys, with legacy cache reads retained for migration and regression coverage proving lossy-name collisions cannot share new storage.
 92. Full-message reads now preflight the server-advertised `RFC822.SIZE` before requesting the MIME body, while retaining the post-fetch 64 MiB bound as a defense against inaccurate servers.
 93. The scheduled rdesktop updater now installs only the manually reviewed SHA in `config/rdesktop-trusted-revision.txt`; upstream default-branch movement cannot silently change the local framework.
+94. Manual sync, pagination, server search, background refresh, and account reauthorization/removal now coordinate through a per-account in-flight lease, preventing duplicate IMAP work and cache recreation after destructive account operations.
 
 ## Remaining production acceptance work
 

@@ -393,6 +393,16 @@ pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathB
                     continue;
                 }
                 for account in accounts {
+                    let _sync_lease = match crate::try_begin_account_sync(&shared, &account.id) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            tracing::debug!(
+                                account_id = %account.id,
+                                "background sync skipped because another operation owns the account: {error}"
+                            );
+                            continue;
+                        }
+                    };
                     let profile = match crate::profile_for_account(&account) {
                         Ok(profile) => profile,
                         Err(_) => continue,

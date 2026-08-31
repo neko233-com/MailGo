@@ -243,6 +243,7 @@ struct MailGoState {
     ready_oauth_credentials: HashMap<String, Zeroizing<String>>,
     attachment_downloads: HashMap<String, AttachmentDownloadSession>,
     attachment_uploads: HashMap<String, AttachmentUploadSession>,
+    sync_in_flight: HashSet<String>,
 }
 
 struct AttachmentDownloadSession {
@@ -302,6 +303,7 @@ impl MailGoState {
             ready_oauth_credentials: HashMap::new(),
             attachment_downloads: HashMap::new(),
             attachment_uploads: HashMap::new(),
+            sync_in_flight: HashSet::new(),
         })
     }
 
@@ -336,6 +338,46 @@ impl MailGoState {
             "hideAds": self.state.hide_ads,
         })
     }
+}
+
+pub(crate) struct AccountSyncLease {
+    shared: Arc<Mutex<MailGoState>>,
+    account_id: String,
+}
+
+impl Drop for AccountSyncLease {
+    fn drop(&mut self) {
+        if let Ok(mut app) = self.shared.lock() {
+            app.sync_in_flight.remove(&self.account_id);
+        }
+    }
+}
+
+fn reserve_account_sync(app: &mut MailGoState, account_id: &str) -> Result<()> {
+    if !app
+        .state
+        .accounts
+        .iter()
+        .any(|account| account.id == account_id)
+    {
+        return Err(anyhow!("account not found"));
+    }
+    if !app.sync_in_flight.insert(account_id.to_string()) {
+        return Err(anyhow!("account sync is already in progress"));
+    }
+    Ok(())
+}
+
+pub(crate) fn try_begin_account_sync(
+    shared: &Arc<Mutex<MailGoState>>,
+    account_id: &str,
+) -> Result<AccountSyncLease> {
+    let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+    reserve_account_sync(&mut app, account_id)?;
+    Ok(AccountSyncLease {
+        shared: Arc::clone(shared),
+        account_id: account_id.to_string(),
+    })
 }
 
 fn app_data_dir() -> PathBuf {
@@ -1131,7 +1173,7 @@ fn handle_ipc(
                     authentication: optional_string_field(&message.payload, "authentication"),
                 };
                 let profile = profile_for_account(&new_account)?;
-                {
+                let account_is_existing = {
                     let app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                     if has_case_variant_account_id(&app.state.accounts, &id) {
                         return Err(anyhow!(
@@ -1152,7 +1194,13 @@ fn handle_ipc(
                             "MailGo supports at most {MAX_IMPORTED_ACCOUNTS} accounts"
                         ));
                     }
-                }
+                    app.state.accounts.iter().any(|account| account.id == id)
+                };
+                let _account_sync_lease = if account_is_existing {
+                    Some(try_begin_account_sync(shared, &id)?)
+                } else {
+                    None
+                };
 
                 let oauth_session_id = optional_string_field(&message.payload, "oauthSessionId");
                 let credential = if let Some(session_id) = oauth_session_id
@@ -1332,6 +1380,14 @@ fn handle_ipc(
                         "imported account id differs only by case from an existing account"
                     ));
                 }
+                if imported_accounts
+                    .iter()
+                    .any(|account| app.sync_in_flight.contains(&account.id))
+                {
+                    return Err(anyhow!(
+                        "one or more imported accounts are syncing; retry after synchronization finishes"
+                    ));
+                }
                 if !transfer_fits_account_capacity(&app.state.accounts, &incoming_ids) {
                     return Err(anyhow!(
                         "importing these accounts would exceed the {MAX_IMPORTED_ACCOUNTS}-account limit"
@@ -1385,6 +1441,11 @@ fn handle_ipc(
                     return Err(anyhow!("invalid account id"));
                 }
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                if app.sync_in_flight.contains(&id) {
+                    return Err(anyhow!(
+                        "account sync is in progress; retry account removal after it finishes"
+                    ));
+                }
                 let previous_accounts = app.state.accounts.clone();
                 let previous_folders = app.state.folder_names.clone();
                 let mut previous_credentials = vec![(id.clone(), snapshot_credential(&id)?)];
@@ -1475,8 +1536,8 @@ fn handle_ipc(
                         .iter()
                         .map(|record| record.account.id.clone())
                         .collect::<HashSet<_>>();
-                    {
-                        let app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                    let _sync_leases = {
+                        let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                         if records.iter().any(|record| {
                             has_case_variant_account_id(&app.state.accounts, &record.account.id)
                         }) {
@@ -1489,7 +1550,26 @@ fn handle_ipc(
                                 "importing these accounts would exceed the {MAX_IMPORTED_ACCOUNTS}-account limit"
                             ));
                         }
-                    }
+                        let existing_ids = records
+                            .iter()
+                            .filter(|record| {
+                                app.state
+                                    .accounts
+                                    .iter()
+                                    .any(|account| account.id == record.account.id)
+                            })
+                            .map(|record| record.account.id.clone())
+                            .collect::<Vec<_>>();
+                        let mut leases = Vec::with_capacity(existing_ids.len());
+                        for account_id in existing_ids {
+                            reserve_account_sync(&mut app, &account_id)?;
+                            leases.push(AccountSyncLease {
+                                shared: Arc::clone(shared),
+                                account_id,
+                            });
+                        }
+                        leases
+                    };
 
                     let mut previous = records
                         .iter()
@@ -1611,6 +1691,7 @@ fn handle_ipc(
                 ensure_network_allowed(shared)?;
                 let account_id = string_field(&message.payload, "accountId")?;
                 let account = account_for(shared, &account_id)?;
+                let _sync_lease = try_begin_account_sync(shared, &account_id)?;
                 let profile = match profile_for_account(&account) {
                     Ok(profile) => profile,
                     Err(error) => {
@@ -1682,6 +1763,7 @@ fn handle_ipc(
                     .unwrap_or(50)
                     .clamp(1, 100);
                 let account = account_for(shared, &account_id)?;
+                let _sync_lease = try_begin_account_sync(shared, &account_id)?;
                 let profile = match profile_for_account(&account) {
                     Ok(profile) => profile,
                     Err(error) => {
@@ -1759,6 +1841,16 @@ fn handle_ipc(
                         truncated = true;
                         break;
                     }
+                    let _sync_lease = match try_begin_account_sync(shared, &account.id) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            failed.push(json!({
+                                "accountId": account.id,
+                                "message": error.to_string(),
+                            }));
+                            continue;
+                        }
+                    };
                     let remaining = limit.saturating_sub(messages.len());
                     let profile = match profile_for_account(&account) {
                         Ok(profile) => profile,
@@ -1831,6 +1923,15 @@ fn handle_ipc(
                 let mut synced = Vec::new();
                 let mut failed = Vec::new();
                 for account in accounts {
+                    let _sync_lease = match try_begin_account_sync(shared, &account.id) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            failed.push(
+                                json!({ "accountId": account.id, "message": error.to_string() }),
+                            );
+                            continue;
+                        }
+                    };
                     let profile = match profile_for_account(&account) {
                         Ok(profile) => profile,
                         Err(error) => {
@@ -2610,6 +2711,7 @@ mod tests {
             )]),
             attachment_downloads: HashMap::new(),
             attachment_uploads: HashMap::new(),
+            sync_in_flight: HashSet::new(),
         };
         assert!(cancel_auth_session(&mut app, "session-1"));
         assert!(app.ready_oauth_credentials.is_empty());
@@ -2775,6 +2877,43 @@ mod tests {
             authentication: None,
         };
         assert!(has_case_variant_account_id(&[account], "account-1"));
+    }
+
+    #[test]
+    fn account_sync_lease_prevents_duplicate_work_and_releases_on_drop() {
+        let account = PersistedAccount {
+            id: "account-1".into(),
+            provider: "qq".into(),
+            label: "QQ".into(),
+            email: "person@example.invalid".into(),
+            unread: 0,
+            accent: "#111".into(),
+            status: "offline".into(),
+            last_sync: "never".into(),
+            imap_host: None,
+            imap_port: None,
+            imap_security: None,
+            smtp_host: None,
+            smtp_port: None,
+            smtp_security: None,
+            authentication: None,
+        };
+        let shared = Arc::new(Mutex::new(MailGoState {
+            state_path: PathBuf::new(),
+            state: PersistedState {
+                accounts: vec![account],
+                ..PersistedState::default()
+            },
+            auth_sessions: HashMap::new(),
+            ready_oauth_credentials: HashMap::new(),
+            attachment_downloads: HashMap::new(),
+            attachment_uploads: HashMap::new(),
+            sync_in_flight: HashSet::new(),
+        }));
+        let lease = try_begin_account_sync(&shared, "account-1").expect("first lease");
+        assert!(try_begin_account_sync(&shared, "account-1").is_err());
+        drop(lease);
+        assert!(try_begin_account_sync(&shared, "account-1").is_ok());
     }
 
     #[test]
