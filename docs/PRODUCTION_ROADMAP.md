@@ -65,6 +65,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 56. Compose now supports bounded image selection with local previews and generated safe CID references; native SMTP builds `multipart/related` HTML mail, while retryable sends preserve inline resources in the encrypted outbox.
 57. Medium desktop widths now move the authorization assistant into its existing drawer boundary and relax the reading-column minimum, eliminating horizontal overflow at 1280px and tighter laptop widths while keeping the four-pane large-screen layout.
 58. The desktop shell no longer imposes a 960px body minimum, so the responsive grid can honor the actual viewport before switching to the single-column mobile layout.
+59. Attachment upload metadata now rejects NUL and other unsafe control characters at the native IPC boundary, with regression coverage for file names, MIME types, and inline Content-ID values.
 
 ## Remaining production acceptance work
 

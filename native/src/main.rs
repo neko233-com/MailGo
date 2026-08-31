@@ -650,7 +650,7 @@ fn valid_upload_file_name(value: &str) -> Result<String> {
         || name == ".."
         || name
             .chars()
-            .any(|character| matches!(character, '\r' | '\n' | '/' | '\\'))
+            .any(|character| matches!(character, '\0' | '\r' | '\n' | '/' | '\\'))
     {
         return Err(anyhow!("invalid attachment file name"));
     }
@@ -664,7 +664,7 @@ fn valid_upload_content_type(value: Option<String>) -> Result<String> {
     if content_type.len() > 128
         || content_type
             .chars()
-            .any(|character| matches!(character, '\r' | '\n'))
+            .any(|character| matches!(character, '\0' | '\r' | '\n'))
     {
         return Err(anyhow!("invalid attachment content type"));
     }
@@ -2135,6 +2135,13 @@ mod tests {
         assert!(optional_bounded_string_field(&json!({}), "htmlBody", 5)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn upload_metadata_rejects_control_characters() {
+        assert!(valid_upload_file_name("image\0.png").is_err());
+        assert!(valid_upload_content_type(Some("image/png\0".into())).is_err());
+        assert!(valid_upload_content_id(Some("inline\r\nid".into())).is_err());
     }
 
     #[test]
