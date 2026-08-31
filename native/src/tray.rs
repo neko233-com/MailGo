@@ -3,7 +3,7 @@ mod windows_tray {
     use std::mem::{size_of, zeroed};
     use std::path::PathBuf;
     use std::ptr::null;
-    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
     use std::thread;
     use std::time::Duration;
 
@@ -17,11 +17,11 @@ mod windows_tray {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
         DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, PeekMessageW,
-        PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW,
-        ShowWindow, TrackPopupMenu, TranslateMessage, GWLP_WNDPROC, HWND_MESSAGE, IMAGE_ICON,
-        LR_LOADFROMFILE, MF_STRING, PM_REMOVE, SW_HIDE, SW_RESTORE, SW_SHOW, TPM_RIGHTALIGN,
-        WM_APP, WM_CLOSE, WM_COMMAND, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
-        WNDPROC,
+        PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
+        SetWindowLongPtrW, ShowWindow, TrackPopupMenu, TranslateMessage, GWLP_WNDPROC,
+        HWND_MESSAGE, IMAGE_ICON, LR_LOADFROMFILE, MF_STRING, PM_REMOVE, SW_HIDE, SW_RESTORE,
+        SW_SHOW, TPM_RIGHTALIGN, WM_APP, WM_CLOSE, WM_COMMAND, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
+        WM_RBUTTONUP, WNDCLASSW, WNDPROC,
     };
 
     const TRAY_CALLBACK: u32 = WM_APP + 73;
@@ -33,6 +33,8 @@ mod windows_tray {
 
     static TARGET_WINDOW: AtomicIsize = AtomicIsize::new(0);
     static TRAY_WINDOW: AtomicIsize = AtomicIsize::new(0);
+    static TRAY_ICON: AtomicIsize = AtomicIsize::new(0);
+    static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
     static PREVIOUS_WNDPROC: AtomicIsize = AtomicIsize::new(0);
     static MINIMIZE_TO_TRAY: AtomicBool = AtomicBool::new(true);
     static ALLOW_CLOSE: AtomicBool = AtomicBool::new(false);
@@ -79,6 +81,12 @@ mod windows_tray {
         if RegisterClassW(&class) == 0 {
             tracing::warn!("MailGo tray window class registration failed");
         }
+        let taskbar_created_name = "TaskbarCreated\0".encode_utf16().collect::<Vec<_>>();
+        let taskbar_created = RegisterWindowMessageW(taskbar_created_name.as_ptr());
+        if taskbar_created == 0 {
+            tracing::warn!("MailGo could not register the TaskbarCreated notification");
+        }
+        TASKBAR_CREATED.store(taskbar_created, Ordering::Release);
 
         let tray_window = CreateWindowExW(
             0,
@@ -101,14 +109,8 @@ mod windows_tray {
         TRAY_WINDOW.store(tray_window, Ordering::Release);
 
         let icon = load_icon();
-        let mut notification: NOTIFYICONDATAW = zeroed();
-        notification.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
-        notification.hWnd = tray_window;
-        notification.uID = TRAY_ID;
-        notification.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-        notification.uCallbackMessage = TRAY_CALLBACK;
-        notification.hIcon = icon;
-        copy_tip(&mut notification.szTip, "MailGo");
+        TRAY_ICON.store(icon as isize, Ordering::Release);
+        let notification = tray_notification(tray_window);
         if Shell_NotifyIconW(NIM_ADD, &notification) == 0 {
             tracing::warn!("MailGo tray icon could not be registered");
         }
@@ -121,6 +123,8 @@ mod windows_tray {
                 if message.message == windows_sys::Win32::UI::WindowsAndMessaging::WM_QUIT {
                     Shell_NotifyIconW(NIM_DELETE, &notification);
                     TRAY_WINDOW.store(0, Ordering::Release);
+                    TRAY_ICON.store(0, Ordering::Release);
+                    TASKBAR_CREATED.store(0, Ordering::Release);
                     DestroyWindow(tray_window);
                     return;
                 }
@@ -158,6 +162,18 @@ mod windows_tray {
             PREVIOUS_WNDPROC.store(previous, Ordering::SeqCst);
             tracing::info!("MailGo tray lifecycle attached to the main window");
         }
+    }
+
+    unsafe fn tray_notification(hwnd: HWND) -> NOTIFYICONDATAW {
+        let mut notification: NOTIFYICONDATAW = zeroed();
+        notification.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+        notification.hWnd = hwnd;
+        notification.uID = TRAY_ID;
+        notification.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        notification.uCallbackMessage = TRAY_CALLBACK;
+        notification.hIcon = TRAY_ICON.load(Ordering::Acquire) as _;
+        copy_tip(&mut notification.szTip, "MailGo");
+        notification
     }
 
     unsafe fn load_icon() -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
@@ -223,7 +239,10 @@ mod windows_tray {
             copy_text(&mut notification.szInfoTitle, title);
             copy_text(&mut notification.szInfo, message);
             notification.dwInfoFlags = NIIF_INFO;
-            Shell_NotifyIconW(NIM_MODIFY, &notification);
+            if Shell_NotifyIconW(NIM_MODIFY, &notification) == 0 {
+                let restored = tray_notification(hwnd);
+                Shell_NotifyIconW(NIM_ADD, &restored);
+            }
         }
     }
 
@@ -265,6 +284,14 @@ mod windows_tray {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        let taskbar_created = TASKBAR_CREATED.load(Ordering::Acquire);
+        if taskbar_created != 0 && message == taskbar_created {
+            let notification = tray_notification(hwnd);
+            if Shell_NotifyIconW(NIM_ADD, &notification) == 0 {
+                tracing::warn!("MailGo tray icon could not be restored after taskbar restart");
+            }
+            return 0;
+        }
         if message == TRAY_CALLBACK {
             match lparam as u32 {
                 WM_LBUTTONUP | WM_LBUTTONDBLCLK => show_main_window(),

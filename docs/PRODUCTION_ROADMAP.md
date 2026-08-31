@@ -71,6 +71,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 62. Windows ZIP packaging now writes entries in stable lexical order with a fixed DOS-compatible timestamp, making repeated local builds byte-identical when their inputs are unchanged.
 63. The packaged renderer no longer depends on remote web fonts, and the Windows packaging gate rejects Google Fonts references so offline startup does not create an implicit font-network dependency.
 64. HTML rendering now suppresses HTTPS image requests while only-offline mode is active, even when the persistent remote-image preference is enabled; same-message CID images remain available.
+65. The Windows tray window listens for the system `TaskbarCreated` broadcast and re-adds the MailGo icon after Explorer restarts; failed notification updates also attempt a safe re-registration.
 
 ## Remaining production acceptance work
 
