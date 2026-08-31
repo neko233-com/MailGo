@@ -110,6 +110,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 101. Server-wide IMAP search and full-message downloads now use bounded read-only retries with the same transport/rate-limit backoff as mailbox synchronization; mutating commands remain single-attempt to avoid replaying a command after an ambiguous timeout.
 102. MIME `Content-ID` values are now bounded and syntax-filtered before entering cache metadata, while inline `cid:` image references resolve case-insensitively across common provider/client formatting differences.
 103. Account onboarding now commits the local account immediately and closes the dialog before the first remote sync; the initial IMAP fetch, mailbox hydration, and queue telemetry continue asynchronously while the new account remains visible as `syncing`.
+104. New account creation and both configuration-import paths now reject duplicate mailbox identities under different account IDs, and imports can no longer repurpose an existing ID for another mailbox; reauthorization and multiple distinct QQ mailboxes remain supported, with the renderer checking duplicates before optimistic state changes.
 
 ## Remaining production acceptance work
 

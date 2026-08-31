@@ -755,7 +755,7 @@ fn has_case_variant_account_id(accounts: &[PersistedAccount], id: &str) -> bool 
 fn account_identity_matches(existing: &PersistedAccount, proposed: &PersistedAccount) -> bool {
     existing.provider.eq_ignore_ascii_case(&proposed.provider)
         && existing.email.eq_ignore_ascii_case(&proposed.email)
-        && (existing.provider != "other"
+        && (!existing.provider.eq_ignore_ascii_case("other")
             || (existing
                 .imap_host
                 .as_deref()
@@ -778,6 +778,35 @@ fn account_identity_matches(existing: &PersistedAccount, proposed: &PersistedAcc
                     .as_deref()
                     .unwrap_or_default()
                     .eq_ignore_ascii_case(proposed.smtp_security.as_deref().unwrap_or_default())))
+}
+
+fn has_new_mailbox_identity_conflict(
+    existing: &[PersistedAccount],
+    incoming: &[PersistedAccount],
+) -> bool {
+    incoming.iter().enumerate().any(|(index, proposed)| {
+        if existing.iter().any(|account| account.id == proposed.id) {
+            return false;
+        }
+        existing
+            .iter()
+            .any(|account| account_identity_matches(account, proposed))
+            || incoming[..index]
+                .iter()
+                .any(|account| account_identity_matches(account, proposed))
+    })
+}
+
+fn has_existing_account_identity_change(
+    existing: &[PersistedAccount],
+    incoming: &[PersistedAccount],
+) -> bool {
+    incoming.iter().any(|proposed| {
+        existing
+            .iter()
+            .find(|account| account.id == proposed.id)
+            .is_some_and(|account| !account_identity_matches(account, proposed))
+    })
 }
 
 fn validate_transfer_account(account: &transfer::TransferAccount) -> Result<()> {
@@ -1189,6 +1218,14 @@ fn handle_ipc(
                             ));
                         }
                     }
+                    if has_new_mailbox_identity_conflict(
+                        &app.state.accounts,
+                        std::slice::from_ref(&new_account),
+                    ) {
+                        return Err(anyhow!(
+                            "mailbox is already configured under another account"
+                        ));
+                    }
                     if !account_capacity_available(&app.state.accounts, &id) {
                         return Err(anyhow!(
                             "MailGo supports at most {MAX_IMPORTED_ACCOUNTS} accounts"
@@ -1380,6 +1417,16 @@ fn handle_ipc(
                         "imported account id differs only by case from an existing account"
                     ));
                 }
+                if has_existing_account_identity_change(&app.state.accounts, &imported_accounts) {
+                    return Err(anyhow!(
+                        "imported account identity differs from the existing mailbox"
+                    ));
+                }
+                if has_new_mailbox_identity_conflict(&app.state.accounts, &imported_accounts) {
+                    return Err(anyhow!(
+                        "one or more imported mailboxes are already configured"
+                    ));
+                }
                 if imported_accounts
                     .iter()
                     .any(|account| app.sync_in_flight.contains(&account.id))
@@ -1543,6 +1590,26 @@ fn handle_ipc(
                         }) {
                             return Err(anyhow!(
                                 "imported account id differs only by case from an existing account"
+                            ));
+                        }
+                        let imported_accounts = records
+                            .iter()
+                            .map(|record| record.account.clone())
+                            .collect::<Vec<_>>();
+                        if has_existing_account_identity_change(
+                            &app.state.accounts,
+                            &imported_accounts,
+                        ) {
+                            return Err(anyhow!(
+                                "imported account identity differs from the existing mailbox"
+                            ));
+                        }
+                        if has_new_mailbox_identity_conflict(
+                            &app.state.accounts,
+                            &imported_accounts,
+                        ) {
+                            return Err(anyhow!(
+                                "one or more imported mailboxes are already configured"
                             ));
                         }
                         if !transfer_fits_account_capacity(&app.state.accounts, &incoming_ids) {
@@ -2868,6 +2935,64 @@ mod tests {
         changed.email = existing.email.clone();
         changed.label = "New label".into();
         assert!(account_identity_matches(&existing, &changed));
+
+        let mut duplicate = existing.clone();
+        duplicate.id = "account-2".into();
+        assert!(has_new_mailbox_identity_conflict(
+            std::slice::from_ref(&existing),
+            std::slice::from_ref(&duplicate)
+        ));
+
+        duplicate.email = "another@example.invalid".into();
+        assert!(!has_new_mailbox_identity_conflict(
+            std::slice::from_ref(&existing),
+            std::slice::from_ref(&duplicate)
+        ));
+
+        let mut replacement = existing.clone();
+        replacement.label = "Replacement".into();
+        assert!(!has_new_mailbox_identity_conflict(
+            std::slice::from_ref(&existing),
+            std::slice::from_ref(&replacement)
+        ));
+        assert!(!has_existing_account_identity_change(
+            std::slice::from_ref(&existing),
+            std::slice::from_ref(&replacement)
+        ));
+
+        replacement.email = "changed@example.invalid".into();
+        assert!(has_existing_account_identity_change(
+            std::slice::from_ref(&existing),
+            std::slice::from_ref(&replacement)
+        ));
+    }
+
+    #[test]
+    fn custom_mailboxes_with_different_servers_are_distinct() {
+        let existing = PersistedAccount {
+            id: "custom-1".into(),
+            provider: "other".into(),
+            label: "Custom".into(),
+            email: "person@example.invalid".into(),
+            unread: 0,
+            accent: "#111".into(),
+            status: "offline".into(),
+            last_sync: "never".into(),
+            imap_host: Some("imap-one.example.invalid".into()),
+            imap_port: Some(993),
+            imap_security: Some("tls".into()),
+            smtp_host: Some("smtp-one.example.invalid".into()),
+            smtp_port: Some(465),
+            smtp_security: Some("tls".into()),
+            authentication: Some("password".into()),
+        };
+        let mut proposed = existing.clone();
+        proposed.id = "custom-2".into();
+        proposed.imap_host = Some("imap-two.example.invalid".into());
+        assert!(!account_identity_matches(&existing, &proposed));
+
+        proposed.imap_host = existing.imap_host.clone();
+        assert!(account_identity_matches(&existing, &proposed));
     }
 
     #[test]
