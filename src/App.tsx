@@ -1447,7 +1447,11 @@ function App() {
         const synced = result.synced?.find((item) => item.accountId === account.id)
         const failed = result.failed?.find((item) => item.accountId === account.id)
         if (synced) return { ...account, unread: synced.unread, status: 'synced' as const, lastSync: '刚刚同步' }
-        if (failed) return { ...account, status: failed.message.includes('authorization') ? 'needs-auth' as const : 'offline' as const, lastSync: failed.message.includes('authorization') ? '等待重新授权' : '同步失败，可重试' }
+        if (failed && /already in progress/i.test(failed.message)) return { ...account, status: 'syncing' as const, lastSync: '后台同步中…' }
+        if (failed) {
+          const needsAuth = /auth|credential|login|password|authorization/i.test(failed.message)
+          return { ...account, status: needsAuth ? 'needs-auth' as const : 'offline' as const, lastSync: needsAuth ? '等待重新授权' : '同步失败，可重试' }
+        }
         return account
       }))
       if (result.failed?.length) pushToast(`${result.synced?.length ?? 0} 个账户已同步，${result.failed.length} 个需要处理`, 'info')
@@ -1513,6 +1517,10 @@ function App() {
       pushToast(`${account.label} 已完成首次同步`, 'success')
     } catch (error) {
       const message = error instanceof Error ? error.message : ''
+      if (/already in progress/i.test(message)) {
+        pushToast(`${account.label} 正在同步`, 'info')
+        return
+      }
       const needsAuth = /auth|credential|login|password|authorization/i.test(message)
       setAccounts((current) => current.map((item) => item.id === account.id
         ? { ...item, status: needsAuth ? 'needs-auth' as const : 'offline' as const, lastSync: needsAuth ? '等待重新授权' : '首次同步失败，可重试' }
@@ -1656,7 +1664,7 @@ function App() {
       unread: 0,
       accent: selectedProvider.accent,
       status: 'syncing',
-      lastSync: '正在同步…',
+      lastSync: '后台同步中…',
       authentication: customAuthentication,
       ...(provider === 'other' ? {
         imapHost: customImapHost.trim(),
