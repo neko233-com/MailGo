@@ -51,6 +51,35 @@ pub fn classify(sender: &str, subject: &str, has_list_unsubscribe: bool) -> Clas
     ]
     .iter()
     .any(|term| subject.contains(term));
+    let apple_connect_sender = apple_sender
+        && [
+            "appstoreconnect.apple.com",
+            "itunesconnect.apple.com",
+            "developer.apple.com",
+            "testflight.apple.com",
+        ]
+        .iter()
+        .any(|domain| sender_domain == *domain || sender_domain.ends_with(&format!(".{domain}")));
+    let apple_ads_sender = apple_sender
+        && ["ads.apple.com", "searchads.apple.com"]
+            .iter()
+            .any(|domain| {
+                sender_domain == *domain || sender_domain.ends_with(&format!(".{domain}"))
+            });
+    let apple_connect_subject = [
+        "app store connect",
+        "testflight",
+        "app review",
+        "sales and trends",
+        "app analytics",
+        "开发者",
+        "审核",
+    ]
+    .iter()
+    .any(|term| subject.contains(term));
+    let apple_ads_subject = ["apple ads", "search ads", "campaign", "广告系列", "广告"]
+        .iter()
+        .any(|term| subject.contains(term));
 
     if apple_sender && security_subject {
         return Classification {
@@ -59,11 +88,21 @@ pub fn classify(sender: &str, subject: &str, has_list_unsubscribe: bool) -> Clas
             confidence: 98,
         };
     }
-    if apple_sender && marketing_subject {
+    if apple_ads_sender
+        || (apple_sender && apple_ads_subject)
+        || (apple_sender && marketing_subject)
+    {
         return Classification {
             category: SmartCategory::AppleAds,
             is_ad: true,
             confidence: 96,
+        };
+    }
+    if apple_connect_sender || (apple_sender && apple_connect_subject) {
+        return Classification {
+            category: SmartCategory::AppleConnect,
+            is_ad: false,
+            confidence: 94,
         };
     }
 
@@ -117,6 +156,24 @@ mod tests {
     #[test]
     fn marks_marketing_mail_as_advertising() {
         let result = classify("news@apple.com", "Discover what is new this month", true);
+        assert_eq!(result.category, SmartCategory::AppleAds);
+        assert!(result.is_ad);
+    }
+
+    #[test]
+    fn classifies_official_app_store_connect_mail_without_generic_keywords() {
+        let result = classify(
+            "noreply@appstoreconnect.apple.com",
+            "Your report is ready",
+            false,
+        );
+        assert_eq!(result.category, SmartCategory::AppleConnect);
+        assert!(!result.is_ad);
+    }
+
+    #[test]
+    fn classifies_apple_ads_sender_as_advertising() {
+        let result = classify("updates@searchads.apple.com", "Account update", false);
         assert_eq!(result.category, SmartCategory::AppleAds);
         assert!(result.is_ad);
     }

@@ -90,6 +90,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 81. The per-user rdesktop updater now places Cargo build artifacts under the already validated `%LOCALAPPDATA%\MailGo\cargo-target` root, avoiding temporary-directory application-control failures while preserving exact upstream HEAD installation.
 82. Native users can move a message from the reading menu into any discovered server folder, including provider-mapped system folders; the target list is deduplicated and current-folder aware, while the existing UID-based offline queue handles replay.
 83. The documented native smoke command now launches the Release shell, while the development build remains available separately; this avoids Windows application-control policies rejecting the Debug binary during packaged-startup verification.
+84. Local smart classification now recognizes official App Store Connect, Developer, TestFlight, Apple Ads, and Search Ads subdomains before falling back to Apple-specific subject signals; security notices remain higher priority and advertising classification stays opt-in to hiding.
 
 ## Remaining production acceptance work
 
