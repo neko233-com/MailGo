@@ -171,9 +171,7 @@ fn sanitize_folder_names(folder_names: &[String]) -> Vec<String> {
     for folder in folder_names {
         if folder.trim().is_empty()
             || folder.len() > 512
-            || folder
-                .chars()
-                .any(|character| matches!(character, '\r' | '\n'))
+            || folder.chars().any(char::is_control)
             || normalized
                 .iter()
                 .any(|known: &String| known.eq_ignore_ascii_case(folder))
@@ -211,11 +209,12 @@ fn sanitize_persisted_accounts(accounts: Vec<PersistedAccount>) -> Vec<Persisted
     accounts
         .into_iter()
         .filter(|account| {
+            let normalized_id = account.id.to_ascii_lowercase();
             valid_account_id(&account.id)
                 && account.label.len() <= MAX_ACCOUNT_LABEL_LENGTH
                 && providers::validate_email(&account.email).is_ok()
                 && profile_for_account(account).is_ok()
-                && seen_ids.insert(account.id.clone())
+                && seen_ids.insert(normalized_id)
         })
         .take(MAX_IMPORTED_ACCOUNTS)
         .collect()
@@ -669,13 +668,74 @@ fn optional_u16_field(payload: &Value, name: &str) -> Option<u16> {
 }
 
 fn valid_account_id(value: &str) -> bool {
+    let stem = value.split('.').next().unwrap_or_default();
     !value.is_empty()
         && value != "."
         && value != ".."
         && value.len() <= MAX_ACCOUNT_ID_LENGTH
+        && !value.ends_with('.')
+        && !matches!(
+            stem.to_ascii_lowercase().as_str(),
+            "con"
+                | "prn"
+                | "aux"
+                | "nul"
+                | "com1"
+                | "com2"
+                | "com3"
+                | "com4"
+                | "com5"
+                | "com6"
+                | "com7"
+                | "com8"
+                | "com9"
+                | "lpt1"
+                | "lpt2"
+                | "lpt3"
+                | "lpt4"
+                | "lpt5"
+                | "lpt6"
+                | "lpt7"
+                | "lpt8"
+                | "lpt9"
+        )
         && value.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
         })
+}
+
+fn has_case_variant_account_id(accounts: &[PersistedAccount], id: &str) -> bool {
+    accounts
+        .iter()
+        .any(|account| account.id != id && account.id.eq_ignore_ascii_case(id))
+}
+
+fn account_identity_matches(existing: &PersistedAccount, proposed: &PersistedAccount) -> bool {
+    existing.provider.eq_ignore_ascii_case(&proposed.provider)
+        && existing.email.eq_ignore_ascii_case(&proposed.email)
+        && (existing.provider != "other"
+            || (existing
+                .imap_host
+                .as_deref()
+                .unwrap_or_default()
+                .eq_ignore_ascii_case(proposed.imap_host.as_deref().unwrap_or_default())
+                && existing.imap_port == proposed.imap_port
+                && existing
+                    .imap_security
+                    .as_deref()
+                    .unwrap_or_default()
+                    .eq_ignore_ascii_case(proposed.imap_security.as_deref().unwrap_or_default())
+                && existing
+                    .smtp_host
+                    .as_deref()
+                    .unwrap_or_default()
+                    .eq_ignore_ascii_case(proposed.smtp_host.as_deref().unwrap_or_default())
+                && existing.smtp_port == proposed.smtp_port
+                && existing
+                    .smtp_security
+                    .as_deref()
+                    .unwrap_or_default()
+                    .eq_ignore_ascii_case(proposed.smtp_security.as_deref().unwrap_or_default())))
 }
 
 fn validate_transfer_account(account: &transfer::TransferAccount) -> Result<()> {
@@ -823,7 +883,11 @@ fn transfer_fits_account_capacity(
 ) -> bool {
     let retained = existing
         .iter()
-        .filter(|account| !incoming_ids.contains(&account.id))
+        .filter(|account| {
+            !incoming_ids
+                .iter()
+                .any(|incoming| incoming.eq_ignore_ascii_case(&account.id))
+        })
         .count();
     retained.saturating_add(incoming_ids.len()) <= MAX_IMPORTED_ACCOUNTS
 }
@@ -960,7 +1024,7 @@ fn handle_ipc(
             "auth.start" => {
                 let provider =
                     providers::ProviderKind::parse(&string_field(&message.payload, "provider")?)?;
-                let email = string_field(&message.payload, "email")?;
+                let email = string_field(&message.payload, "email")?.trim().to_string();
                 providers::validate_email(&email)?;
                 {
                     let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
@@ -1069,6 +1133,20 @@ fn handle_ipc(
                 let profile = profile_for_account(&new_account)?;
                 {
                     let app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                    if has_case_variant_account_id(&app.state.accounts, &id) {
+                        return Err(anyhow!(
+                            "account id differs only by case from an existing account"
+                        ));
+                    }
+                    if let Some(existing) =
+                        app.state.accounts.iter().find(|account| account.id == id)
+                    {
+                        if !account_identity_matches(existing, &new_account) {
+                            return Err(anyhow!(
+                                "account identity is fixed; remove the account and add it again to change mailbox"
+                            ));
+                        }
+                    }
                     if !account_capacity_available(&app.state.accounts, &id) {
                         return Err(anyhow!(
                             "MailGo supports at most {MAX_IMPORTED_ACCOUNTS} accounts"
@@ -1194,7 +1272,7 @@ fn handle_ipc(
                     if !valid_account_id(id)
                         || label.len() > MAX_ACCOUNT_LABEL_LENGTH
                         || providers::validate_email(email).is_err()
-                        || !seen_ids.insert(id.to_string())
+                        || !seen_ids.insert(id.to_ascii_lowercase())
                     {
                         continue;
                     }
@@ -1246,6 +1324,14 @@ fn handle_ipc(
                     .map(|account| account.id.clone())
                     .collect::<HashSet<_>>();
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                if imported_accounts
+                    .iter()
+                    .any(|account| has_case_variant_account_id(&app.state.accounts, &account.id))
+                {
+                    return Err(anyhow!(
+                        "imported account id differs only by case from an existing account"
+                    ));
+                }
                 if !transfer_fits_account_capacity(&app.state.accounts, &incoming_ids) {
                     return Err(anyhow!(
                         "importing these accounts would exceed the {MAX_IMPORTED_ACCOUNTS}-account limit"
@@ -1380,7 +1466,7 @@ fn handle_ipc(
                     let mut seen = HashSet::new();
                     for record in &records {
                         validate_transfer_account(record)?;
-                        if !seen.insert(record.account.id.clone()) {
+                        if !seen.insert(record.account.id.to_ascii_lowercase()) {
                             return Err(anyhow!("duplicate account in encrypted bundle"));
                         }
                     }
@@ -1391,6 +1477,13 @@ fn handle_ipc(
                         .collect::<HashSet<_>>();
                     {
                         let app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                        if records.iter().any(|record| {
+                            has_case_variant_account_id(&app.state.accounts, &record.account.id)
+                        }) {
+                            return Err(anyhow!(
+                                "imported account id differs only by case from an existing account"
+                            ));
+                        }
                         if !transfer_fits_account_capacity(&app.state.accounts, &incoming_ids) {
                             return Err(anyhow!(
                                 "importing these accounts would exceed the {MAX_IMPORTED_ACCOUNTS}-account limit"
@@ -2630,7 +2723,58 @@ mod tests {
     fn account_ids_cannot_escape_the_cache_root() {
         assert!(!valid_account_id("."));
         assert!(!valid_account_id(".."));
+        assert!(!valid_account_id("CON"));
+        assert!(!valid_account_id("mailbox."));
         assert!(valid_account_id("qq-account-1"));
+    }
+
+    #[test]
+    fn account_identity_cannot_be_reused_for_another_mailbox() {
+        let existing = PersistedAccount {
+            id: "account-1".into(),
+            provider: "qq".into(),
+            label: "QQ".into(),
+            email: "person@example.invalid".into(),
+            unread: 0,
+            accent: "#111".into(),
+            status: "offline".into(),
+            last_sync: "never".into(),
+            imap_host: None,
+            imap_port: None,
+            imap_security: None,
+            smtp_host: None,
+            smtp_port: None,
+            smtp_security: None,
+            authentication: Some("app-password".into()),
+        };
+        let mut changed = existing.clone();
+        changed.email = "other@example.invalid".into();
+        assert!(!account_identity_matches(&existing, &changed));
+        changed.email = existing.email.clone();
+        changed.label = "New label".into();
+        assert!(account_identity_matches(&existing, &changed));
+    }
+
+    #[test]
+    fn account_ids_are_compared_case_insensitively() {
+        let account = PersistedAccount {
+            id: "Account-1".into(),
+            provider: "qq".into(),
+            label: "QQ".into(),
+            email: "person@example.invalid".into(),
+            unread: 0,
+            accent: "#111".into(),
+            status: "offline".into(),
+            last_sync: "never".into(),
+            imap_host: None,
+            imap_port: None,
+            imap_security: None,
+            smtp_host: None,
+            smtp_port: None,
+            smtp_security: None,
+            authentication: None,
+        };
+        assert!(has_case_variant_account_id(&[account], "account-1"));
     }
 
     #[test]
@@ -2701,6 +2845,7 @@ mod tests {
                     {"id":"..","provider":"qq","label":"bad","email":"bad@example.invalid","unread":0,"accent":"#111","status":"offline","lastSync":"never"},
                     {"id":"safe","provider":"qq","label":"first","email":"first@example.invalid","unread":0,"accent":"#111","status":"offline","lastSync":"never"},
                     {"id":"safe","provider":"qq","label":"duplicate","email":"second@example.invalid","unread":0,"accent":"#222","status":"offline","lastSync":"never"},
+                    {"id":"SAFE","provider":"qq","label":"case duplicate","email":"third@example.invalid","unread":0,"accent":"#222","status":"offline","lastSync":"never"},
                     {"id":"unsafe","provider":"other","label":"bad custom","email":"custom@example.invalid","unread":0,"accent":"#333","status":"offline","lastSync":"never","imapHost":"bad host","imapPort":993,"smtpHost":"smtp.example.invalid","smtpPort":465}
                 ]
             }"##,

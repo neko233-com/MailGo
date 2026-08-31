@@ -11,6 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use imap::types::{Flag, UnsolicitedResponse};
 use native_tls::{TlsConnector, TlsStream};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::mail::{parse_full, parse_header, CachedMailbox, CachedMessage};
 use crate::providers::{Authentication, ProviderProfile, TransportSecurity};
@@ -1392,6 +1393,13 @@ pub fn fetch_message(
     validate_mailbox_name(folder)?;
     let mut session = authenticate(&profile, email, credential)?;
     session.select(folder)?;
+    let size_probe = session.uid_fetch(uid.to_string(), "UID RFC822.SIZE")?;
+    let advertised_size = size_probe
+        .iter()
+        .next()
+        .and_then(|item| item.size)
+        .ok_or_else(|| anyhow!("message UID {uid} did not include RFC822.SIZE"))?;
+    validate_advertised_message_size(advertised_size)?;
     let fetched = session.uid_fetch(uid.to_string(), FULL_FETCH_QUERY)?;
     let item = fetched
         .iter()
@@ -1413,6 +1421,16 @@ pub fn fetch_message(
     Ok(MailDetail { message })
 }
 
+fn validate_advertised_message_size(size: u32) -> Result<()> {
+    if size as usize > crate::mail::MAX_FULL_MESSAGE_BYTES {
+        return Err(anyhow!(
+            "message is larger than the {0} MiB safety limit",
+            crate::mail::MAX_FULL_MESSAGE_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(())
+}
+
 fn store_attachment_payloads(
     cache_root: &Path,
     account_id: &str,
@@ -1427,7 +1445,7 @@ fn store_attachment_payloads(
     let directory = cache_root
         .join(safe_component(account_id))
         .join("attachments")
-        .join(safe_component(folder));
+        .join(cache_folder_component(folder));
     fs::create_dir_all(&directory).with_context(|| format!("create {}", directory.display()))?;
     for (index, payload) in payloads.iter().enumerate() {
         let path = directory.join(format!("{uid}-{index}.bin"));
@@ -1471,10 +1489,23 @@ pub fn load_attachment_data(
     let path = cache_root
         .join(safe_component(account_id))
         .join("attachments")
-        .join(safe_component(folder))
+        .join(cache_folder_component(folder))
         .join(format!("{uid}-{index}.bin"));
-    let encrypted =
-        fs::read(&path).with_context(|| format!("read attachment {}", path.display()))?;
+    let encrypted = match fs::read(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let legacy_path = cache_root
+                .join(safe_component(account_id))
+                .join("attachments")
+                .join(legacy_folder_component(folder))
+                .join(format!("{uid}-{index}.bin"));
+            fs::read(&legacy_path)
+                .with_context(|| format!("read attachment {}", legacy_path.display()))?
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("read attachment {}", path.display()))
+        }
+    };
     let bytes = unprotect_cache(&encrypted).context("decrypt cached attachment")?;
     Ok(AttachmentData {
         file_name: metadata.file_name.clone(),
@@ -1495,6 +1526,11 @@ pub fn load_mailbox_for_folder(
         (encrypted_path.clone(), true),
         (encrypted_path.with_extension("bin.bak"), true),
     ];
+    let legacy_path = directory.join(legacy_cache_file_name(folder));
+    if legacy_path != encrypted_path {
+        candidates.push((legacy_path.clone(), true));
+        candidates.push((legacy_path.with_extension("bin.bak"), true));
+    }
     if folder.eq_ignore_ascii_case("INBOX") {
         let legacy_path = directory.join("inbox.json");
         candidates.push((legacy_path.clone(), false));
@@ -1756,12 +1792,7 @@ fn remove_cached_message_unlocked(
 }
 
 fn validate_mailbox_name(name: &str) -> Result<()> {
-    if name.trim().is_empty()
-        || name.len() > 512
-        || name
-            .chars()
-            .any(|character| matches!(character, '\r' | '\n'))
-    {
+    if name.trim().is_empty() || name.len() > 512 || name.chars().any(char::is_control) {
         return Err(anyhow!("invalid destination mailbox"));
     }
     Ok(())
@@ -2529,6 +2560,29 @@ fn safe_component(value: &str) -> String {
     }
 }
 
+fn hashed_component(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+/// Folder cache paths use a content-addressed key. IMAP folder names can contain arbitrary
+/// Unicode and punctuation, so lossy replacement is not sufficient: two distinct names must
+/// never share a cache file or attachment directory.
+fn cache_folder_component(folder: &str) -> String {
+    if folder.eq_ignore_ascii_case("INBOX") {
+        "INBOX".into()
+    } else {
+        format!("folder-{}", hashed_component(folder))
+    }
+}
+
+fn legacy_folder_component(folder: &str) -> String {
+    safe_component(folder)
+}
+
 fn now_stamp() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2538,6 +2592,14 @@ fn now_stamp() -> String {
 }
 
 fn cache_file_name(folder: &str) -> String {
+    if folder.eq_ignore_ascii_case("INBOX") {
+        CACHE_FILE.into()
+    } else {
+        format!("folder_{}.bin", hashed_component(folder))
+    }
+}
+
+fn legacy_cache_file_name(folder: &str) -> String {
     if folder.eq_ignore_ascii_case("INBOX") {
         CACHE_FILE.into()
     } else {
@@ -2587,11 +2649,7 @@ fn discover_folders(
 }
 
 fn is_safe_discovered_folder(name: &str) -> bool {
-    name.trim().len() <= 512
-        && !name.trim().is_empty()
-        && !name
-            .chars()
-            .any(|character| matches!(character, '\r' | '\n'))
+    name.trim().len() <= 512 && !name.trim().is_empty() && !name.chars().any(char::is_control)
 }
 
 fn folders_for(provider: crate::providers::ProviderKind) -> Vec<&'static str> {
@@ -2718,6 +2776,24 @@ mod tests {
     }
 
     #[test]
+    fn folder_cache_keys_do_not_collide_after_normalization() {
+        assert_ne!(
+            cache_file_name("Projects/2026"),
+            cache_file_name("Projects\\2026")
+        );
+        assert_ne!(
+            cache_file_name("团队收件箱"),
+            cache_file_name("团队_收件箱")
+        );
+        assert_ne!(
+            cache_folder_component("Projects/2026"),
+            cache_folder_component("Projects\\2026")
+        );
+        assert_eq!(cache_file_name("INBOX"), cache_file_name("inbox"));
+        assert!(cache_file_name("Projects/2026").starts_with("folder_"));
+    }
+
+    #[test]
     fn removing_account_cache_is_scoped_and_idempotent() {
         let root =
             std::env::temp_dir().join(format!("mailgo-sync-cache-test-{}", std::process::id()));
@@ -2785,6 +2861,15 @@ mod tests {
     }
 
     #[test]
+    fn advertised_message_size_is_rejected_before_full_fetch() {
+        assert!(validate_advertised_message_size(1024).is_ok());
+        assert!(
+            validate_advertised_message_size((crate::mail::MAX_FULL_MESSAGE_BYTES + 1) as u32)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn incremental_fetch_query_adds_vanished_only_for_qresync() {
         assert_eq!(
             delta_fetch_query(IncrementalMode::Condstore, 42),
@@ -2847,6 +2932,7 @@ mod tests {
         assert!(is_safe_discovered_folder("Projects/2026"));
         assert!(is_safe_discovered_folder("团队收件箱"));
         assert!(!is_safe_discovered_folder("Contacts\r\nUID FETCH 1 ALL"));
+        assert!(!is_safe_discovered_folder("Drafts\0shadow"));
         assert!(!is_safe_discovered_folder(""));
     }
 
@@ -2855,6 +2941,7 @@ mod tests {
         assert!(validate_mailbox_name("INBOX").is_ok());
         assert!(validate_mailbox_name("Sent Items").is_ok());
         assert!(validate_mailbox_name("INBOX\r\nUID FETCH 1 ALL").is_err());
+        assert!(validate_mailbox_name("Drafts\0shadow").is_err());
         assert!(validate_mailbox_name("").is_err());
     }
 

@@ -197,10 +197,60 @@ fn validate_host(host: &str, protocol: &str) -> Result<()> {
 
 pub fn validate_email(email: &str) -> Result<()> {
     let trimmed = email.trim();
+    if trimmed.len() > 320
+        || trimmed
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(anyhow!("invalid email address"));
+    }
     let (local, domain) = trimmed
         .split_once('@')
         .ok_or_else(|| anyhow!("invalid email address"))?;
-    if local.is_empty() || domain.is_empty() || !domain.contains('.') || trimmed.len() > 320 {
+    if local.is_empty()
+        || local.len() > 64
+        || domain.is_empty()
+        || domain.len() > 255
+        || domain.split('@').count() != 1
+        || !domain.contains('.')
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+        || !local.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(
+                    character,
+                    '!' | '#'
+                        | '$'
+                        | '%'
+                        | '&'
+                        | '\''
+                        | '*'
+                        | '+'
+                        | '-'
+                        | '/'
+                        | '='
+                        | '?'
+                        | '^'
+                        | '_'
+                        | '`'
+                        | '{'
+                        | '|'
+                        | '}'
+                        | '~'
+                        | '.'
+                )
+        })
+        || !domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        })
+    {
         return Err(anyhow!("invalid email address"));
     }
     Ok(())
@@ -229,8 +279,14 @@ mod tests {
     #[test]
     fn email_validation_rejects_unsafe_shapes() {
         assert!(validate_email("person@example.com").is_ok());
+        assert!(validate_email("person+tag@example.com").is_ok());
         assert!(validate_email("missing-at").is_err());
         assert!(validate_email("@example.com").is_err());
+        assert!(validate_email("person@@example.com").is_err());
+        assert!(validate_email("person..name@example.com").is_err());
+        assert!(validate_email("person name@example.com").is_err());
+        assert!(validate_email("person@example..com").is_err());
+        assert!(validate_email("person@example.com\r\nBcc: attacker@example.com").is_err());
     }
 
     #[test]

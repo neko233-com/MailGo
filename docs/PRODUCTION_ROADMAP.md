@@ -10,7 +10,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 4. The UI is local-first: a browser preview stays usable without native IPC, while native mode persists account metadata and preferences under `%LOCALAPPDATA%\\MailGo`.
 5. Rich HTML is sanitized before rendering; scripts, frames, forms, event handlers, and JavaScript URLs are removed.
 6. Rust provider profiles cover Google/Gmail, QQ, Outlook, and custom IMAP/SMTP endpoints. IMAP sync, lazy MIME parsing, SMTP send, UID flags, and local classification are wired behind IPC.
-7. Windows mailbox caches are protected with DPAPI, account credentials use Windows Credential Manager, and metadata exports stay redacted.
+7. Windows mailbox caches are protected with DPAPI, account credentials use Windows Credential Manager, and normal metadata exports stay redacted; encrypted transfer bundles are the explicit credential-bearing exception.
 8. Windows tray lifecycle, single-instance activation, crash-safe state recovery, and a five-minute background sync scheduler are implemented without blocking the rdesktop event loop.
 9. Native OAuth2 + PKCE exchange and refresh-token rotation are available when registered client IDs are provided through environment configuration; codes and tokens remain outside metadata.
 10. Outlook Device Flow is available in the account assistant with verification-page launch, user-code display, bounded polling, expiry handling, and in-memory handoff to the Windows credential store.
@@ -26,7 +26,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 20. Release packaging has a reproducible Windows portable ZIP path; the native shell resolves renderer assets beside the executable, with an environment override for controlled deployment.
 21. Existing accounts can re-enter the authorization flow without changing their stable account ID, and native account removal clears the protected credential plus the account-scoped offline cache.
 22. Windows desktop can export/import fully configured accounts through a password-protected Argon2id + ChaCha20-Poly1305 bundle; decrypted credentials are written only to Windows Credential Manager and imported account caches are reset before the next sync.
-23. The per-user rdesktop updater resolves the latest upstream default-branch commit to an exact SHA before installing, preserves a working installation when local application-control policy blocks source builds, and only accepts a newer release fallback when a configured Authenticode signer trust root and the asset digest both verify.
+23. The per-user rdesktop updater installs only the manually reviewed immutable SHA in `config/rdesktop-trusted-revision.txt`, preserves a working installation when local application-control policy blocks source builds, and only accepts a release fallback when a configured Authenticode signer trust root and the asset digest both verify.
 24. Persisted state loading explicitly migrates legacy missing fields and both snake_case/camelCase spellings, normalizes the current schema version, and rejects future unsupported versions before touching the backup state.
 25. Native MIME sanitization now retains only safe HTTPS image sources and removes tracking-related attributes before caching; the renderer blocks remote images by default while preserving safe HTTPS/mailto links and inline CID images.
 26. Sync retry handling honors numeric `Retry-After` hints that survive transport errors, with a bounded 1–300 second cap and exponential fallback for providers that omit the hint.
@@ -87,7 +87,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 78. User CSS is bounded, persisted only after sanitization, and cannot load `@import`, `url()`, script protocols, legacy behavior properties, CSS comments, or escape-obfuscated equivalents; theme variables, layout rules, gradients, media queries, and animations remain supported.
 79. Mail actions now expose a provider-mapped “move to spam” command for single messages and batches; it reuses the UID-based native move path, encrypted offline mutation queue, UIDVALIDITY checks, and immediate local cache updates for Gmail, QQ, Outlook, and custom accounts.
 80. Messages can also be restored to `INBOX` from archive, spam, trash, or custom folders through a dedicated native-validated command, with the same offline replay and immediate cache semantics.
-81. The per-user rdesktop updater now places Cargo build artifacts under the already validated `%LOCALAPPDATA%\MailGo\cargo-target` root, avoiding temporary-directory application-control failures while preserving exact upstream HEAD installation.
+81. The per-user rdesktop updater now places Cargo build artifacts under the already validated `%LOCALAPPDATA%\MailGo\cargo-target` root and installs only the checked-in reviewed rdesktop revision, avoiding temporary-directory application-control failures and moving-default-branch supply-chain drift.
 82. Native users can move a message from the reading menu into any discovered server folder, including provider-mapped system folders; the target list is deduplicated and current-folder aware, while the existing UID-based offline queue handles replay.
 83. The documented native smoke command now launches the Release shell, while the development build remains available separately; this avoids Windows application-control policies rejecting the Debug binary during packaged-startup verification.
 84. Local smart classification now recognizes official App Store Connect, Developer, TestFlight, Apple Ads, and Search Ads subdomains before falling back to Apple-specific subject signals; security notices remain higher priority and advertising classification stays opt-in to hiding.
@@ -95,6 +95,11 @@ The repository is deliberately split into a real desktop UI foundation and provi
 86. Renderer IPC requests now clear their timeout after a response and clean up both pending state and timers when native `postMessage` fails; request IDs use a cryptographic UUID when the runtime provides one, improving long-lived background stability.
 87. Account onboarding now uses a cryptographic UUID-based account ID for new accounts and guards the asynchronous save/sync path against duplicate submissions; the account dialog exposes a busy label and cannot close mid-commit.
 88. MIME parsing now rejects messages exceeding the attachment-count limit before collecting attachment metadata, with regression coverage for oversized multipart attachment sets; this keeps rich HTML/inline-image support bounded against multi-part abuse.
+89. Provider email validation now rejects controls, whitespace, duplicate separators, malformed domain labels, and ambiguous local parts before credentials or transport are opened.
+90. Account reauthorization now keeps the mailbox identity immutable for a stable account ID; provider, email, and custom transport changes must use a new account, while case-variant IDs are rejected across state, import, and onboarding.
+91. Non-INBOX mailbox caches and attachment directories now use SHA-256 folder keys, with legacy cache reads retained for migration and regression coverage proving lossy-name collisions cannot share new storage.
+92. Full-message reads now preflight the server-advertised `RFC822.SIZE` before requesting the MIME body, while retaining the post-fetch 64 MiB bound as a defense against inaccurate servers.
+93. The scheduled rdesktop updater now installs only the manually reviewed SHA in `config/rdesktop-trusted-revision.txt`; upstream default-branch movement cannot silently change the local framework.
 
 ## Remaining production acceptance work
 
@@ -102,6 +107,6 @@ The repository is deliberately split into a real desktop UI foundation and provi
 - Disposable-provider acceptance tests for OAuth/IMAP/SMTP, including reconnect, UIDVALIDITY changes, folder mappings, and server-side mutation conflicts.
 - Tray integration tests on supported Windows versions.
 - Signed installer generation on a trusted Windows release host; the current rdesktop NSIS command is still an upstream placeholder.
-- Packaged IPC caller isolation beyond the renderer build guard and cross-target acceptance of the protected non-Windows cache backend on native dependency hosts; the updater now fails closed without an independently configured Authenticode trust root.
+- Packaged IPC caller isolation beyond the renderer build guard and cross-target acceptance of the protected non-Windows cache backend on native dependency hosts; the updater remains dependent on a manually reviewed source pin or independently configured Authenticode trust root.
 
 Production acceptance requires integration tests against disposable provider fixtures, a Windows WebView2 smoke test, migration tests for every persisted-state schema, and a security review of HTML/MIME parsing before shipping.

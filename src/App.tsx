@@ -570,7 +570,8 @@ function App() {
     setDeviceFlow(null)
   }
 
-  const changeProvider = (nextProvider: Provider) => {
+  const changeProvider = (nextProvider: Provider, allowLocked = false) => {
+    if (isAccountModalOpen && editingAccountId && !allowLocked) return
     invalidateAuthFlow()
     setProvider(nextProvider)
     setCustomAuthentication(nextProvider === 'outlook' || nextProvider === 'google' ? 'oauth2' : nextProvider === 'other' ? 'password' : 'app-password')
@@ -582,7 +583,7 @@ function App() {
 
   const openNewAccount = () => {
     setEditingAccountId(null)
-    changeProvider('qq')
+    changeProvider('qq', true)
     setAccountEmail('')
     setAuthorizationCode('')
     setShowAuthorizationCode(false)
@@ -1534,6 +1535,24 @@ function App() {
     isAddingAccountRef.current = true
     setAddingAccount(true)
     const existingAccount = editingAccountId ? accounts.find((account) => account.id === editingAccountId) : undefined
+    const changedMailboxIdentity = existingAccount && (
+      existingAccount.provider !== provider
+      || existingAccount.email.toLowerCase() !== accountEmail.trim().toLowerCase()
+      || (provider === 'other' && (
+        existingAccount.imapHost?.toLowerCase() !== customImapHost.trim().toLowerCase()
+        || existingAccount.imapPort !== Number(customImapPort)
+        || existingAccount.imapSecurity?.toLowerCase() !== customImapSecurity.trim().toLowerCase()
+        || existingAccount.smtpHost?.toLowerCase() !== customSmtpHost.trim().toLowerCase()
+        || existingAccount.smtpPort !== Number(customSmtpPort)
+        || existingAccount.smtpSecurity?.toLowerCase() !== customSmtpSecurity.trim().toLowerCase()
+      ))
+    )
+    if (changedMailboxIdentity) {
+      isAddingAccountRef.current = false
+      setAddingAccount(false)
+      pushToast('账户身份已锁定；如需更换邮箱或服务器，请移除后重新添加', 'error')
+      return
+    }
     const id = editingAccountId ?? createAccountId(provider)
     const newAccount: MailAccount = {
       id,

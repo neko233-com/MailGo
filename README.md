@@ -18,7 +18,7 @@ The current foundation includes:
 - Local-only advertising classification can optionally hide ads from normal lists while keeping Apple Connect security mail and smart-category access visible.
 - Rust `neko233-com/rdesktop` WebView2 shell with custom frameless title bar and preserved WebView data directory under `%LOCALAPPDATA%\\MailGo\\WebView2`.
 - The renderer uses Windows system fonts rather than remote web fonts, so the packaged UI has no implicit font-network dependency in offline mode.
-- Windows Credential Manager integration through `keyring` for authorization-code storage; secrets never enter `state.json` or account exports.
+- Windows Credential Manager integration through `keyring` for authorization-code storage; secrets never enter `state.json` or redacted account exports. Encrypted transfer bundles are the explicit exception and require a user-chosen passphrase.
 - Theme changes are written to the native state after startup hydration, and user CSS is capped at 64 KiB with a session-only fallback when WebView storage is unavailable.
 - Packaged native RPC calls carry a per-launch capability from the trusted app URL; forged or navigated-away renderer messages are rejected before any account, credential, filesystem, or network operation.
 - Native IMAP sync uses capability-driven `QRESYNC`/`CONDSTORE` deltas when a server exposes them (including `HIGHESTMODSEQ` cursors, `VANISHED` deletions, and UID-only new-mail discovery), with a UID-based incremental header fallback across provider folder mappings. Bounded `UID FLAGS` refreshes, lazy full-message retrieval, replayable offline flag mutations, local flag updates, and protected mailbox/attachment caches keep the offline view safe: Windows uses DPAPI, while non-Windows builds use an OS keyring-held XChaCha20-Poly1305 key. Attachment downloads use bounded start/chunk/cancel IPC with progress and cancellation support.
@@ -47,7 +47,7 @@ The current foundation includes:
 - The tray icon re-registers itself after Windows Explorer/taskbar restarts, so a hidden MailGo window remains recoverable without restarting the app.
 - Custom IMAP/SMTP onboarding accepts host, port, TLS mode, and password/app-password/OAuth2 settings without putting credentials in metadata.
 
-Provider authentication is deliberately explicit: Gmail defaults to native OAuth2 and also offers a provider-issued app-password fallback; QQ uses its provider-issued authorization code; Outlook uses OAuth2 Device Flow or loopback PKCE; custom OAuth2 accounts can use a provider-issued Bearer access token. Set `MAILGO_GOOGLE_CLIENT_ID` or `MAILGO_OUTLOOK_CLIENT_ID` (and an optional redirect URI/client secret) to enable the native OAuth2 flow. The app never persists the one-time code itself.
+Provider authentication is deliberately explicit: Gmail defaults to a provider-issued app password and can use native OAuth2 when a registered client is configured; QQ uses its provider-issued authorization code; Outlook uses OAuth2 Device Flow or loopback PKCE; custom OAuth2 accounts can use a provider-issued Bearer access token. Set `MAILGO_GOOGLE_CLIENT_ID` or `MAILGO_OUTLOOK_CLIENT_ID` (and an optional redirect URI/client secret) to enable the native OAuth2 flow. The app never persists the one-time code itself.
 
 For a registered desktop OAuth client, configure the client before launching the native shell:
 
@@ -62,7 +62,7 @@ The redirect URI must be registered exactly with the provider. MailGo keeps a sh
 
 For safety, configured Google and Outlook redirect URIs must remain explicit loopback HTTP callbacks such as `http://127.0.0.1:8765/oauth/callback`; MailGo rejects remote hosts, embedded credentials, query strings, and fragments.
 
-The per-user `MailGo-rdesktop-updater` scheduled task resolves the upstream rdesktop HEAD to an exact commit and installs through the already validated `%LOCALAPPDATA%\MailGo\cargo-target` Cargo directory, which is compatible with Windows application-control policies that reject build executables in `%TEMP%`.
+The per-user `MailGo-rdesktop-updater` scheduled task installs only the manually reviewed immutable commit recorded in `config/rdesktop-trusted-revision.txt`, through the already validated `%LOCALAPPDATA%\MailGo\cargo-target` Cargo directory. It never follows the upstream default branch automatically; maintainers must review and bump the pin deliberately.
 
 Use the settings panel's encrypted account transfer actions when moving fully configured accounts between Windows machines. Choose a strong transfer password of at least 12 characters; the password is never stored, and a bundle cannot be recovered if it is forgotten. The browser preview intentionally disables credential-bearing transfer actions.
 
@@ -79,7 +79,7 @@ For rdesktop Agent-first development, use the installed CLI (kept on the reviewe
 rdesktop dev --path .
 ```
 
-The per-user `MailGo-rdesktop-updater` task runs weekly. It resolves the latest upstream default-branch commit to an exact SHA before installing; if Windows application control blocks Cargo build scripts, it only accepts a newer official release when `MAILGO_RDESKTOP_SIGNER_THUMBPRINT` is configured and both the SHA-256 digest and Authenticode signer thumbprint match. Without that independent signer trust root, it preserves the current installation without downgrading it.
+The per-user `MailGo-rdesktop-updater` task runs weekly but installs only the reviewed SHA in `config/rdesktop-trusted-revision.txt`. If Windows application control blocks Cargo build scripts, it only accepts an official release when `MAILGO_RDESKTOP_SIGNER_THUMBPRINT` is configured and both the SHA-256 digest and Authenticode signer thumbprint match. Without that independent signer trust root, it preserves the current installation.
 
 ## Build the Windows shell
 

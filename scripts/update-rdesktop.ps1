@@ -8,24 +8,25 @@ $cargo = Get-Command cargo -ErrorAction Stop
 $git = Get-Command git -ErrorAction Stop
 $repository = 'https://github.com/neko233-com/rdesktop'
 $rdesktopTargetRoot = Join-Path $env:LOCALAPPDATA 'MailGo\cargo-target'
+$trustedRevisionPath = Join-Path $PSScriptRoot '..\config\rdesktop-trusted-revision.txt'
 New-Item -ItemType Directory -Force -Path $rdesktopTargetRoot | Out-Null
-# Resolve the upstream default branch to an exact commit before invoking Cargo. This keeps the
-# scheduled install on the real latest revision without handing Cargo a mutable branch name.
-# Release fallback is disabled unless the deployment supplies the reviewed Authenticode
-# publisher thumbprint. A digest from the same release API is not an authenticity proof.
+# The updater is deliberately pinned to a reviewed immutable commit. Updating this file is a
+# manual release-maintainer action after reviewing the upstream diff; a moving default branch is
+# never installed by the scheduled task.
+# Release fallback is disabled unless the deployment supplies the reviewed Authenticode publisher
+# thumbprint. A digest from the same release API is not an authenticity proof.
 $trustedSignerThumbprint = [string]$env:MAILGO_RDESKTOP_SIGNER_THUMBPRINT
 $releaseApi = 'https://api.github.com/repos/neko233-com/rdesktop/releases/latest'
 
-function Get-LatestRevision {
-    $line = & $git.Source ls-remote $repository HEAD 2>$null | Select-Object -First 1
-    if ($LASTEXITCODE -ne 0 -or !$line) {
-        throw 'could not resolve the latest upstream rdesktop revision'
+function Get-TrustedRevision {
+    if (!(Test-Path -LiteralPath $trustedRevisionPath -PathType Leaf)) {
+        throw "trusted rdesktop revision file is missing: $trustedRevisionPath"
     }
-    $match = [regex]::Match([string]$line, '(?<revision>[0-9a-fA-F]{40})\s+HEAD')
-    if (!$match.Success) {
-        throw 'upstream rdesktop returned an invalid revision'
+    $revision = (Get-Content -LiteralPath $trustedRevisionPath -Raw).Trim()
+    if ($revision -notmatch '^[0-9a-fA-F]{40}$') {
+        throw 'trusted rdesktop revision is not a 40-character commit SHA'
     }
-    return $match.Groups['revision'].Value.ToLowerInvariant()
+    return $revision.ToLowerInvariant()
 }
 
 function Get-InstalledRdesktop {
@@ -88,13 +89,13 @@ function Try-InstallVerifiedRelease($installed) {
 
 Write-Host "Updating rdesktop-cli from $repository"
 try {
-    $latestRevision = Get-LatestRevision
-    Write-Host "Installing latest upstream rdesktop revision $latestRevision"
+    $trustedRevision = Get-TrustedRevision
+    Write-Host "Installing reviewed rdesktop revision $trustedRevision"
     # Keep Cargo's build scripts under the same trusted per-user root used by MailGo's native
     # builds. Some Windows application-control policies block custom build executables in %TEMP%.
     $env:CARGO_TARGET_DIR = $rdesktopTargetRoot
     Write-Host "Using trusted Cargo target directory $rdesktopTargetRoot"
-    & $cargo.Source install rdesktop-cli --git $repository --rev $latestRevision --locked --force
+    & $cargo.Source install rdesktop-cli --git $repository --rev $trustedRevision --locked --force
     if ($LASTEXITCODE -ne 0) {
         throw "cargo install rdesktop-cli failed with exit code $LASTEXITCODE"
     }
