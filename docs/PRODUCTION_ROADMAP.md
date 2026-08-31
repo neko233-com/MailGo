@@ -68,6 +68,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 59. Attachment upload metadata now rejects NUL and other unsafe control characters at the native IPC boundary, with regression coverage for file names, MIME types, and inline Content-ID values.
 60. Offline-only mode is now an enforced local-first policy: it pauses background/manual network sync and remote search, keeps cached mail readable, queues outgoing mail in the encrypted outbox without opening a network connection, and queues flag/move mutations for replay after the mode is disabled.
 61. The Windows release gate now performs build, format, clippy, Release-test, portable-package, SHA-256, and manifest checks; GitHub publication remains opt-in behind an explicit tag and `-Publish` flag with no automated workflow.
+62. Windows ZIP packaging now writes entries in stable lexical order with a fixed DOS-compatible timestamp, making repeated local builds byte-identical when their inputs are unchanged.
 
 ## Remaining production acceptance work
 

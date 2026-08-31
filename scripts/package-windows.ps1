@@ -6,6 +6,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $OutputDirectory = if ($OutputDirectory) { $OutputDirectory } else { Join-Path $projectRoot 'artifacts' }
+$OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 $targetRoot = Join-Path $env:LOCALAPPDATA 'MailGo\cargo-target'
 $package = Get-Content (Join-Path $projectRoot 'package.json') -Raw | ConvertFrom-Json
 $version = [string]$package.version
@@ -60,7 +61,30 @@ if (-not (Test-Path -LiteralPath (Join-Path $distDestination 'index.html'))) {
 if (-not (Test-Path -LiteralPath (Join-Path $iconDestination 'mailgo.ico'))) {
     throw 'staged tray icon is missing resources\icons\mailgo.ico'
 }
-Compress-Archive -Path (Join-Path $stageRoot '*') -DestinationPath $archivePath -CompressionLevel Optimal
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$archiveStream = [System.IO.File]::Create($archivePath)
+$zip = [System.IO.Compression.ZipArchive]::new($archiveStream, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+try {
+    $epoch = [DateTimeOffset]::Parse('1980-01-01T00:00:00Z')
+    $files = Get-ChildItem -LiteralPath $stageRoot -File -Recurse | Sort-Object FullName
+    foreach ($file in $files) {
+        $relativeName = $file.FullName.Substring($stageRoot.Length).TrimStart('\', '/') -replace '\\', '/'
+        $entry = $zip.CreateEntry($relativeName, [System.IO.Compression.CompressionLevel]::Optimal)
+        $entry.LastWriteTime = $epoch
+        $input = [System.IO.File]::OpenRead($file.FullName)
+        $output = $entry.Open()
+        try {
+            $input.CopyTo($output)
+        } finally {
+            $output.Dispose()
+            $input.Dispose()
+        }
+    }
+} finally {
+    $zip.Dispose()
+    $archiveStream.Dispose()
+}
 
 $archive = Get-Item -LiteralPath $archivePath
 Write-Host "Portable Windows package created: $($archive.FullName) ($($archive.Length) bytes)"
