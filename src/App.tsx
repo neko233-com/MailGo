@@ -986,15 +986,17 @@ function App() {
     else pushToast(selected.length ? `已${starred ? '添加' : '移除'} ${selected.length} 封邮件的星标` : `所选邮件已经${starred ? '全部加星' : '全部取消星标'}`, 'success')
   }
 
-  const moveMail = async (mail: MailMessage, operation: 'archive' | 'delete') => {
+  const moveMail = async (mail: MailMessage, operation: 'archive' | 'delete' | 'spam') => {
     if (mail.id === 'empty-mail') return false
     const account = accounts.find((item) => item.id === mail.accountId)
     if (operation === 'archive' && mail.folder === 'archive') return false
+    if (operation === 'spam' && mail.folder === 'spam') return false
     const isPermanentDelete = operation === 'delete' && mail.folder === 'trash'
-    const targetFolder = isPermanentDelete || !account ? undefined : nativeFolderName(account, operation === 'archive' ? 'archive' : 'trash')
+    const targetFolder = isPermanentDelete || !account ? undefined : nativeFolderName(account, operation === 'archive' ? 'archive' : operation === 'spam' ? 'spam' : 'trash')
     let queued = false
     if (isNativeRuntime && account && mail.nativeUid != null) {
-      const result = await invoke<{ queued?: boolean }>('mail.' + operation, {
+      const command = operation === 'spam' ? 'mail.spam' : 'mail.' + operation
+      const result = await invoke<{ queued?: boolean }>(command, {
         accountId: mail.accountId,
         folder: mail.nativeFolder ?? 'INBOX',
         uid: mail.nativeUid,
@@ -1010,7 +1012,7 @@ function App() {
         setSelectedMailId(next?.id ?? '')
       }
     } else {
-      const nextFolder = operation === 'archive' ? 'archive' : 'trash'
+      const nextFolder = operation === 'archive' ? 'archive' : operation === 'spam' ? 'spam' : 'trash'
       mapMailSources((item) => item.id === mail.id
         ? { ...item, folder: nextFolder, nativeFolder: targetFolder ?? item.nativeFolder }
         : item)
@@ -1023,16 +1025,16 @@ function App() {
     return queued
   }
 
-  const runMove = async (mail: MailMessage, operation: 'archive' | 'delete') => {
+  const runMove = async (mail: MailMessage, operation: 'archive' | 'delete' | 'spam') => {
     try {
       const queued = await moveMail(mail, operation)
-      pushToast(queued ? '操作已保存，联网后会自动同步' : operation === 'archive' ? '邮件已归档' : '邮件已移入回收站', 'success')
+      pushToast(queued ? '操作已保存，联网后会自动同步' : operation === 'archive' ? '邮件已归档' : operation === 'spam' ? '邮件已移入垃圾邮件' : '邮件已移入回收站', 'success')
     } catch (error) {
       pushToast(error instanceof Error ? error.message : '邮件操作失败，请稍后重试', 'error')
     }
   }
 
-  const applyBulkMove = async (operation: 'archive' | 'delete') => {
+  const applyBulkMove = async (operation: 'archive' | 'delete' | 'spam') => {
     if (!selectedVisibleMails.length) {
       pushToast('请先选择邮件', 'info')
       return
@@ -1049,7 +1051,7 @@ function App() {
     const count = selectedVisibleMails.length - failed
     setSelectedMailIds([])
     if (failed) pushToast(`${count} 封邮件已处理，${failed} 封处理失败`, 'error')
-    else pushToast(`${operation === 'archive' ? `已归档 ${count} 封邮件` : `已将 ${count} 封邮件移入回收站`}${queued ? `，${queued} 封将在联网后同步` : ''}`, 'success')
+    else pushToast(`${operation === 'archive' ? `已归档 ${count} 封邮件` : operation === 'spam' ? `已将 ${count} 封邮件移入垃圾邮件` : `已将 ${count} 封邮件移入回收站`}${queued ? `，${queued} 封将在联网后同步` : ''}`, 'success')
   }
 
   const markSelectedRead = () => { void setSelectedReadState(false) }
@@ -1827,6 +1829,7 @@ function App() {
                 <button type="button" role="menuitem" disabled={!selectedVisibleMails.length} onClick={markSelectedUnread}><Icon name="message" size={16} />标为未读</button>
                 <button type="button" role="menuitem" disabled={!selectedVisibleMails.length} onClick={() => { void setSelectedStarred(true) }}><Icon name="star" size={16} />批量加星</button>
                 <button type="button" role="menuitem" disabled={!selectedVisibleMails.length} onClick={() => { void setSelectedStarred(false) }}><Icon name="star" size={16} />批量取消星标</button>
+                <button type="button" role="menuitem" disabled={!selectedVisibleMails.length} onClick={() => { void applyBulkMove('spam') }}><Icon name="shield" size={16} />移入垃圾邮件</button>
                 <button type="button" role="menuitem" disabled={!selectedVisibleMails.length} onClick={() => { setSelectedMailIds([]); setOpenMenu(null) }}><Icon name="close" size={16} />取消选择</button>
               </div>}
             </div>
@@ -1854,7 +1857,7 @@ function App() {
 
         <section className="reading-panel" aria-label="邮件阅读区">
           <div className="reading-toolbar">
-            <div className="reading-actions"><TooltipButton label="返回邮件列表" className="mobile-only-button reading-back-button" onClick={() => setMobilePane('list')}><span className="mobile-back-label">列表</span></TooltipButton><TooltipButton label="回复" onClick={() => openCompose(undefined, 'reply', selectedMail)}><Icon name="reply" size={18} /></TooltipButton><span>回复</span><TooltipButton label="回复全部" onClick={() => openCompose(undefined, 'reply-all', selectedMail)}><Icon name="reply" size={18} /></TooltipButton><span>回复全部</span><TooltipButton label="转发" onClick={() => openCompose(undefined, 'forward', selectedMail)}><Icon name="forward" size={18} /></TooltipButton><span>转发</span><TooltipButton label="归档" onClick={() => { void runMove(selectedMail, 'archive') }}><Icon name="archive" size={18} /></TooltipButton><span>归档</span><TooltipButton label="删除" onClick={() => { void runMove(selectedMail, 'delete') }}><Icon name="trash" size={18} /></TooltipButton><span>删除</span></div>
+            <div className="reading-actions"><TooltipButton label="返回邮件列表" className="mobile-only-button reading-back-button" onClick={() => setMobilePane('list')}><span className="mobile-back-label">列表</span></TooltipButton><TooltipButton label="回复" onClick={() => openCompose(undefined, 'reply', selectedMail)}><Icon name="reply" size={18} /></TooltipButton><span>回复</span><TooltipButton label="回复全部" onClick={() => openCompose(undefined, 'reply-all', selectedMail)}><Icon name="reply" size={18} /></TooltipButton><span>回复全部</span><TooltipButton label="转发" onClick={() => openCompose(undefined, 'forward', selectedMail)}><Icon name="forward" size={18} /></TooltipButton><span>转发</span><TooltipButton label="归档" onClick={() => { void runMove(selectedMail, 'archive') }}><Icon name="archive" size={18} /></TooltipButton><span>归档</span><TooltipButton label="删除" onClick={() => { void runMove(selectedMail, 'delete') }}><Icon name="trash" size={18} /></TooltipButton><span>删除</span><TooltipButton label="移入垃圾邮件" onClick={() => { void runMove(selectedMail, 'spam') }}><Icon name="shield" size={18} /></TooltipButton><span>垃圾邮件</span></div>
             <div className="menu-anchor">
               <TooltipButton label="更多邮件操作" active={openMenu === 'message'} ariaExpanded={openMenu === 'message'} onClick={() => setOpenMenu((current) => current === 'message' ? null : 'message')}><Icon name="more" size={19} /></TooltipButton>
               {openMenu === 'message' && <div className="action-menu" role="menu" aria-label="更多邮件操作">

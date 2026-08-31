@@ -2043,7 +2043,7 @@ fn handle_ipc(
                     "dataBase64": STANDARD.encode(attachment.bytes),
                 }))
             }
-            "mail.move" | "mail.archive" | "mail.delete" => {
+            "mail.move" | "mail.archive" | "mail.delete" | "mail.spam" => {
                 let account_id = string_field(&message.payload, "accountId")?;
                 let uid = u32_field(&message.payload, "uid")?;
                 let folder = optional_string_field(&message.payload, "folder")
@@ -2054,6 +2054,7 @@ fn handle_ipc(
                     "mail.move" => "move",
                     "mail.archive" => "archive",
                     "mail.delete" => "delete",
+                    "mail.spam" => "move",
                     _ => unreachable!("matched mail mutation command"),
                 };
                 if matches!(operation, "move" | "archive") && target_folder.is_none() {
