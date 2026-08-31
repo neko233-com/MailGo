@@ -54,14 +54,16 @@ The repository is deliberately split into a real desktop UI foundation and provi
 45. Network transport now has explicit deadlines: IMAP uses bounded address connection attempts plus TLS/STARTTLS and socket read/write timeouts, OAuth HTTP requests use bounded connect/read/write timeouts, and SMTP delivery has a bounded transport timeout for predictable background/offline behavior.
 46. OAuth loopback callbacks now use a bounded shared listener per configured port/path and route successful or failed returns by validated `state`, so simultaneous Google/Outlook authorization flows do not compete for one-shot `accept` ownership.
 47. Account onboarding and import enforce a shared 64-account ceiling, while pending OAuth sessions are capped and expired sessions are purged before new flows start.
+48. IMAP synchronization now enables capability-driven QRESYNC/CONDSTORE deltas, persists bounded `HIGHESTMODSEQ` cursors, removes QRESYNC `VANISHED` UIDs, discovers new UIDs without an `ALL` search, and safely falls back to the existing UID path when an extension is unavailable or rejected.
+49. Non-Windows builds now protect mailbox and attachment caches with a random XChaCha20-Poly1305 key stored in the platform keyring; the Windows DPAPI path remains unchanged.
+50. OAuth device, authorization-code, and refresh requests now retain bounded numeric `Retry-After` guidance for HTTP 429 responses without exposing response bodies or credentials.
 
 ## Remaining production acceptance work
 
-- Provider-specific incremental delta sync beyond the resumable UID-page path.
 - Provider-specific rate-limit headers/backoff and richer MIME regression fixtures.
 - Disposable-provider acceptance tests for OAuth/IMAP/SMTP, including reconnect, UIDVALIDITY changes, folder mappings, and server-side mutation conflicts.
 - Tray integration tests on supported Windows versions.
 - Signed installer generation on a trusted Windows release host; the current rdesktop NSIS command is still an upstream placeholder.
-- Packaged IPC caller isolation beyond the renderer build guard and a protected non-Windows cache backend; the updater now fails closed without an independently configured Authenticode trust root.
+- Packaged IPC caller isolation beyond the renderer build guard and cross-target acceptance of the protected non-Windows cache backend on native dependency hosts; the updater now fails closed without an independently configured Authenticode trust root.
 
 Production acceptance requires integration tests against disposable provider fixtures, a Windows WebView2 smoke test, migration tests for every persisted-state schema, and a security review of HTML/MIME parsing before shipping.

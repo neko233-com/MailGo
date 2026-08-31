@@ -244,15 +244,7 @@ pub fn start_device(
         .set("Accept", "application/json")
         .set("Content-Type", "application/x-www-form-urlencoded")
         .send_string(&form.finish())
-        .map_err(|error| match error {
-            ureq::Error::Status(429, _) => anyhow!("OAuth device authorization is rate limited"),
-            ureq::Error::Status(code, _) => {
-                anyhow!("OAuth device authorization endpoint returned HTTP {code}")
-            }
-            ureq::Error::Transport(_) => {
-                anyhow!("OAuth device authorization endpoint is unavailable")
-            }
-        })?;
+        .map_err(|error| oauth_request_error("OAuth device authorization endpoint", error))?;
     let device: DeviceAuthorizationResponse = response
         .into_json()
         .context("OAuth device response was not valid JSON")?;
@@ -425,10 +417,7 @@ pub fn exchange_code(
         .set("Accept", "application/json")
         .set("Content-Type", "application/x-www-form-urlencoded")
         .send_string(&form.finish())
-        .map_err(|error| match error {
-            ureq::Error::Status(code, _) => anyhow!("OAuth token endpoint returned HTTP {code}"),
-            ureq::Error::Transport(_) => anyhow!("OAuth token endpoint is unavailable"),
-        })?;
+        .map_err(|error| oauth_request_error("OAuth token endpoint", error))?;
     let token: TokenResponse = response
         .into_json()
         .context("OAuth token response was not valid JSON")?;
@@ -493,10 +482,7 @@ pub fn refresh_if_needed(provider: ProviderKind, raw: &str) -> Result<String> {
         .set("Accept", "application/json")
         .set("Content-Type", "application/x-www-form-urlencoded")
         .send_string(&form.finish())
-        .map_err(|error| match error {
-            ureq::Error::Status(code, _) => anyhow!("OAuth refresh endpoint returned HTTP {code}"),
-            ureq::Error::Transport(_) => anyhow!("OAuth refresh endpoint is unavailable"),
-        })?;
+        .map_err(|error| oauth_request_error("OAuth refresh endpoint", error))?;
     let token: TokenResponse = response
         .into_json()
         .context("OAuth refresh response was not valid JSON")?;
@@ -562,6 +548,25 @@ fn parse_retry_after(value: Option<&str>, fallback: u64) -> u64 {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map(|seconds| seconds.clamp(5, 3600))
         .unwrap_or(fallback.clamp(5, 3600))
+}
+
+fn oauth_request_error(context: &str, error: ureq::Error) -> anyhow::Error {
+    match error {
+        ureq::Error::Status(429, response) => {
+            let retry_after = response
+                .header("Retry-After")
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(|seconds| seconds.clamp(5, 3600));
+            match retry_after {
+                Some(seconds) => {
+                    anyhow!("{context} is rate limited (HTTP 429; retry after {seconds} seconds)")
+                }
+                None => anyhow!("{context} is rate limited (HTTP 429)"),
+            }
+        }
+        ureq::Error::Status(code, _) => anyhow!("{context} returned HTTP {code}"),
+        ureq::Error::Transport(_) => anyhow!("{context} is unavailable"),
+    }
 }
 
 fn register_loopback_listener(

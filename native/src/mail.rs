@@ -72,6 +72,10 @@ pub struct CachedMailbox {
     pub account_id: String,
     pub folder: String,
     pub uid_validity: Option<u32>,
+    /// The server's CONDSTORE/QRESYNC cursor, when the provider exposes one. Older cache
+    /// snapshots intentionally deserialize with `None` and take the safe UID-based path once.
+    #[serde(default)]
+    pub highest_mod_seq: Option<u64>,
     pub synced_at: String,
     pub messages: Vec<CachedMessage>,
     #[serde(default)]
@@ -87,6 +91,7 @@ impl CachedMailbox {
             account_id: account_id.into(),
             folder: folder.into(),
             uid_validity: None,
+            highest_mod_seq: None,
             synced_at: String::new(),
             messages: Vec::new(),
             oldest_uid: None,
@@ -492,6 +497,26 @@ mod tests {
         assert!(!name.contains('/'));
         assert!(!name.contains('\\'));
         assert!(!name.starts_with('.'));
+    }
+
+    #[test]
+    fn parses_nested_alternative_quoted_printable_and_calendar_attachment() {
+        let raw = "From: =?UTF-8?B?5ZGo5Lq65Lq6?= <sender@example.com>\r\nSubject: =?UTF-8?B?5rWL6K+V5LiW55WM?=\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n--outer\r\nContent-Type: multipart/alternative; boundary=alternative\r\n\r\n--alternative\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n=4E=6F=74=69=63=65=3A=20=E6=82=A8=E6=9C=89=E4=B8=80=E4=B8=AA=E6=96=B0=E6=97=A5=E7=A8=8B=E3=80=82\r\n--alternative\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n<p>=E9=87=8D=E8=A6=81=20<strong>=E6=97=A5=E7=A8=8B</strong></p>\r\n--alternative--\r\n--outer\r\nContent-Type: text/calendar; method=REQUEST\r\nContent-Disposition: attachment; filename=\"invite.ics\"\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nBEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n--outer--\r\n";
+        let message = parse_full("account", "INBOX", 10, false, false, raw.as_bytes()).unwrap();
+        assert_eq!(message.subject, "世界邮件");
+        assert!(message.sender_name.contains("发件人"));
+        assert!(message.text_body.contains("您有一个新日程"));
+        assert!(message
+            .html_body
+            .as_deref()
+            .is_some_and(|html| html.contains("日程")));
+        let payloads = extract_attachment_payloads(raw.as_bytes()).unwrap();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].content_type, "text/calendar");
+        assert_eq!(
+            payloads[0].bytes,
+            b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n"
+        );
     }
 
     #[test]

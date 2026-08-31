@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use imap::types::Flag;
+use imap::types::{Flag, UnsolicitedResponse};
 use native_tls::{TlsConnector, TlsStream};
 use serde::{Deserialize, Serialize};
 
@@ -29,11 +29,19 @@ const MAX_SEARCH_RESULTS_PER_FOLDER: usize = 40;
 const MAX_SEARCH_RESULTS_PER_ACCOUNT: usize = 240;
 const MAX_MUTATIONS: usize = 1_000;
 const MAX_MUTATION_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DELTA_HEADER_UIDS: usize = MAX_HEADER_MESSAGES;
+const MAX_DELTA_VANISHED_RANGES: usize = MAX_CACHED_MESSAGES_PER_FOLDER;
 const IMAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const IMAP_IO_TIMEOUT: Duration = Duration::from_secs(60);
 const CACHE_FILE: &str = "inbox.bin";
 const MUTATION_FILE: &str = "mutations.bin";
 const MOVE_MUTATION_FILE: &str = "moves.bin";
+#[cfg(not(target_os = "windows"))]
+const NON_WINDOWS_CACHE_MAGIC: &[u8] = b"MAILGO-CACHE-1\0";
+#[cfg(not(target_os = "windows"))]
+const NON_WINDOWS_CACHE_KEY_SERVICE: &str = "com.neko233.mailgo.cache";
+#[cfg(not(target_os = "windows"))]
+const NON_WINDOWS_CACHE_KEY_ACCOUNT: &str = "cache-encryption-key";
 
 static CACHE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -106,6 +114,15 @@ pub struct AttachmentData {
     pub file_name: String,
     pub content_type: String,
     pub bytes: Vec<u8>,
+}
+
+/// Capability-driven incremental synchronization. QRESYNC gives us server-side deletion
+/// deltas; CONDSTORE gives us changed flags and is paired with a bounded UID existence check.
+/// Servers that advertise neither extension continue through the conservative UID path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncrementalMode {
+    Condstore,
+    Qresync,
 }
 
 fn connect(profile: &ProviderProfile) -> Result<imap::Client<imap::Connection>> {
@@ -237,6 +254,110 @@ fn authenticate(
             )
             .map_err(|(error, _)| anyhow!("IMAP OAuth authentication failed: {error}")),
     }
+}
+
+fn detect_incremental_mode(
+    session: &mut imap::Session<imap::Connection>,
+) -> Option<IncrementalMode> {
+    let capabilities = match session.capabilities() {
+        Ok(capabilities) => capabilities,
+        Err(error) => {
+            tracing::debug!("could not read IMAP capabilities for incremental sync: {error}");
+            return None;
+        }
+    };
+    if capabilities.has_str("QRESYNC") {
+        if session.run_command_and_check_ok("ENABLE QRESYNC").is_ok() {
+            return Some(IncrementalMode::Qresync);
+        }
+        tracing::debug!("IMAP QRESYNC enable failed; falling back to CONDSTORE");
+    }
+    if capabilities.has_str("CONDSTORE") || capabilities.has_str("QRESYNC") {
+        if session.run_command_and_check_ok("ENABLE CONDSTORE").is_ok() {
+            Some(IncrementalMode::Condstore)
+        } else {
+            tracing::debug!("IMAP CONDSTORE enable failed; using the UID sync path");
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn incremental_status(
+    session: &mut imap::Session<imap::Connection>,
+    folder: &str,
+    mode: Option<IncrementalMode>,
+) -> Option<u64> {
+    mode?;
+    let command = format!("STATUS {} (HIGHESTMODSEQ)", quoted_mailbox_name(folder));
+    match session.run_command_and_read_response(command) {
+        Ok(response) => parse_status_highest_mod_seq(&response, folder),
+        Err(error) => {
+            tracing::debug!(folder = %folder, "IMAP incremental status unavailable: {error}");
+            None
+        }
+    }
+}
+
+fn parse_status_highest_mod_seq(response: &[u8], expected_folder: &str) -> Option<u64> {
+    for line in response.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(rest) = line.strip_prefix(b"* STATUS ") else {
+            continue;
+        };
+        let (mailbox, attributes) = if rest.first() == Some(&b'"') {
+            let mut value = Vec::new();
+            let mut escaped = false;
+            let mut end = None;
+            for (index, byte) in rest.iter().enumerate().skip(1) {
+                if escaped {
+                    value.push(*byte);
+                    escaped = false;
+                } else if *byte == b'\\' {
+                    escaped = true;
+                } else if *byte == b'"' {
+                    end = Some(index);
+                    break;
+                } else {
+                    value.push(*byte);
+                }
+            }
+            let end = end?;
+            let attribute_start = rest[end + 1..]
+                .iter()
+                .position(|byte| !byte.is_ascii_whitespace())?;
+            let attributes = &rest[end + 1 + attribute_start..];
+            (String::from_utf8(value).ok()?, attributes)
+        } else {
+            let separator = rest.iter().position(|byte| byte.is_ascii_whitespace())?;
+            let attribute_start = rest[separator..]
+                .iter()
+                .position(|byte| !byte.is_ascii_whitespace())?;
+            (
+                String::from_utf8(rest[..separator].to_vec()).ok()?,
+                &rest[separator + attribute_start..],
+            )
+        };
+        if mailbox != expected_folder {
+            continue;
+        }
+        let marker = b"HIGHESTMODSEQ ";
+        let start = attributes
+            .windows(marker.len())
+            .position(|window| window.eq_ignore_ascii_case(marker))?
+            + marker.len();
+        let digits = attributes[start..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .copied()
+            .collect::<Vec<_>>();
+        if digits.is_empty() {
+            return None;
+        }
+        return std::str::from_utf8(&digits).ok()?.parse().ok();
+    }
+    None
 }
 
 /// Keep the local cache fresh while the window is hidden. The scheduler intentionally runs on a
@@ -513,6 +634,7 @@ fn sync_account_once(
     }
 
     let mut session = authenticate(&profile, email, credential)?;
+    let incremental_mode = detect_incremental_mode(&mut session);
 
     flush_queued_moves(&mut session, cache_root, account_id, profile.provider);
     flush_queued_flags(&mut session, cache_root, account_id);
@@ -524,6 +646,7 @@ fn sync_account_once(
     let mut cache_path = cache_root.join(safe_component(account_id)).join(CACHE_FILE);
 
     for folder in discover_folders(&mut session, profile.provider) {
+        let status_highest_mod_seq = incremental_status(&mut session, &folder, incremental_mode);
         let Ok(mailbox) = session.select(&folder) else {
             continue;
         };
@@ -532,6 +655,8 @@ fn sync_account_once(
             account_id,
             &folder,
             mailbox.uid_validity,
+            mailbox.highest_mod_seq.or(status_highest_mod_seq),
+            incremental_mode,
             cache_root,
             synced_at.clone(),
         )?;
@@ -567,15 +692,44 @@ fn sync_account_once(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_folder_latest(
     session: &mut imap::Session<imap::Connection>,
     account_id: &str,
     folder: &str,
     uid_validity: Option<u32>,
+    highest_mod_seq: Option<u64>,
+    incremental_mode: Option<IncrementalMode>,
     cache_root: &Path,
     synced_at: String,
 ) -> Result<(CachedMailbox, usize)> {
     validate_mailbox_name(folder)?;
+    let mut cached = load_mailbox_for_folder(cache_root, account_id, folder)?
+        .unwrap_or_else(|| CachedMailbox::empty(account_id, folder));
+    let uid_validity_changed = cached.uid_validity.is_some() && cached.uid_validity != uid_validity;
+    if uid_validity_changed {
+        cached.messages.clear();
+        cached.oldest_uid = None;
+        cached.has_more = false;
+        cached.highest_mod_seq = None;
+    } else if let (Some(mode), Some(current), Some(previous)) =
+        (incremental_mode, highest_mod_seq, cached.highest_mod_seq)
+    {
+        if let Some(fetched) = sync_folder_incremental(
+            session,
+            account_id,
+            folder,
+            uid_validity,
+            current,
+            previous,
+            mode,
+            &mut cached,
+            synced_at.clone(),
+        )? {
+            return Ok((cached, fetched));
+        }
+    }
+
     let mut all_uids = session
         .uid_search("ALL")
         .with_context(|| format!("search {folder}"))?
@@ -587,18 +741,12 @@ fn sync_folder_latest(
     }
     let current_uids = all_uids.iter().copied().collect::<HashSet<_>>();
     let total_uids = all_uids.len();
-    let mut cached = load_mailbox_for_folder(cache_root, account_id, folder)?
-        .unwrap_or_else(|| CachedMailbox::empty(account_id, folder));
-    let uid_validity_changed = cached.uid_validity.is_some() && cached.uid_validity != uid_validity;
-    if uid_validity_changed {
-        cached.messages.clear();
-        cached.oldest_uid = None;
-        cached.has_more = false;
-    }
 
     // The header window is fetched only for a cold cache or UIDs newer than the newest cached
     // message. Existing bodies/attachments remain untouched and are refreshed through FLAGS.
     let newest_cached_uid = cached.messages.iter().map(|message| message.uid).max();
+    let new_uid_count = newest_cached_uid
+        .map(|newest_uid| all_uids.iter().filter(|uid| **uid > newest_uid).count());
     let selected_uids = match newest_cached_uid {
         None => all_uids
             .iter()
@@ -609,7 +757,6 @@ fn sync_folder_latest(
         Some(newest_uid) => all_uids
             .iter()
             .filter(|uid| **uid > newest_uid)
-            .rev()
             .take(MAX_HEADER_MESSAGES)
             .copied()
             .collect::<Vec<_>>(),
@@ -684,7 +831,21 @@ fn sync_folder_latest(
         }
     }
 
+    let fetched_uids = fetched_messages
+        .iter()
+        .map(|message| message.uid)
+        .collect::<HashSet<_>>();
+    let all_selected_headers_fetched = selected_uids.iter().all(|uid| fetched_uids.contains(uid));
+    let delta_headers_complete = new_uid_count
+        .map(|count| count <= MAX_HEADER_MESSAGES)
+        .unwrap_or(all_selected_headers_fetched)
+        && all_selected_headers_fetched;
     cached.uid_validity = uid_validity;
+    cached.highest_mod_seq = if delta_headers_complete {
+        highest_mod_seq
+    } else {
+        cached.highest_mod_seq
+    };
     cached.synced_at = synced_at;
     cached
         .messages
@@ -696,6 +857,212 @@ fn sync_folder_latest(
     cached.oldest_uid = cached.messages.iter().map(|message| message.uid).min();
     cached.has_more = total_uids > cached.messages.len();
     Ok((cached, fetched_messages.len()))
+}
+
+fn delta_fetch_query(mode: IncrementalMode, previous_mod_seq: u64) -> String {
+    let vanished = if mode == IncrementalMode::Qresync {
+        " VANISHED"
+    } else {
+        ""
+    };
+    format!("(UID FLAGS MODSEQ) (CHANGEDSINCE {previous_mod_seq}{vanished})")
+}
+
+fn cached_uid_set(cached: &CachedMailbox) -> Option<String> {
+    let mut uids = cached
+        .messages
+        .iter()
+        .map(|message| message.uid)
+        .collect::<Vec<_>>();
+    uids.sort_unstable();
+    uids.dedup();
+    (!uids.is_empty()).then(|| {
+        uids.into_iter()
+            .map(|uid| uid.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    })
+}
+
+/// Apply a bounded CONDSTORE/QRESYNC delta. Returning `None` means the server advertised an
+/// extension but rejected one of its commands; the caller must immediately use the safe UID
+/// implementation on the same sync attempt. Cache mutation is delayed until all required wire
+/// responses have been parsed so a failed extension path cannot persist a half-applied snapshot.
+#[allow(clippy::too_many_arguments)]
+fn sync_folder_incremental(
+    session: &mut imap::Session<imap::Connection>,
+    account_id: &str,
+    folder: &str,
+    uid_validity: Option<u32>,
+    current_mod_seq: u64,
+    previous_mod_seq: u64,
+    mode: IncrementalMode,
+    cached: &mut CachedMailbox,
+    synced_at: String,
+) -> Result<Option<usize>> {
+    if current_mod_seq < previous_mod_seq {
+        return Ok(None);
+    }
+    if current_mod_seq == previous_mod_seq {
+        cached.uid_validity = uid_validity;
+        cached.highest_mod_seq = Some(current_mod_seq);
+        cached.synced_at = synced_at;
+        return Ok(Some(0));
+    }
+
+    let Some(cached_uid_set) = cached_uid_set(cached) else {
+        return Ok(None);
+    };
+    let changed = match session.uid_fetch(
+        cached_uid_set.clone(),
+        delta_fetch_query(mode, previous_mod_seq),
+    ) {
+        Ok(changed) => changed,
+        Err(error) => {
+            tracing::debug!(folder = %folder, "IMAP incremental fetch rejected; using UID fallback: {error}");
+            return Ok(None);
+        }
+    };
+    let mut changed_flags = Vec::new();
+    let mut header_uids = Vec::new();
+    for item in changed.iter() {
+        let Some(uid) = item.uid else { continue };
+        let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
+        let starred = item
+            .flags()
+            .iter()
+            .any(|flag| matches!(flag, Flag::Flagged));
+        changed_flags.push((uid, unread, starred));
+        if cached.messages.iter().all(|message| message.uid != uid) {
+            header_uids.push(uid);
+        }
+    }
+
+    let mut vanished_ranges = Vec::new();
+    for response in session.take_all_unsolicited() {
+        if let UnsolicitedResponse::Vanished { uids, .. } = response {
+            vanished_ranges.extend(uids);
+        }
+    }
+    if vanished_ranges.len() > MAX_DELTA_VANISHED_RANGES {
+        tracing::debug!(folder = %folder, "IMAP vanished delta is too large; using UID fallback");
+        return Ok(None);
+    }
+
+    let mut current_uids = None;
+    if mode == IncrementalMode::Condstore {
+        let uids = match session.uid_search(format!("UID {cached_uid_set}")) {
+            Ok(uids) => uids,
+            Err(error) => {
+                tracing::debug!(folder = %folder, "IMAP UID existence check failed; using UID fallback: {error}");
+                return Ok(None);
+            }
+        };
+        current_uids = Some(uids.into_iter().collect::<HashSet<_>>());
+    }
+
+    let max_cached_uid = cached
+        .messages
+        .iter()
+        .map(|message| message.uid)
+        .max()
+        .unwrap_or(0);
+    if max_cached_uid == u32::MAX {
+        return Ok(None);
+    }
+    let new_uids = match session.uid_search(format!("UID {}:*", max_cached_uid + 1)) {
+        Ok(uids) => uids,
+        Err(error) => {
+            tracing::debug!(folder = %folder, "IMAP new-UID delta rejected; using UID fallback: {error}");
+            return Ok(None);
+        }
+    };
+    header_uids.extend(new_uids);
+    header_uids.sort_unstable();
+    header_uids.dedup();
+    let delta_headers_complete = header_uids.len() <= MAX_DELTA_HEADER_UIDS;
+    header_uids.truncate(MAX_DELTA_HEADER_UIDS);
+
+    let mut fetched_messages = Vec::with_capacity(header_uids.len());
+    if !header_uids.is_empty() {
+        let uid_set = header_uids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let fetched = match session.uid_fetch(uid_set, HEADER_FETCH_QUERY) {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                tracing::debug!(folder = %folder, "IMAP incremental header fetch failed; using UID fallback: {error}");
+                return Ok(None);
+            }
+        };
+        let mut header_bytes = 0usize;
+        for item in fetched.iter() {
+            let Some(uid) = item.uid else { continue };
+            let Some(header) = item.header() else {
+                continue;
+            };
+            if header.len() > MAX_HEADER_BYTES {
+                continue;
+            }
+            header_bytes = header_bytes.saturating_add(header.len());
+            if header_bytes > MAX_HEADER_TOTAL_BYTES {
+                break;
+            }
+            let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
+            let starred = item
+                .flags()
+                .iter()
+                .any(|flag| matches!(flag, Flag::Flagged));
+            if let Ok(message) = parse_header(account_id, folder, uid, unread, starred, header) {
+                fetched_messages.push(message);
+            }
+        }
+    }
+
+    let fetched_uids = fetched_messages
+        .iter()
+        .map(|message| message.uid)
+        .collect::<HashSet<_>>();
+    let all_requested_headers_fetched = header_uids.iter().all(|uid| fetched_uids.contains(uid));
+    if let Some(current_uids) = current_uids {
+        cached
+            .messages
+            .retain(|message| current_uids.contains(&message.uid));
+    } else if !vanished_ranges.is_empty() {
+        cached.messages.retain(|message| {
+            !vanished_ranges
+                .iter()
+                .any(|range| range.contains(&message.uid))
+        });
+    }
+    for (uid, unread, starred) in changed_flags {
+        if let Some(message) = cached
+            .messages
+            .iter_mut()
+            .find(|message| message.uid == uid)
+        {
+            message.unread = unread;
+            message.starred = starred;
+        }
+    }
+    cached
+        .messages
+        .retain(|message| !fetched_messages.iter().any(|item| item.uid == message.uid));
+    cached.messages.extend(fetched_messages.iter().cloned());
+    cached
+        .messages
+        .sort_by_key(|message| std::cmp::Reverse(message.uid));
+    cached.uid_validity = uid_validity;
+    cached.highest_mod_seq = if delta_headers_complete && all_requested_headers_fetched {
+        Some(current_mod_seq)
+    } else {
+        Some(previous_mod_seq)
+    };
+    cached.synced_at = synced_at;
+    cached.oldest_uid = cached.messages.iter().map(|message| message.uid).min();
+    Ok(Some(fetched_messages.len()))
 }
 
 /// Fetch one older page for a folder and merge it into the encrypted local cache. The cursor is
@@ -766,6 +1133,7 @@ fn sync_folder_page_once(
         cached.messages.clear();
         cached.oldest_uid = None;
         cached.has_more = false;
+        cached.highest_mod_seq = None;
     }
     let effective_before_uid = if uid_validity_changed {
         None
@@ -861,6 +1229,7 @@ fn sync_folder_page_once(
     fetched_messages.sort_by_key(|message| std::cmp::Reverse(message.uid));
 
     cached.uid_validity = mailbox.uid_validity;
+    cached.highest_mod_seq = mailbox.highest_mod_seq.or(cached.highest_mod_seq);
     cached.synced_at = now_stamp();
     cached
         .messages
@@ -2003,10 +2372,56 @@ pub(crate) fn protect_cache(payload: &[u8]) -> Result<Vec<u8>> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn protect_cache(_payload: &[u8]) -> Result<Vec<u8>> {
-    Err(anyhow!(
-        "MailGo requires Windows data protection for local cache storage"
-    ))
+fn non_windows_cache_key() -> Result<[u8; 32]> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let entry = keyring::Entry::new(NON_WINDOWS_CACHE_KEY_SERVICE, NON_WINDOWS_CACHE_KEY_ACCOUNT)
+        .map_err(|error| anyhow!("protected cache keyring unavailable: {error}"))?;
+    match entry.get_password() {
+        Ok(encoded) => {
+            let decoded = STANDARD
+                .decode(encoded)
+                .map_err(|_| anyhow!("protected cache keyring contains an invalid key"))?;
+            decoded
+                .try_into()
+                .map_err(|_| anyhow!("protected cache keyring contains an invalid key length"))
+        }
+        Err(keyring::Error::NoEntry) => {
+            let mut key = [0_u8; 32];
+            let mut rng = rand::thread_rng();
+            rand::RngCore::fill_bytes(&mut rng, &mut key);
+            entry
+                .set_password(&STANDARD.encode(key))
+                .map_err(|error| anyhow!("save protected cache key: {error}"))?;
+            Ok(key)
+        }
+        Err(error) => Err(anyhow!("load protected cache key: {error}")),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn protect_cache(payload: &[u8]) -> Result<Vec<u8>> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+
+    let key = non_windows_cache_key()?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    let mut nonce = [0_u8; 24];
+    let mut rng = rand::thread_rng();
+    rand::RngCore::fill_bytes(&mut rng, &mut nonce);
+    let ciphertext = cipher
+        .encrypt(XNonce::from_slice(&nonce), payload)
+        .map_err(|_| anyhow!("encrypt local cache"))?;
+    let mut output = Vec::with_capacity(
+        NON_WINDOWS_CACHE_MAGIC
+            .len()
+            .saturating_add(nonce.len())
+            .saturating_add(ciphertext.len()),
+    );
+    output.extend_from_slice(NON_WINDOWS_CACHE_MAGIC);
+    output.extend_from_slice(&nonce);
+    output.extend_from_slice(&ciphertext);
+    Ok(output)
 }
 
 #[cfg(target_os = "windows")]
@@ -2043,10 +2458,27 @@ pub(crate) fn unprotect_cache(payload: &[u8]) -> Result<Vec<u8>> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn unprotect_cache(_payload: &[u8]) -> Result<Vec<u8>> {
-    Err(anyhow!(
-        "MailGo requires Windows data protection for local cache storage"
-    ))
+pub(crate) fn unprotect_cache(payload: &[u8]) -> Result<Vec<u8>> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+
+    let minimum = NON_WINDOWS_CACHE_MAGIC
+        .len()
+        .saturating_add(24)
+        .saturating_add(16);
+    if payload.len() < minimum || !payload.starts_with(NON_WINDOWS_CACHE_MAGIC) {
+        return Err(anyhow!("protected cache envelope is invalid"));
+    }
+    let key = non_windows_cache_key()?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    cipher
+        .decrypt(
+            XNonce::from_slice(
+                &payload[NON_WINDOWS_CACHE_MAGIC.len()..NON_WINDOWS_CACHE_MAGIC.len() + 24],
+            ),
+            &payload[NON_WINDOWS_CACHE_MAGIC.len() + 24..],
+        )
+        .map_err(|_| anyhow!("protected cache could not be unlocked"))
 }
 
 fn safe_component(value: &str) -> String {
@@ -2308,6 +2740,53 @@ mod tests {
     }
 
     #[test]
+    fn incremental_fetch_query_adds_vanished_only_for_qresync() {
+        assert_eq!(
+            delta_fetch_query(IncrementalMode::Condstore, 42),
+            "(UID FLAGS MODSEQ) (CHANGEDSINCE 42)"
+        );
+        assert_eq!(
+            delta_fetch_query(IncrementalMode::Qresync, 42),
+            "(UID FLAGS MODSEQ) (CHANGEDSINCE 42 VANISHED)"
+        );
+    }
+
+    #[test]
+    fn incremental_uid_set_is_sorted_and_deduplicated() {
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = vec![
+            fixture_message(42, "INBOX"),
+            fixture_message(7, "INBOX"),
+            fixture_message(42, "INBOX"),
+        ];
+        assert_eq!(cached_uid_set(&mailbox).as_deref(), Some("7,42"));
+        mailbox.messages.clear();
+        assert_eq!(cached_uid_set(&mailbox), None);
+    }
+
+    #[test]
+    fn status_modseq_parser_handles_quoted_mailboxes_and_unrelated_lines() {
+        let response = b"* STATUS Other (HIGHESTMODSEQ 9)\r\n* STATUS \"Sent Items\" (HIGHESTMODSEQ 12345)\r\n";
+        assert_eq!(
+            parse_status_highest_mod_seq(response, "Sent Items"),
+            Some(12_345)
+        );
+        assert_eq!(
+            parse_status_highest_mod_seq(b"* STATUS INBOX (MESSAGES 2)\r\n", "INBOX"),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_mailbox_snapshots_default_without_a_modseq_cursor() {
+        let mailbox: CachedMailbox = serde_json::from_str(
+            r#"{"schemaVersion":1,"accountId":"fixture","folder":"INBOX","uidValidity":1,"syncedAt":"unix:1","messages":[],"oldestUid":null,"hasMore":false}"#,
+        )
+        .expect("legacy mailbox snapshot");
+        assert_eq!(mailbox.highest_mod_seq, None);
+    }
+
+    #[test]
     fn server_search_query_is_bounded_and_quoted() {
         let query = build_search_query("  release \\\"candidate\\\"  ").unwrap();
         assert!(query.contains("FROM \"release \\\\\\\"candidate\\\\\\\"\""));
@@ -2357,6 +2836,7 @@ mod tests {
             account_id: "fixture-account".into(),
             folder: "INBOX".into(),
             uid_validity: Some(1),
+            highest_mod_seq: None,
             synced_at: now_stamp(),
             messages: vec![fixture_message(7, "INBOX")],
             oldest_uid: Some(7),
@@ -2391,6 +2871,7 @@ mod tests {
             account_id: "fixture-account".into(),
             folder: "INBOX".into(),
             uid_validity: Some(1),
+            highest_mod_seq: None,
             synced_at: now_stamp(),
             messages: vec![fixture_message(1, "INBOX")],
             oldest_uid: Some(1),
@@ -2426,6 +2907,7 @@ mod tests {
             account_id: "fixture-account".into(),
             folder: "INBOX".into(),
             uid_validity: Some(1),
+            highest_mod_seq: None,
             synced_at: now_stamp(),
             messages: vec![fixture_message(8, "INBOX")],
             oldest_uid: Some(8),

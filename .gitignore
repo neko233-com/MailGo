@@ -10,5 +10,6 @@ target/
 secrets/
 local/
 native/.mailgo/
+native/.mailgo-test-target/
 native/*.local.*
 resources/icons/*-preview.png
