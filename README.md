@@ -11,6 +11,7 @@ The current foundation includes:
 - Multiple accounts, including multiple QQ accounts, account switching, and import/export with redacted credentials.
 - Windows desktop also supports password-protected account migration: encrypted export/import keeps provider credentials inside an Argon2id + ChaCha20-Poly1305 bundle and writes them back only to Windows Credential Manager.
 - Local-first UI state with offline cache indicators and a Rust IPC boundary for durable state.
+- The native shell starts from the real local account/cache state; demo messages are browser-preview-only, and first launch provides a direct add-account path.
 - Optional offline-only mode is enforced by the native boundary: cached mail remains readable, network sync/search are paused, outgoing mail is queued encrypted, and local flag/move mutations replay when online mode is restored.
 - Provider quick links and guided authorization-code onboarding.
 - Safe HTML preview mode, attachments, smart categories (including Apple Connect and Apple advertising), search, unread filter, star, reply, compose, theme switching, and user CSS overrides.

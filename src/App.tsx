@@ -343,17 +343,18 @@ function Avatar({ message, size = 'md' }: { message: MailMessage; size?: 'sm' | 
 }
 
 function App() {
+  const isNativeRuntime = Boolean(window.ipc?.postMessage)
   const prefersReducedMotion = useReducedMotion()
   const [theme, setTheme] = useState<ThemeMode>(loadTheme)
-  const [accounts, setAccounts] = useState<MailAccount[]>(sampleAccounts)
-  const [mails, setMails] = useState<MailMessage[]>(() => sampleMails.map((mail) => ({ ...mail, body: [...mail.body], attachments: mail.attachments?.map((attachment) => ({ ...attachment })) })))
+  const [accounts, setAccounts] = useState<MailAccount[]>(() => isNativeRuntime ? [] : sampleAccounts)
+  const [mails, setMails] = useState<MailMessage[]>(() => isNativeRuntime ? [] : sampleMails.map((mail) => ({ ...mail, body: [...mail.body], attachments: mail.attachments?.map((attachment) => ({ ...attachment })) })))
   const [serverSearchMails, setServerSearchMails] = useState<MailMessage[]>([])
   const [serverSearchState, setServerSearchState] = useState<'idle' | 'searching' | 'ready' | 'error'>('idle')
   const [serverSearchTruncated, setServerSearchTruncated] = useState(false)
   const [selectedFolder, setSelectedFolder] = useState<FolderId>('inbox')
   const [selectedCategory, setSelectedCategory] = useState<SmartCategory | null>(null)
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null)
-  const [selectedMailId, setSelectedMailId] = useState('launch-plan')
+  const [selectedMailId, setSelectedMailId] = useState(() => isNativeRuntime ? '' : 'launch-plan')
   const [selectedMailIds, setSelectedMailIds] = useState<string[]>([])
   const [mobilePane, setMobilePane] = useState<MobilePane>('list')
   const [isMobileSidebarOpen, setMobileSidebarOpen] = useState(false)
@@ -410,7 +411,6 @@ function App() {
   const accountPrefillRef = useRef<string | null>(null)
   const selectedMailRef = useRef<MailMessage | undefined>(undefined)
   const attachmentCancelsRef = useRef(new Map<string, () => void>())
-  const isNativeRuntime = Boolean(window.ipc?.postMessage)
   const [nativeStateReady, setNativeStateReady] = useState(!isNativeRuntime)
 
   const openExternalUrl = async (url: string) => {
@@ -593,6 +593,11 @@ function App() {
       }
       if (isNativeRuntime) setAccounts(nativeState.accounts)
       if (isNativeRuntime) setNativeFolders(nativeState.folders ?? {})
+      if (isNativeRuntime) {
+        setMails([])
+        setServerSearchMails([])
+        setSelectedMailId('')
+      }
       setTheme(nativeState.theme)
       setMinimizeToTray(nativeState.minimizeToTray)
       setOfflineMode(nativeState.offlineMode ?? false)
@@ -1839,7 +1844,7 @@ function App() {
                 </motion.section>
               ))}
             </AnimatePresence>
-            {visibleMails.length === 0 && <div className="empty-list"><span className="empty-icon"><Icon name="search" size={24} /></span><strong>没有找到邮件</strong><p>试试清除筛选或搜索其他关键词。</p></div>}
+            {visibleMails.length === 0 && <div className="empty-list"><span className="empty-icon"><Icon name={isNativeRuntime && !nativeStateReady ? 'rotate' : accounts.length === 0 ? 'user' : 'search'} size={24} /></span><strong>{isNativeRuntime && !nativeStateReady ? '正在读取本地邮箱' : accounts.length === 0 ? '还没有添加邮箱账户' : '没有找到邮件'}</strong><p>{isNativeRuntime && !nativeStateReady ? '正在加载本机账户与加密缓存，请稍候。' : accounts.length === 0 ? '添加 Google、QQ、Outlook 或自定义 IMAP/SMTP 账户后开始使用。' : '试试清除筛选或搜索其他关键词。'}</p>{isNativeRuntime && nativeStateReady && accounts.length === 0 && <button type="button" className="empty-list-action" onClick={openNewAccount}><Icon name="add" size={16} />添加第一个账户</button>}</div>}
           </div>
           <div className="list-footer"><span>{visibleMails.length ? `1–${visibleMails.length} / ${visibleMails.length}` : '0 封邮件'}</span><div className="list-footer-actions">{canLoadEarlier && <button type="button" className="load-earlier-button" onClick={() => { void loadEarlier() }} disabled={isLoadingEarlier}>{isLoadingEarlier ? '加载中…' : '加载更早邮件'}</button>}<TooltipButton label="刷新邮件" onClick={handleSync}><Icon name="rotate" size={17} /></TooltipButton></div></div>
         </main>

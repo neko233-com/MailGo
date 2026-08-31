@@ -202,6 +202,8 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .empty-list { display: grid; place-items: center; gap: 6px; padding: 70px 28px; text-align: center; color: var(--muted); }
 .empty-list strong { color: var(--muted-strong); font-size: 14px; }
 .empty-list p { margin: 0; font-size: 12px; }
+.empty-list-action { min-height: 34px; display: inline-flex; align-items: center; gap: 7px; margin-top: 9px; padding: 0 13px; border: 1px solid rgba(119, 129, 255, .55); border-radius: 8px; color: var(--text); background: var(--accent-soft); font-size: 12px; font-weight: 600; }
+.empty-list-action:hover { border-color: var(--accent); background: var(--surface-selected); }
 .empty-icon { width: 48px; height: 48px; display: grid; place-items: center; margin-bottom: 6px; border: 1px solid var(--line); border-radius: 50%; color: var(--accent); background: var(--accent-soft); }
 .list-footer { height: 45px; padding: 0 16px 0 22px; border-top: 1px solid var(--line); color: var(--muted); font-size: 10px; }
 .list-footer-actions { display: flex; align-items: center; gap: 8px; }

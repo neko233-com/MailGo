@@ -81,6 +81,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 72. Credential reads, OAuth refresh results, transfer records, and rollback snapshots now use zeroizing wrappers so secret-bearing intermediate values are cleared on drop, including encrypted transfer serialization.
 73. Windows authorization and provider-help links now use a capability-gated native HTTPS/`mailto` default-handler opener; browser previews retain `window.open`, while embedded credentials and unrelated schemes are rejected.
 74. Sanitized HTML mail links now delegate HTTPS and `mailto` navigation to the same native external opener, preventing WebView navigation away from MailGo and rejecting unsafe schemes at the event boundary.
+75. Native startup now begins with an empty account/cache view instead of browser-demo data; the first-run empty state distinguishes local-state loading, no configured accounts, and an empty mailbox, with a direct add-account action.
 
 ## Remaining production acceptance work
 
