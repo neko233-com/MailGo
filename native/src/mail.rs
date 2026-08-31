@@ -184,7 +184,7 @@ fn build_message(
             index: part.0,
             file_name: safe_attachment_name(part.1.attachment_name().unwrap_or("attachment")),
             content_type: content_type_for_part(part.1),
-            content_id: part.1.content_id().map(str::to_string),
+            content_id: part.1.content_id().and_then(safe_content_id),
             size: part_size(part.1),
             cache_path: None,
         })
@@ -260,7 +260,7 @@ pub fn extract_attachment_payloads(raw: &[u8]) -> Result<Vec<AttachmentPayload>>
         total_bytes = total_bytes.saturating_add(size);
         payloads.push(AttachmentPayload {
             content_type: content_type_for_part(part),
-            content_id: part.content_id().map(str::to_string),
+            content_id: part.content_id().and_then(safe_content_id),
             bytes: part_bytes(part),
         });
     }
@@ -289,17 +289,72 @@ pub fn embed_inline_images(html: &mut Option<String>, payloads: &[AttachmentPayl
         {
             continue;
         }
-        let Some(content_id) = payload.content_id.as_deref() else {
+        let Some(content_id) = payload.content_id.as_deref().and_then(safe_content_id) else {
             continue;
         };
         let encoded = STANDARD.encode(&payload.bytes);
         let data_uri = format!("data:{};base64,{}", payload.content_type, encoded);
         for needle in [format!("cid:{content_id}"), format!("cid:<{content_id}>")] {
-            let replaced = html.replace(&needle, &data_uri);
-            *html = replaced;
+            *html = replace_ascii_case_insensitive(html, &needle, &data_uri);
         }
     }
     *html = truncate_utf8(html, MAX_CACHED_HTML_BYTES);
+}
+
+fn safe_content_id(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .trim_matches(|character| character == '<' || character == '>');
+    if value.is_empty()
+        || value.len() > 128
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(
+                    character,
+                    '!' | '#'
+                        | '$'
+                        | '%'
+                        | '&'
+                        | '\''
+                        | '*'
+                        | '+'
+                        | '-'
+                        | '/'
+                        | '='
+                        | '?'
+                        | '^'
+                        | '_'
+                        | '`'
+                        | '{'
+                        | '|'
+                        | '}'
+                        | '~'
+                        | '.'
+                        | '@'
+                )
+        })
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn replace_ascii_case_insensitive(value: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() {
+        return value.to_string();
+    }
+    let lowered_value = value.to_ascii_lowercase();
+    let lowered_needle = needle.to_ascii_lowercase();
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0usize;
+    while let Some(relative) = lowered_value[cursor..].find(&lowered_needle) {
+        let start = cursor + relative;
+        output.push_str(&value[cursor..start]);
+        output.push_str(replacement);
+        cursor = start + needle.len();
+    }
+    output.push_str(&value[cursor..]);
+    output
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> String {
@@ -499,6 +554,28 @@ mod tests {
         let html = message.html_body.unwrap();
         assert!(html.contains("data:image/png;base64,"));
         assert_eq!(message.attachments.len(), 1);
+    }
+
+    #[test]
+    fn matches_inline_cid_references_without_case_sensitivity() {
+        let payload = AttachmentPayload {
+            content_type: "image/png".into(),
+            content_id: Some("logo@example.com".into()),
+            bytes: vec![0, 1, 2],
+        };
+        let mut html = Some("<img src=\"CID:<LOGO@EXAMPLE.COM>\">".to_string());
+        embed_inline_images(&mut html, &[payload]);
+        assert!(html
+            .as_deref()
+            .is_some_and(|value| value.starts_with("<img src=\"data:image/png;base64,")));
+    }
+
+    #[test]
+    fn drops_unsafe_content_ids_from_attachment_metadata() {
+        let raw = "From: sender@example.com\r\nSubject: Unsafe CID\r\nContent-Type: multipart/related; boundary=related\r\n\r\n--related\r\nContent-Type: text/html\r\n\r\n<p>body</p>\r\n--related\r\nContent-Type: image/png\r\nContent-Disposition: inline; filename=\"pixel.png\"\r\nContent-ID: <bad id>\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n--related--\r\n";
+        let message = parse_full("account", "INBOX", 12, false, false, raw.as_bytes()).unwrap();
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(message.attachments[0].content_id, None);
     }
 
     #[test]
