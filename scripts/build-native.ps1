@@ -1,5 +1,6 @@
 param(
-    [switch]$Run
+    [switch]$Run,
+    [switch]$Release
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,8 +10,12 @@ $manifest = Join-Path $projectRoot 'native\Cargo.toml'
 
 New-Item -ItemType Directory -Force -Path $targetRoot | Out-Null
 $cargoCommand = if ($Run) { 'run' } else { 'build' }
+$cargoArguments = @('--manifest-path', $manifest, '--locked', '--target-dir', $targetRoot)
+if ($Release) {
+    $cargoArguments += '--release'
+}
 
-& cargo $cargoCommand --manifest-path $manifest --locked --target-dir $targetRoot
+& cargo $cargoCommand @cargoArguments
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }

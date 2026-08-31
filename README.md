@@ -89,6 +89,7 @@ npm run native:run
 ```
 
 The native shell loads `dist/` through the framework-owned `rdesktop://` protocol. Run `npm run build` before compiling Rust.
+`npm run native:run` intentionally launches the Release shell so Windows application-control policies do not reject the Debug binary during smoke testing; `npm run native:build` remains the fast development build.
 
 Create a self-contained portable Windows package with the release shell and renderer assets:
 
