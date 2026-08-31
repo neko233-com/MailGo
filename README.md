@@ -101,6 +101,15 @@ npm run package:windows
 Extract the archive and launch `MailGo.exe`. The package expects a compatible WebView2 runtime on Windows. The installed rdesktop 0.1.8 CLI currently emits a small NSIS placeholder from `rdesktop bundle`; do not distribute that generated file as an installer. Generate the portable archive on a release build host where the Windows application-control policy permits Cargo Release build scripts; this repository intentionally does not ship an unsigned or placeholder installer.
 The Windows npm scripts place Cargo's target directory under `%LOCALAPPDATA%\MailGo\cargo-target` so application-control policies do not block dependency build scripts in the repository checkout.
 
+Build a signed MSIX on a Windows release host with the Windows SDK (`makeappx.exe` and `signtool.exe`) and a trusted production certificate. The command fails closed without those tools and a certificate; it does not create an unsigned production installer:
+
+```powershell
+$env:MAILGO_SIGNING_PFX_PASSWORD = "use-a-secret-manager-value"
+npm run package:msix -- -Publisher "CN=MailGo Release" -CertificatePath C:\secure\MailGo.pfx
+```
+
+Prefer `-CertificateThumbprint` when the certificate is installed in the release host's protected certificate store. MSIX still requires the WebView2 Evergreen Runtime on the target machine; runtime bootstrapper packaging and signed-certificate provisioning belong to the release host, not the source repository.
+
 ## Publishing
 
 This repository has no GitHub Actions. Releases and publication are intentionally manual and require an explicit user instruction. Run the release gate to build, test, package, hash, and write a manifest without publishing:

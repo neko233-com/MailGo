@@ -101,6 +101,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 92. Full-message reads now preflight the server-advertised `RFC822.SIZE` before requesting the MIME body, while retaining the post-fetch 64 MiB bound as a defense against inaccurate servers.
 93. The scheduled rdesktop updater now installs only the manually reviewed SHA in `config/rdesktop-trusted-revision.txt`; upstream default-branch movement cannot silently change the local framework.
 94. Manual sync, pagination, server search, background refresh, and account reauthorization/removal now coordinate through a per-account in-flight lease, preventing duplicate IMAP work and cache recreation after destructive account operations.
+95. A fail-closed MSIX packaging path now reuses the deterministic Release portable build, emits an explicit desktop manifest, requires Windows SDK tooling and a production certificate, and verifies the Authenticode signature before handing off the installer.
 
 ## Remaining production acceptance work
 
