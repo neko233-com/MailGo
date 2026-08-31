@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -18,6 +19,8 @@ const SESSION_TTL_SECONDS: u64 = 10 * 60;
 const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:8765/oauth/callback";
 const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const HTTP_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const CALLBACK_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_PENDING_CALLBACKS: usize = 16;
 
 static HTTP_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
@@ -30,6 +33,19 @@ fn http_agent() -> &'static ureq::Agent {
             .build()
     })
 }
+
+struct PendingCallback {
+    callback: Arc<Mutex<Option<CallbackResult>>>,
+    expires_at: u64,
+}
+
+struct LoopbackListener {
+    expected_path: String,
+    callbacks: Mutex<HashMap<String, PendingCallback>>,
+}
+
+static LOOPBACK_LISTENERS: OnceLock<Mutex<HashMap<String, Arc<LoopbackListener>>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct PendingSession {
@@ -166,7 +182,7 @@ pub fn start(provider: ProviderKind, email: &str) -> Result<(PendingSession, Sta
     let authorization_url = authorization.finish();
     let now = now_seconds();
     let callback = Arc::new(Mutex::new(None));
-    spawn_loopback_listener(&config.redirect_uri, callback.clone());
+    register_loopback_listener(&config.redirect_uri, &state, callback.clone());
     let session = PendingSession {
         id: session_id.clone(),
         provider,
@@ -548,7 +564,11 @@ fn parse_retry_after(value: Option<&str>, fallback: u64) -> u64 {
         .unwrap_or(fallback.clamp(5, 3600))
 }
 
-fn spawn_loopback_listener(redirect_uri: &str, callback: Arc<Mutex<Option<CallbackResult>>>) {
+fn register_loopback_listener(
+    redirect_uri: &str,
+    state: &str,
+    callback: Arc<Mutex<Option<CallbackResult>>>,
+) {
     let Ok(parsed) = url::Url::parse(redirect_uri) else {
         return;
     };
@@ -558,53 +578,126 @@ fn spawn_loopback_listener(redirect_uri: &str, callback: Arc<Mutex<Option<Callba
     let Some(port) = parsed.port_or_known_default() else {
         return;
     };
-    let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) else {
-        tracing::debug!(
-            port,
-            "OAuth loopback port unavailable; manual code entry remains enabled"
-        );
+    let expected_path = parsed.path().to_string();
+    let listener_key = format!("{port}:{expected_path}");
+    let listeners = LOOPBACK_LISTENERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let listener_state = {
+        let Ok(mut listeners) = listeners.lock() else {
+            return;
+        };
+        if let Some(existing) = listeners.get(&listener_key) {
+            existing.clone()
+        } else {
+            let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) else {
+                tracing::debug!(
+                    port,
+                    "OAuth loopback port unavailable; manual code entry remains enabled"
+                );
+                return;
+            };
+            let created = Arc::new(LoopbackListener {
+                expected_path: expected_path.clone(),
+                callbacks: Mutex::new(HashMap::new()),
+            });
+            let thread_state = created.clone();
+            if thread::Builder::new()
+                .name("mailgo-oauth-callback".into())
+                .spawn(move || run_loopback_listener(listener, thread_state))
+                .is_err()
+            {
+                tracing::debug!(port, "OAuth loopback listener thread could not start");
+                return;
+            }
+            listeners.insert(listener_key, created.clone());
+            created
+        }
+    };
+
+    let Ok(mut callbacks) = listener_state.callbacks.lock() else {
         return;
     };
-    let expected_path = parsed.path().to_string();
-    let _ = thread::Builder::new()
-        .name("mailgo-oauth-callback".into())
-        .spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            let Some(request_target) = read_request_target(&mut stream) else {
-                return;
-            };
-            let callback_result = parse_callback(&request_target, &expected_path);
-            let body = match &callback_result {
+    let now = now_seconds();
+    callbacks.retain(|_, pending| pending.expires_at > now);
+    if callbacks.len() >= MAX_PENDING_CALLBACKS {
+        tracing::debug!(
+            port,
+            "OAuth callback capacity reached; manual code entry remains enabled"
+        );
+        return;
+    }
+    callbacks.insert(
+        state.to_string(),
+        PendingCallback {
+            callback,
+            expires_at: now.saturating_add(SESSION_TTL_SECONDS),
+        },
+    );
+}
+
+fn run_loopback_listener(listener: TcpListener, state: Arc<LoopbackListener>) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(CALLBACK_SOCKET_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(CALLBACK_SOCKET_TIMEOUT));
+        let Some(request_target) = read_request_target(&mut stream) else {
+            continue;
+        };
+        let callback_result = parse_callback(&request_target, &state.expected_path);
+        let callback = callback_state(&request_target).and_then(|callback_state| {
+            state
+                .callbacks
+                .lock()
+                .ok()?
+                .remove(&callback_state)
+                .map(|pending| pending.callback)
+        });
+        let body = if callback.is_some() {
+            match &callback_result {
                 CallbackResult::Code { .. } => {
                     "<h1>MailGo 授权完成</h1><p>可以返回 MailGo 继续同步。</p>"
                 }
-                CallbackResult::Error(_) => {
-                    "<h1>MailGo 授权失败</h1><p>可以返回 MailGo 重试。</p>"
-                }
-            };
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(), body
-            );
-            let _ = stream.write_all(response.as_bytes());
+                CallbackResult::Error(_) => "<h1>MailGo 授权失败</h1><p>可以返回 MailGo 重试。</p>",
+            }
+        } else {
+            "<h1>MailGo 授权请求已失效</h1><p>请返回 MailGo 重新开始授权。</p>"
+        };
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        if let Some(callback) = callback {
             if let Ok(mut stored) = callback.lock() {
                 *stored = Some(callback_result);
             }
-        });
+        }
+    }
 }
 
 fn read_request_target(stream: &mut TcpStream) -> Option<String> {
     let mut buffer = [0u8; 16 * 1024];
     let size = stream.read(&mut buffer).ok()?;
     let request = std::str::from_utf8(&buffer[..size]).ok()?;
-    request
-        .lines()
-        .next()?
-        .split_whitespace()
-        .nth(1)
-        .map(str::to_string)
+    let mut fields = request.lines().next()?.split_whitespace();
+    let method = fields.next()?;
+    let target = fields.next()?;
+    if method != "GET" || !target.starts_with('/') || target.len() > 8192 {
+        return None;
+    }
+    Some(target.to_string())
+}
+
+fn callback_state(target: &str) -> Option<String> {
+    let parsed = url::Url::parse(&format!("http://127.0.0.1{target}")).ok()?;
+    let state = parsed
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))?;
+    if state.is_empty() || state.len() > 256 {
+        return None;
+    }
+    Some(state)
 }
 
 fn parse_callback(target: &str, expected_path: &str) -> CallbackResult {
@@ -684,6 +777,16 @@ mod tests {
             parse_callback("/wrong?code=abc&state=xyz", "/oauth/callback"),
             CallbackResult::Error(_)
         ));
+    }
+
+    #[test]
+    fn callback_state_is_bounded_and_extracted_for_dispatch() {
+        assert_eq!(
+            callback_state("/oauth/callback?code=abc&state=xyz"),
+            Some("xyz".to_string())
+        );
+        assert!(callback_state(&format!("/oauth/callback?state={}", "x".repeat(257))).is_none());
+        assert!(callback_state("/oauth/callback?code=abc").is_none());
     }
 
     #[test]

@@ -1236,7 +1236,7 @@ function App() {
         setOauthSessionId(flow.sessionId)
         setOauthState(flow.state)
         window.open(flow.authorizationUrl, '_blank', 'noopener,noreferrer')
-        pushToast('OAuth 授权页面已打开，完成后将授权码粘贴回来', 'info')
+        pushToast('OAuth 授权页面已打开，完成后返回 MailGo 点击“开始同步”；回调不可用时再手动粘贴授权码', 'info')
         return
       } catch (error) {
         pushToast(error instanceof Error ? error.message : 'OAuth 客户端尚未配置，将打开帮助页面', 'error')

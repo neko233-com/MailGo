@@ -43,7 +43,7 @@ $env:MAILGO_OUTLOOK_CLIENT_ID = "your-registered-microsoft-client-id"
 $env:MAILGO_OUTLOOK_REDIRECT_URI = "http://127.0.0.1:8765/oauth/callback"
 ```
 
-The redirect URI must be registered exactly with the provider. MailGo listens once on a configured `127.0.0.1` callback and lets the account assistant exchange the returned code directly; manual code entry remains available when the callback port is unavailable. Outlook uses a native Device Flow path in the account assistant: it opens the verification page, displays the user code, polls with provider-supplied intervals, and keeps the resulting token only in Windows Credential Manager.
+The redirect URI must be registered exactly with the provider. MailGo keeps a shared listener for each configured `127.0.0.1` callback port/path and routes simultaneous OAuth returns by their validated `state`; the account assistant exchanges the returned code directly, while manual code entry remains available when the callback port is unavailable. Outlook uses a native Device Flow path in the account assistant: it opens the verification page, displays the user code, polls with provider-supplied intervals, and keeps the resulting token only in Windows Credential Manager.
 
 Use the settings panel's encrypted account transfer actions when moving fully configured accounts between Windows machines. Choose a strong transfer password of at least 12 characters; the password is never stored, and a bundle cannot be recovered if it is forgotten. The browser preview intentionally disables credential-bearing transfer actions.
 
