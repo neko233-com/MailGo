@@ -2060,6 +2060,15 @@ fn handle_ipc(
                 if matches!(operation, "move" | "archive") && target_folder.is_none() {
                     return Err(anyhow!("{operation} destination is required"));
                 }
+                if message.cmd == "mail.spam" {
+                    let profile = profile_for_account(&account)?;
+                    if !target_folder
+                        .as_deref()
+                        .is_some_and(|target| sync::is_spam_folder(profile.provider, target))
+                    {
+                        return Err(anyhow!("spam destination must be the provider spam folder"));
+                    }
+                }
                 if operation == "delete" {
                     let profile = profile_for_account(&account)?;
                     let permanent = target_folder

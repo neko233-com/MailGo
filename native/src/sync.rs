@@ -1908,6 +1908,16 @@ pub fn is_trash_folder(provider: crate::providers::ProviderKind, folder: &str) -
     folder.eq_ignore_ascii_case(expected)
 }
 
+pub fn is_spam_folder(provider: crate::providers::ProviderKind, folder: &str) -> bool {
+    let expected = match provider {
+        crate::providers::ProviderKind::Google => "[Gmail]/Spam",
+        crate::providers::ProviderKind::Qq => "Spam",
+        crate::providers::ProviderKind::Outlook => "Junk Email",
+        crate::providers::ProviderKind::Other => "Spam",
+    };
+    folder.eq_ignore_ascii_case(expected)
+}
+
 pub fn queue_move_mutation(
     cache_root: &Path,
     account_id: &str,
@@ -2633,6 +2643,23 @@ mod tests {
         let stream = connect_socket("127.0.0.1", port).expect("connect fixture socket");
         assert_eq!(stream.read_timeout().unwrap(), Some(IMAP_IO_TIMEOUT));
         assert_eq!(stream.write_timeout().unwrap(), Some(IMAP_IO_TIMEOUT));
+    }
+
+    #[test]
+    fn provider_spam_folder_mapping_is_case_insensitive_and_provider_specific() {
+        assert!(is_spam_folder(
+            crate::providers::ProviderKind::Google,
+            "[gmail]/spam"
+        ));
+        assert!(is_spam_folder(crate::providers::ProviderKind::Qq, "spam"));
+        assert!(is_spam_folder(
+            crate::providers::ProviderKind::Outlook,
+            "JUNK EMAIL"
+        ));
+        assert!(!is_spam_folder(
+            crate::providers::ProviderKind::Google,
+            "[Gmail]/Trash"
+        ));
     }
 
     #[test]
