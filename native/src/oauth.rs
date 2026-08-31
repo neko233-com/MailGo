@@ -720,14 +720,17 @@ fn run_loopback_listener(listener: TcpListener, state: Arc<LoopbackListener>) {
             continue;
         };
         let callback_result = parse_callback(&request_target, &state.expected_path);
-        let callback = callback_state(&request_target).and_then(|callback_state| {
-            state
-                .callbacks
-                .lock()
-                .ok()?
-                .remove(&callback_state)
-                .map(|pending| pending.callback)
-        });
+        let callback = is_expected_callback_path(&request_target, &state.expected_path)
+            .then(|| callback_state(&request_target))
+            .flatten()
+            .and_then(|callback_state| {
+                state
+                    .callbacks
+                    .lock()
+                    .ok()?
+                    .remove(&callback_state)
+                    .map(|pending| pending.callback)
+            });
         let body = if callback.is_some() {
             match &callback_result {
                 CallbackResult::Code { .. } => {
@@ -773,6 +776,12 @@ fn callback_state(target: &str) -> Option<String> {
         return None;
     }
     Some(state)
+}
+
+fn is_expected_callback_path(target: &str, expected_path: &str) -> bool {
+    url::Url::parse(&format!("http://127.0.0.1{target}"))
+        .map(|parsed| parsed.path() == expected_path)
+        .unwrap_or(false)
 }
 
 fn parse_callback(target: &str, expected_path: &str) -> CallbackResult {
@@ -862,6 +871,14 @@ mod tests {
         );
         assert!(callback_state(&format!("/oauth/callback?state={}", "x".repeat(257))).is_none());
         assert!(callback_state("/oauth/callback?code=abc").is_none());
+        assert!(is_expected_callback_path(
+            "/oauth/callback?code=abc&state=xyz",
+            "/oauth/callback"
+        ));
+        assert!(!is_expected_callback_path(
+            "/wrong?code=abc&state=xyz",
+            "/oauth/callback"
+        ));
     }
 
     #[test]

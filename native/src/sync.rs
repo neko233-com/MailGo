@@ -2625,11 +2625,19 @@ fn discover_folders(
     let listed = session
         .list(None, Some("*"))
         .map(|names| {
-            names
-                .iter()
-                .map(|name| name.name().to_string())
-                .filter(|name| is_safe_discovered_folder(name))
-                .collect::<Vec<_>>()
+            let mut bounded = Vec::with_capacity(MAX_DISCOVERED_FOLDERS);
+            for name in names.iter().map(|name| name.name().to_string()) {
+                if !is_safe_discovered_folder(&name) {
+                    continue;
+                }
+                let is_preferred = preferred
+                    .iter()
+                    .any(|candidate| name.eq_ignore_ascii_case(candidate));
+                if is_preferred || bounded.len() < MAX_DISCOVERED_FOLDERS {
+                    bounded.push(name);
+                }
+            }
+            bounded
         })
         .unwrap_or_default();
     if listed.is_empty() {
