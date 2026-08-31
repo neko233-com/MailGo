@@ -33,6 +33,8 @@ const MAX_DELTA_HEADER_UIDS: usize = MAX_HEADER_MESSAGES;
 const MAX_DELTA_VANISHED_RANGES: usize = MAX_CACHED_MESSAGES_PER_FOLDER;
 const IMAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const IMAP_IO_TIMEOUT: Duration = Duration::from_secs(60);
+const INITIAL_SYNC_DELAY: Duration = Duration::from_secs(3);
+const BACKGROUND_SYNC_INTERVAL: Duration = Duration::from_secs(300);
 const CACHE_FILE: &str = "inbox.bin";
 const MUTATION_FILE: &str = "mutations.bin";
 const MOVE_MUTATION_FILE: &str = "moves.bin";
@@ -365,99 +367,107 @@ fn parse_status_highest_mod_seq(response: &[u8], expected_folder: &str) -> Optio
 pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathBuf) {
     thread::Builder::new()
         .name("mailgo-sync-scheduler".into())
-        .spawn(move || loop {
-            thread::sleep(Duration::from_secs(300));
-            let (accounts, notifications_enabled, offline_mode) = match shared.lock() {
-                Ok(app) => (
-                    app.state.accounts.clone(),
-                    app.state.notifications_enabled,
-                    app.state.offline_mode,
-                ),
-                Err(_) => {
-                    tracing::warn!("background sync state lock poisoned");
-                    continue;
-                }
-            };
-            if offline_mode {
-                tracing::debug!("background sync skipped because offline-only mode is enabled");
-                continue;
-            }
-            for account in accounts {
-                let profile = match crate::profile_for_account(&account) {
-                    Ok(profile) => profile,
-                    Err(_) => continue,
-                };
-                let credential = match crate::load_credential(&account) {
-                    Ok(credential) => credential,
-                    Err(error) => {
-                        crate::record_account_sync_failure(
-                            &shared,
-                            &account.id,
-                            needs_reauthorization(&error),
-                        );
-                        tracing::warn!(
-                            account_id = %account.id,
-                            "background credential load failed: {error}"
-                        );
+        .spawn(move || {
+            let mut first_run = true;
+            loop {
+                thread::sleep(if first_run {
+                    INITIAL_SYNC_DELAY
+                } else {
+                    BACKGROUND_SYNC_INTERVAL
+                });
+                first_run = false;
+                let (accounts, notifications_enabled, offline_mode) = match shared.lock() {
+                    Ok(app) => (
+                        app.state.accounts.clone(),
+                        app.state.notifications_enabled,
+                        app.state.offline_mode,
+                    ),
+                    Err(_) => {
+                        tracing::warn!("background sync state lock poisoned");
                         continue;
                     }
                 };
-                if let Err(error) = crate::outbox::flush_due(
-                    &cache_root,
-                    &account.id,
-                    profile.clone(),
-                    &account.email,
-                    &credential,
-                ) {
-                    tracing::warn!(
-                        account_id = %account.id,
-                        "background outbox flush failed: {error}"
-                    );
+                if offline_mode {
+                    tracing::debug!("background sync skipped because offline-only mode is enabled");
+                    continue;
                 }
-                match sync_account(
-                    &account.id,
-                    profile,
-                    &account.email,
-                    &credential,
-                    &cache_root,
-                ) {
-                    Ok(result) => {
-                        if notifications_enabled && result.unread > account.unread as usize {
-                            crate::tray::notify_new_mail(
-                                "MailGo",
-                                &format!(
-                                    "{} 有 {} 封未读邮件",
-                                    account.label,
-                                    result.unread - account.unread as usize
-                                ),
+                for account in accounts {
+                    let profile = match crate::profile_for_account(&account) {
+                        Ok(profile) => profile,
+                        Err(_) => continue,
+                    };
+                    let credential = match crate::load_credential(&account) {
+                        Ok(credential) => credential,
+                        Err(error) => {
+                            crate::record_account_sync_failure(
+                                &shared,
+                                &account.id,
+                                needs_reauthorization(&error),
                             );
+                            tracing::warn!(
+                                account_id = %account.id,
+                                "background credential load failed: {error}"
+                            );
+                            continue;
                         }
-                        if let Ok(mut app) = shared.lock() {
-                            if let Some(stored) = app
-                                .state
-                                .accounts
-                                .iter_mut()
-                                .find(|item| item.id == account.id)
-                            {
-                                stored.unread = result.unread as u32;
-                                stored.status = "synced".into();
-                                stored.last_sync = "后台刚刚同步".into();
-                            }
-                            if let Err(error) = app.save() {
-                                tracing::warn!("background sync state save failed: {error}");
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        crate::record_account_sync_failure(
-                            &shared,
-                            &account.id,
-                            needs_reauthorization(&error),
-                        );
+                    };
+                    if let Err(error) = crate::outbox::flush_due(
+                        &cache_root,
+                        &account.id,
+                        profile.clone(),
+                        &account.email,
+                        &credential,
+                    ) {
                         tracing::warn!(
                             account_id = %account.id,
-                            "background sync failed: {error}"
+                            "background outbox flush failed: {error}"
                         );
+                    }
+                    match sync_account(
+                        &account.id,
+                        profile,
+                        &account.email,
+                        &credential,
+                        &cache_root,
+                    ) {
+                        Ok(result) => {
+                            if notifications_enabled && result.unread > account.unread as usize {
+                                crate::tray::notify_new_mail(
+                                    "MailGo",
+                                    &format!(
+                                        "{} 有 {} 封未读邮件",
+                                        account.label,
+                                        result.unread - account.unread as usize
+                                    ),
+                                );
+                            }
+                            if let Ok(mut app) = shared.lock() {
+                                if let Some(stored) = app
+                                    .state
+                                    .accounts
+                                    .iter_mut()
+                                    .find(|item| item.id == account.id)
+                                {
+                                    stored.unread = result.unread as u32;
+                                    stored.status = "synced".into();
+                                    stored.last_sync = "后台刚刚同步".into();
+                                }
+                                if let Err(error) = app.save() {
+                                    tracing::warn!("background sync state save failed: {error}");
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            crate::record_account_sync_failure(
+                                &shared,
+                                &account.id,
+                                needs_reauthorization(&error),
+                            );
+                            tracing::warn!(
+                                account_id = %account.id,
+                                "background sync failed: {error}"
+                            );
+                        }
                     }
                 }
             }

@@ -42,6 +42,7 @@ The current foundation includes:
 - Account reauthorization now commits the new credential and metadata as one recoverable operation; a persistence failure restores the previous account state and credential, and outbox-resume errors cannot falsely report the account as unsaved.
 - Account removal uses the same recovery boundary: cache, draft, outbox, and Credential Manager cleanup must finish before the account list is committed, and failures restore the prior credential/state snapshot.
 - Windows tray lifecycle is implemented with the generated `resources/icons/mailgo.ico`: close-to-tray, restore on click, deliberate quit, and a five-minute background sync scheduler.
+- The background scheduler performs a short delayed first sync after launch, then continues on its five-minute cadence; offline-only mode skips both paths.
 - The tray icon re-registers itself after Windows Explorer/taskbar restarts, so a hidden MailGo window remains recoverable without restarting the app.
 - Custom IMAP/SMTP onboarding accepts host, port, TLS mode, and password/app-password/OAuth2 settings without putting credentials in metadata.
 
