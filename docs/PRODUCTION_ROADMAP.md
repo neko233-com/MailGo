@@ -82,6 +82,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 73. Windows authorization and provider-help links now use a capability-gated native HTTPS/`mailto` default-handler opener; browser previews retain `window.open`, while embedded credentials and unrelated schemes are rejected.
 74. Sanitized HTML mail links now delegate HTTPS and `mailto` navigation to the same native external opener, preventing WebView navigation away from MailGo and rejecting unsafe schemes at the event boundary.
 75. Native startup now begins with an empty account/cache view instead of browser-demo data; the first-run empty state distinguishes local-state loading, no configured accounts, and an empty mailbox, with a direct add-account action.
+76. Google and Outlook OAuth redirect configuration now fails closed unless it is an explicit `http://127.0.0.1:<port>/<path>` callback without userinfo, query, or fragment components; this keeps authorization returns local to the desktop process.
 
 ## Remaining production acceptance work
 

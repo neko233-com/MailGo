@@ -516,8 +516,7 @@ fn provider_config(provider: ProviderKind) -> Result<ProviderOAuthConfig> {
         ProviderKind::Google => Ok(ProviderOAuthConfig {
             client_id: required_env("MAILGO_GOOGLE_CLIENT_ID")?,
             client_secret: optional_env("MAILGO_GOOGLE_CLIENT_SECRET"),
-            redirect_uri: optional_env("MAILGO_GOOGLE_REDIRECT_URI")
-                .unwrap_or_else(|| DEFAULT_REDIRECT_URI.into()),
+            redirect_uri: configured_redirect_uri("MAILGO_GOOGLE_REDIRECT_URI")?,
             authorization_endpoint: "https://accounts.google.com/o/oauth2/v2/auth",
             token_endpoint: "https://oauth2.googleapis.com/token",
             scopes: "openid email https://mail.google.com/",
@@ -526,8 +525,7 @@ fn provider_config(provider: ProviderKind) -> Result<ProviderOAuthConfig> {
         ProviderKind::Outlook => Ok(ProviderOAuthConfig {
             client_id: required_env("MAILGO_OUTLOOK_CLIENT_ID")?,
             client_secret: optional_env("MAILGO_OUTLOOK_CLIENT_SECRET"),
-            redirect_uri: optional_env("MAILGO_OUTLOOK_REDIRECT_URI")
-                .unwrap_or_else(|| DEFAULT_REDIRECT_URI.into()),
+            redirect_uri: configured_redirect_uri("MAILGO_OUTLOOK_REDIRECT_URI")?,
             authorization_endpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
             token_endpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
             scopes: "openid email offline_access https://outlook.office365.com/IMAP.AccessAsUser.All https://outlook.office365.com/SMTP.Send",
@@ -550,6 +548,34 @@ fn optional_env(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn validate_loopback_redirect_uri(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.len() > 2048 {
+        return Err(anyhow!("OAuth redirect URI is too long"));
+    }
+    let parsed = url::Url::parse(value).context("OAuth redirect URI is invalid")?;
+    if parsed.scheme() != "http"
+        || parsed.host_str() != Some("127.0.0.1")
+        || parsed.port().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path().is_empty()
+        || !parsed.path().starts_with('/')
+    {
+        return Err(anyhow!(
+            "OAuth redirect URI must be an http URL on 127.0.0.1 with an explicit port and path"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn configured_redirect_uri(name: &str) -> Result<String> {
+    let value = optional_env(name).unwrap_or_else(|| DEFAULT_REDIRECT_URI.to_string());
+    validate_loopback_redirect_uri(&value)
 }
 
 fn parse_retry_after(value: Option<&str>, fallback: u64) -> u64 {
@@ -809,5 +835,20 @@ mod tests {
         assert_eq!(parse_retry_after(Some("1"), 5), 5);
         assert_eq!(parse_retry_after(Some("99999"), 5), 3600);
         assert_eq!(parse_retry_after(Some("invalid"), 15), 15);
+    }
+
+    #[test]
+    fn redirect_uri_is_restricted_to_loopback_http() {
+        assert!(validate_loopback_redirect_uri("http://127.0.0.1:8765/oauth/callback").is_ok());
+        assert!(
+            validate_loopback_redirect_uri("http://127.0.0.1:8765/oauth/callback?x=1").is_err()
+        );
+        assert!(validate_loopback_redirect_uri("https://127.0.0.1:8765/oauth/callback").is_err());
+        assert!(validate_loopback_redirect_uri("http://127.0.0.1/oauth/callback").is_err());
+        assert!(validate_loopback_redirect_uri("http://example.com:8765/oauth/callback").is_err());
+        assert!(
+            validate_loopback_redirect_uri("http://user:pass@127.0.0.1:8765/oauth/callback")
+                .is_err()
+        );
     }
 }
