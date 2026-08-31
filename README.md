@@ -16,6 +16,7 @@ The current foundation includes:
 - Safe HTML preview mode, attachments, smart categories (including Apple Connect and Apple advertising), search, unread filter, star, reply, compose, theme switching, and user CSS overrides.
 - Local-only advertising classification can optionally hide ads from normal lists while keeping Apple Connect security mail and smart-category access visible.
 - Rust `neko233-com/rdesktop` WebView2 shell with custom frameless title bar and preserved WebView data directory under `%LOCALAPPDATA%\\MailGo\\WebView2`.
+- The renderer uses Windows system fonts rather than remote web fonts, so the packaged UI has no implicit font-network dependency in offline mode.
 - Windows Credential Manager integration through `keyring` for authorization-code storage; secrets never enter `state.json` or account exports.
 - Theme changes are written to the native state after startup hydration, and user CSS is capped at 64 KiB with a session-only fallback when WebView storage is unavailable.
 - Packaged native RPC calls carry a per-launch capability from the trusted app URL; forged or navigated-away renderer messages are rejected before any account, credential, filesystem, or network operation.

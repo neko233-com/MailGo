@@ -26,6 +26,12 @@ try {
     & npm run build
     if ($LASTEXITCODE -ne 0) { throw "npm run build failed with exit code $LASTEXITCODE" }
 
+    $remoteFontReferences = Get-ChildItem -LiteralPath (Join-Path $projectRoot 'dist') -File -Recurse |
+        Select-String -Pattern 'fonts\.(googleapis|gstatic)\.com' -ErrorAction SilentlyContinue
+    if ($remoteFontReferences) {
+        throw 'renderer contains a remote font dependency; Windows packages must remain usable offline'
+    }
+
     & rdesktop build --path $projectRoot
     if ($LASTEXITCODE -ne 0) { throw "rdesktop build failed with exit code $LASTEXITCODE" }
 
