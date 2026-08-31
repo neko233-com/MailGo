@@ -26,7 +26,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 20. Release packaging has a reproducible Windows portable ZIP path; the native shell resolves renderer assets beside the executable, with an environment override for controlled deployment.
 21. Existing accounts can re-enter the authorization flow without changing their stable account ID, and native account removal clears the protected credential plus the account-scoped offline cache.
 22. Windows desktop can export/import fully configured accounts through a password-protected Argon2id + ChaCha20-Poly1305 bundle; decrypted credentials are written only to Windows Credential Manager and imported account caches are reset before the next sync.
-23. The per-user rdesktop updater is pinned to the reviewed upstream commit, preserves a working installation when local application-control policy blocks source builds, and only accepts a newer release fallback when a configured Authenticode signer trust root and the asset digest both verify.
+23. The per-user rdesktop updater resolves the latest upstream default-branch commit to an exact SHA before installing, preserves a working installation when local application-control policy blocks source builds, and only accepts a newer release fallback when a configured Authenticode signer trust root and the asset digest both verify.
 24. Persisted state loading explicitly migrates legacy missing fields and both snake_case/camelCase spellings, normalizes the current schema version, and rejects future unsupported versions before touching the backup state.
 25. Native MIME sanitization now retains only safe HTTPS image sources and removes tracking-related attributes before caching; the renderer blocks remote images by default while preserving safe HTTPS/mailto links and inline CID images.
 26. Sync retry handling honors numeric `Retry-After` hints that survive transport errors, with a bounded 1–300 second cap and exponential fallback for providers that omit the hint.
@@ -57,10 +57,11 @@ The repository is deliberately split into a real desktop UI foundation and provi
 48. IMAP synchronization now enables capability-driven QRESYNC/CONDSTORE deltas, persists bounded `HIGHESTMODSEQ` cursors, removes QRESYNC `VANISHED` UIDs, discovers new UIDs without an `ALL` search, and safely falls back to the existing UID path when an extension is unavailable or rejected.
 49. Non-Windows builds now protect mailbox and attachment caches with a random XChaCha20-Poly1305 key stored in the platform keyring; the Windows DPAPI path remains unchanged.
 50. OAuth device, authorization-code, and refresh requests now retain bounded numeric `Retry-After` guidance for HTTP 429 responses without exposing response bodies or credentials.
+51. Incremental and UID fallback syncs retain the previous delta cursor while bounded header windows are incomplete, fetch unseen UIDs oldest-first, and only advance the cursor after every requested header parses successfully.
 
 ## Remaining production acceptance work
 
-- Provider-specific rate-limit headers/backoff and richer MIME regression fixtures.
+- Provider-specific IMAP/SMTP rate-limit headers/backoff and broader provider MIME corpus coverage.
 - Disposable-provider acceptance tests for OAuth/IMAP/SMTP, including reconnect, UIDVALIDITY changes, folder mappings, and server-side mutation conflicts.
 - Tray integration tests on supported Windows versions.
 - Signed installer generation on a trusted Windows release host; the current rdesktop NSIS command is still an upstream placeholder.

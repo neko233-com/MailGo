@@ -60,7 +60,7 @@ For rdesktop Agent-first development, use the installed CLI (kept on the reviewe
 rdesktop dev --path .
 ```
 
-The per-user `MailGo-rdesktop-updater` task runs weekly. It installs the exact reviewed upstream revision pinned in `scripts/update-rdesktop.ps1`; if Windows application control blocks Cargo build scripts, it only accepts a newer official release when `MAILGO_RDESKTOP_SIGNER_THUMBPRINT` is configured and both the SHA-256 digest and Authenticode signer thumbprint match. Without that independent signer trust root, it preserves the current installation without downgrading it. Updating either trust root is an intentional dependency-review step.
+The per-user `MailGo-rdesktop-updater` task runs weekly. It resolves the latest upstream default-branch commit to an exact SHA before installing; if Windows application control blocks Cargo build scripts, it only accepts a newer official release when `MAILGO_RDESKTOP_SIGNER_THUMBPRINT` is configured and both the SHA-256 digest and Authenticode signer thumbprint match. Without that independent signer trust root, it preserves the current installation without downgrading it.
 
 ## Build the Windows shell
 

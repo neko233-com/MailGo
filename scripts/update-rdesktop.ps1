@@ -5,14 +5,26 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $cargo = Get-Command cargo -ErrorAction Stop
+$git = Get-Command git -ErrorAction Stop
 $repository = 'https://github.com/neko233-com/rdesktop'
-# Keep the updater on the exact rdesktop revision audited by this workspace. Move this
-# trust root only as part of a reviewed dependency update; never follow an unpinned branch.
-$trustedRevision = 'e9b2ba8d7a6c22138d37ca0cccfc41bbfeb28439'
+# Resolve the upstream default branch to an exact commit before invoking Cargo. This keeps the
+# scheduled install on the real latest revision without handing Cargo a mutable branch name.
 # Release fallback is disabled unless the deployment supplies the reviewed Authenticode
 # publisher thumbprint. A digest from the same release API is not an authenticity proof.
 $trustedSignerThumbprint = [string]$env:MAILGO_RDESKTOP_SIGNER_THUMBPRINT
 $releaseApi = 'https://api.github.com/repos/neko233-com/rdesktop/releases/latest'
+
+function Get-LatestRevision {
+    $line = & $git.Source ls-remote $repository HEAD 2>$null | Select-Object -First 1
+    if ($LASTEXITCODE -ne 0 -or !$line) {
+        throw 'could not resolve the latest upstream rdesktop revision'
+    }
+    $match = [regex]::Match([string]$line, '(?<revision>[0-9a-fA-F]{40})\s+HEAD')
+    if (!$match.Success) {
+        throw 'upstream rdesktop returned an invalid revision'
+    }
+    return $match.Groups['revision'].Value.ToLowerInvariant()
+}
 
 function Get-InstalledRdesktop {
     $command = Get-Command rdesktop -ErrorAction SilentlyContinue
@@ -74,7 +86,9 @@ function Try-InstallVerifiedRelease($installed) {
 
 Write-Host "Updating rdesktop-cli from $repository"
 try {
-    & $cargo.Source install rdesktop-cli --git $repository --rev $trustedRevision --locked --force
+    $latestRevision = Get-LatestRevision
+    Write-Host "Installing latest upstream rdesktop revision $latestRevision"
+    & $cargo.Source install rdesktop-cli --git $repository --rev $latestRevision --locked --force
     if ($LASTEXITCODE -ne 0) {
         throw "cargo install rdesktop-cli failed with exit code $LASTEXITCODE"
     }
