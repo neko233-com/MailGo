@@ -275,6 +275,13 @@ function createInlineContentId() {
   return `mailgo-inline-${randomPart.replace(/[^a-zA-Z0-9-]/g, '')}`
 }
 
+function createAccountId(provider: Provider) {
+  const randomPart = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  return `${provider}-${randomPart.replace(/[^a-zA-Z0-9-]/g, '')}`
+}
+
 function composeHtmlBody(body: string, inlineImages: ComposeInlineImage[]) {
   const textBlock = body.trim()
     ? `<div>${escapeHtml(body).replace(/\r?\n/g, '<br>')}</div>`
@@ -342,9 +349,9 @@ function BrandMark() {
   )
 }
 
-function TooltipButton({ label, onClick, children, active = false, className = '', ariaExpanded }: { label: string; onClick?: () => void; children: React.ReactNode; active?: boolean; className?: string; ariaExpanded?: boolean }) {
+function TooltipButton({ label, onClick, children, active = false, className = '', ariaExpanded, disabled = false }: { label: string; onClick?: () => void; children: React.ReactNode; active?: boolean; className?: string; ariaExpanded?: boolean; disabled?: boolean }) {
   return (
-    <button className={`icon-button ${active ? 'is-active' : ''} ${className}`} onClick={onClick} aria-label={label} aria-expanded={ariaExpanded} title={label} type="button">
+    <button className={`icon-button ${active ? 'is-active' : ''} ${className}`} onClick={onClick} aria-label={label} aria-expanded={ariaExpanded} title={label} type="button" disabled={disabled}>
       {children}
     </button>
   )
@@ -388,6 +395,7 @@ function App() {
   const [composeMode, setComposeMode] = useState<ComposeMode>('new')
   const [composeSource, setComposeSource] = useState<MailMessage | undefined>()
   const [isAccountModalOpen, setAccountModalOpen] = useState(false)
+  const [isAddingAccount, setAddingAccount] = useState(false)
   const [isAuthPanelOpen, setAuthPanelOpen] = useState(true)
   const [isSettingsOpen, setSettingsOpen] = useState(false)
   const [openMenu, setOpenMenu] = useState<ActionMenu | null>(null)
@@ -434,6 +442,7 @@ function App() {
   const accountPrefillRef = useRef<string | null>(null)
   const oauthSessionIdRef = useRef('')
   const authAttemptRef = useRef(0)
+  const isAddingAccountRef = useRef(false)
   const selectedMailRef = useRef<MailMessage | undefined>(undefined)
   const attachmentCancelsRef = useRef(new Map<string, () => void>())
   const [nativeStateReady, setNativeStateReady] = useState(!isNativeRuntime)
@@ -551,6 +560,7 @@ function App() {
   }
 
   const closeAccountModal = () => {
+    if (isAddingAccountRef.current) return
     invalidateAuthFlow()
     setAccountModalOpen(false)
     setAuthorizationCode('')
@@ -1508,6 +1518,7 @@ function App() {
   }
 
   const handleAddAccount = async () => {
+    if (isAddingAccountRef.current) return
     if (!accountEmail.includes('@')) {
       pushToast('请输入有效的邮箱地址', 'error')
       return
@@ -1520,8 +1531,10 @@ function App() {
       pushToast('请先完成 Outlook 设备验证，完成后再开始同步', 'info')
       return
     }
+    isAddingAccountRef.current = true
+    setAddingAccount(true)
     const existingAccount = editingAccountId ? accounts.find((account) => account.id === editingAccountId) : undefined
-    const id = editingAccountId ?? `${provider}-${Date.now()}`
+    const id = editingAccountId ?? createAccountId(provider)
     const newAccount: MailAccount = {
       id,
       provider,
@@ -1589,6 +1602,7 @@ function App() {
           if (converted.length) setSelectedMailId(converted[0].id)
         }
       }
+      await refreshPendingOperations([...accounts.filter((account) => account.id !== id), newAccount])
     } catch (error) {
       if (accountStored) {
         const message = error instanceof Error ? error.message : ''
@@ -1608,8 +1622,10 @@ function App() {
         : current.filter((account) => account.id !== id))
       pushToast(existingAccount ? '账户重新授权失败，已保留原账户配置' : '账户添加失败，请检查授权码、OAuth 配置或服务器设置', 'error')
       return
+    } finally {
+      isAddingAccountRef.current = false
+      setAddingAccount(false)
     }
-    await refreshPendingOperations([...accounts.filter((account) => account.id !== id), newAccount])
     setAccountEmail('')
     setEditingAccountId(null)
     closeAccountModal()
@@ -2006,7 +2022,7 @@ function App() {
 
       <AnimatePresence>{isHelpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}</AnimatePresence>
       <AnimatePresence>{isComposeOpen && <ComposeModal mode={composeMode} source={composeSource} accountId={composeSource?.accountId ?? selectedAccountId ?? accounts[0]?.id} senderEmail={accounts.find((account) => account.id === (composeSource?.accountId ?? selectedAccountId))?.email ?? accounts[0]?.email} draftId={composeDraftId} onDraftChanged={handleDraftChanged} onDraftRemoved={handleDraftRemoved} onClose={() => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts() }} onSent={(queued) => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts(); void refreshOutbox(); pushToast(queued ? '网络暂不可用，邮件已加入发件箱，联网后自动重试' : '邮件已发送', 'success') }} onError={(message) => pushToast(message, 'error')} />}</AnimatePresence>
-      <AnimatePresence>{isAccountModalOpen && <AccountModal editingAccountId={editingAccountId} provider={provider} setProvider={changeProvider} providerDefinition={selectedProvider} accountEmail={accountEmail} setAccountEmail={setAccountEmail} authorizationCode={authorizationCode} setAuthorizationCode={setAuthorizationCode} showAuthorizationCode={showAuthorizationCode} setShowAuthorizationCode={setShowAuthorizationCode} customImapHost={customImapHost} setCustomImapHost={setCustomImapHost} customImapPort={customImapPort} setCustomImapPort={setCustomImapPort} customImapSecurity={customImapSecurity} setCustomImapSecurity={setCustomImapSecurity} customSmtpHost={customSmtpHost} setCustomSmtpHost={setCustomSmtpHost} customSmtpPort={customSmtpPort} setCustomSmtpPort={setCustomSmtpPort} customSmtpSecurity={customSmtpSecurity} setCustomSmtpSecurity={setCustomSmtpSecurity} customAuthentication={customAuthentication} setCustomAuthentication={setCustomAuthentication} deviceFlow={deviceFlow} onClose={closeAccountModal} onOpenProvider={() => { void handleOpenProvider() }} onCopy={handleCopy} onAdd={handleAddAccount} onRemove={handleRemoveAccount} />}</AnimatePresence>
+      <AnimatePresence>{isAccountModalOpen && <AccountModal editingAccountId={editingAccountId} provider={provider} setProvider={changeProvider} providerDefinition={selectedProvider} accountEmail={accountEmail} setAccountEmail={setAccountEmail} authorizationCode={authorizationCode} setAuthorizationCode={setAuthorizationCode} showAuthorizationCode={showAuthorizationCode} setShowAuthorizationCode={setShowAuthorizationCode} customImapHost={customImapHost} setCustomImapHost={setCustomImapHost} customImapPort={customImapPort} setCustomImapPort={setCustomImapPort} customImapSecurity={customImapSecurity} setCustomImapSecurity={setCustomImapSecurity} customSmtpHost={customSmtpHost} setCustomSmtpHost={setCustomSmtpHost} customSmtpPort={customSmtpPort} setCustomSmtpPort={setCustomSmtpPort} customSmtpSecurity={customSmtpSecurity} setCustomSmtpSecurity={setCustomSmtpSecurity} customAuthentication={customAuthentication} setCustomAuthentication={setCustomAuthentication} deviceFlow={deviceFlow} isBusy={isAddingAccount} onClose={closeAccountModal} onOpenProvider={() => { void handleOpenProvider() }} onCopy={handleCopy} onAdd={handleAddAccount} onRemove={handleRemoveAccount} />}</AnimatePresence>
       <AnimatePresence>{transferMode && <TransferModal mode={transferMode} fileName={transferFile?.name} isBusy={isImporting} onClose={() => { if (!isImporting) { setTransferMode(null); setTransferFile(null) } }} onSubmit={handleEncryptedTransfer} />}</AnimatePresence>
       <div className="toast-stack" aria-live="polite">{toasts.map((toast) => <motion.div key={toast.id} className={`toast toast-${toast.tone}`} initial={{ opacity: 0, y: 12, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 12 }}><Icon name={toast.tone === 'success' ? 'checkCircle' : toast.tone === 'error' ? 'info' : 'bell'} size={17} /><span>{toast.message}</span></motion.div>)}</div>
     </div>
@@ -2036,9 +2052,9 @@ function HelpModal({ onClose }: { onClose: () => void }) {
   return <motion.div className="modal-backdrop help-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="help-modal" initial={{ opacity: 0, y: 14, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 8, scale: 0.98 }} role="dialog" aria-modal="true" aria-labelledby="help-title"><div className="modal-header"><div><Icon name="help" size={21} /><h2 id="help-title">MailGo 帮助中心</h2></div><TooltipButton label="关闭帮助中心" onClick={onClose}><Icon name="close" size={19} /></TooltipButton></div><div className="help-modal-body"><section><h3>常用快捷键</h3><div className="shortcut-row"><span>写邮件</span><kbd>C</kbd></div><div className="shortcut-row"><span>聚焦搜索</span><kbd>Ctrl K</kbd></div><div className="shortcut-row"><span>回复当前邮件</span><kbd>R</kbd></div><div className="shortcut-row"><span>关闭弹窗</span><kbd>Esc</kbd></div></section><section><h3>账户与同步</h3><p>Google 与 Outlook 优先使用 OAuth 安全授权；QQ 邮箱和自定义 IMAP/SMTP 使用服务商生成的授权码或应用密码。</p><p>同步失败时，邮件仍保留在本地缓存；离线状态下的归档、删除和已读操作会在恢复连接后重放。</p></section><section><h3>隐私与安全</h3><p>授权凭据只交给本机安全存储。普通导出不包含授权码；Windows 桌面端可使用加密账户迁移包转移完整配置。HTML 邮件默认屏蔽远程图片，避免追踪像素；需要时可在设置中显式开启。</p></section></div><div className="modal-footer"><span><Icon name="shieldCheck" size={17} />MailGo 运行在本机，数据由你控制</span><button className="gradient-button" type="button" onClick={onClose}>知道了</button></div></motion.div></motion.div>
 }
 
-function AccountModal({ editingAccountId, provider, setProvider, providerDefinition, accountEmail, setAccountEmail, authorizationCode, setAuthorizationCode, showAuthorizationCode, setShowAuthorizationCode, customImapHost, setCustomImapHost, customImapPort, setCustomImapPort, customImapSecurity, setCustomImapSecurity, customSmtpHost, setCustomSmtpHost, customSmtpPort, setCustomSmtpPort, customSmtpSecurity, setCustomSmtpSecurity, customAuthentication, setCustomAuthentication, deviceFlow, onClose, onOpenProvider, onCopy, onAdd, onRemove }: { editingAccountId: string | null; provider: Provider; setProvider: (provider: Provider) => void; providerDefinition: ReturnType<typeof providerFor>; accountEmail: string; setAccountEmail: (value: string) => void; authorizationCode: string; setAuthorizationCode: (value: string) => void; showAuthorizationCode: boolean; setShowAuthorizationCode: (value: boolean) => void; customImapHost: string; setCustomImapHost: (value: string) => void; customImapPort: string; setCustomImapPort: (value: string) => void; customImapSecurity: string; setCustomImapSecurity: (value: string) => void; customSmtpHost: string; setCustomSmtpHost: (value: string) => void; customSmtpPort: string; setCustomSmtpPort: (value: string) => void; customSmtpSecurity: string; setCustomSmtpSecurity: (value: string) => void; customAuthentication: string; setCustomAuthentication: (value: string) => void; deviceFlow: DeviceFlowState | null; onClose: () => void; onOpenProvider: () => void; onCopy: () => void; onAdd: () => void; onRemove: () => void }) {
+function AccountModal({ editingAccountId, provider, setProvider, providerDefinition, accountEmail, setAccountEmail, authorizationCode, setAuthorizationCode, showAuthorizationCode, setShowAuthorizationCode, customImapHost, setCustomImapHost, customImapPort, setCustomImapPort, customImapSecurity, setCustomImapSecurity, customSmtpHost, setCustomSmtpHost, customSmtpPort, setCustomSmtpPort, customSmtpSecurity, setCustomSmtpSecurity, customAuthentication, setCustomAuthentication, deviceFlow, isBusy, onClose, onOpenProvider, onCopy, onAdd, onRemove }: { editingAccountId: string | null; provider: Provider; setProvider: (provider: Provider) => void; providerDefinition: ReturnType<typeof providerFor>; accountEmail: string; setAccountEmail: (value: string) => void; authorizationCode: string; setAuthorizationCode: (value: string) => void; showAuthorizationCode: boolean; setShowAuthorizationCode: (value: boolean) => void; customImapHost: string; setCustomImapHost: (value: string) => void; customImapPort: string; setCustomImapPort: (value: string) => void; customImapSecurity: string; setCustomImapSecurity: (value: string) => void; customSmtpHost: string; setCustomSmtpHost: (value: string) => void; customSmtpPort: string; setCustomSmtpPort: (value: string) => void; customSmtpSecurity: string; setCustomSmtpSecurity: (value: string) => void; customAuthentication: string; setCustomAuthentication: (value: string) => void; deviceFlow: DeviceFlowState | null; isBusy: boolean; onClose: () => void; onOpenProvider: () => void; onCopy: () => void; onAdd: () => void; onRemove: () => void }) {
   const isOAuth = customAuthentication === 'oauth2'
-  const credentialLabel = isOAuth ? '手动授权码（可选）' : providerDefinition.requiresAuthCode ? '授权码' : '登录凭据'
+  const credentialLabel = isBusy ? '正在保存…' : isOAuth ? '手动授权码（可选）' : providerDefinition.requiresAuthCode ? '授权码' : '登录凭据'
   const guideTitle = isOAuth ? '如何完成安全授权？' : '如何获取授权码？'
   const guide = isOAuth
     ? provider === 'outlook'
