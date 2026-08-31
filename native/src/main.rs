@@ -981,6 +981,9 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     if profile_for_account(&imported_account).is_err() {
                         continue;
                     }
+                    sync::remove_account_cache(&cache_dir(), id)?;
+                    let _ = drafts::remove_account(&cache_dir(), id);
+                    outbox::remove_account(&cache_dir(), id)?;
                     if let Ok(entry) = credential_entry(id) {
                         let _ = entry.delete_credential();
                     }
@@ -1092,6 +1095,7 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                     let state_result = (|| -> Result<u32> {
                         for record in &records {
                             sync::remove_account_cache(&cache_dir(), &record.account.id)?;
+                            let _ = drafts::remove_account(&cache_dir(), &record.account.id);
                             outbox::remove_account(&cache_dir(), &record.account.id)?;
                         }
                         let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;

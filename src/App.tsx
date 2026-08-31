@@ -1401,10 +1401,26 @@ function App() {
           authentication: typeof account.authentication === 'string' ? account.authentication.trim().slice(0, 32) : undefined,
         }]
       }).slice(0, 64)
-      setAccounts((current) => [...current.filter((account) => !imported.some((item) => item.id === account.id)), ...imported])
-      setNativeFolders((current) => Object.fromEntries(Object.entries(current).filter(([accountId]) => !imported.some((account) => account.id === accountId))))
-      try { await invoke('accounts.import', { accounts: imported }) } catch { /* Browser preview fallback. */ }
-      pushToast(`已导入 ${imported.length} 个账户，请逐一补充授权码`, 'success')
+      if (imported.length === 0) throw new Error('配置文件中没有可导入的有效账户')
+      const importedIds = new Set(imported.map((account) => account.id))
+      if (isNativeRuntime) {
+        const result = await invoke<{ imported: number }>('accounts.import', { accounts: imported })
+        if (result.imported === 0) throw new Error('没有账户通过本地校验，配置未导入')
+        const nativeState = await readNativeState()
+        const nextAccounts = nativeState?.accounts ?? accounts.filter((account) => !importedIds.has(account.id)).concat(imported)
+        setAccounts(nextAccounts)
+        setNativeFolders(nativeState?.folders ?? {})
+        setMails((current) => current.filter((mail) => !importedIds.has(mail.accountId)))
+        void refreshPendingOperations(nextAccounts)
+        void refreshOutbox(nextAccounts)
+        void refreshNativeDrafts(nextAccounts)
+        pushToast(`已导入 ${result.imported} 个账户，请逐一补充授权码`, 'success')
+      } else {
+        setAccounts((current) => [...current.filter((account) => !importedIds.has(account.id)), ...imported])
+        setNativeFolders((current) => Object.fromEntries(Object.entries(current).filter(([accountId]) => !importedIds.has(accountId))))
+        setMails((current) => current.filter((mail) => !importedIds.has(mail.accountId)))
+        pushToast(`已导入 ${imported.length} 个账户，请逐一补充授权码`, 'success')
+      }
     } catch (error) {
       pushToast(error instanceof Error ? error.message : '配置导入失败', 'error')
     } finally {
