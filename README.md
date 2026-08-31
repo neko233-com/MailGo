@@ -11,6 +11,7 @@ The current foundation includes:
 - Multiple accounts, including multiple QQ accounts, account switching, and import/export with redacted credentials.
 - Windows desktop also supports password-protected account migration: encrypted export/import keeps provider credentials inside an Argon2id + ChaCha20-Poly1305 bundle and writes them back only to Windows Credential Manager.
 - Local-first UI state with offline cache indicators and a Rust IPC boundary for durable state.
+- Optional offline-only mode is enforced by the native boundary: cached mail remains readable, network sync/search are paused, outgoing mail is queued encrypted, and local flag/move mutations replay when online mode is restored.
 - Provider quick links and guided authorization-code onboarding.
 - Safe HTML preview mode, attachments, smart categories (including Apple Connect and Apple advertising), search, unread filter, star, reply, compose, theme switching, and user CSS overrides.
 - Local-only advertising classification can optionally hide ads from normal lists while keeping Apple Connect security mail and smart-category access visible.
@@ -86,4 +87,16 @@ The Windows npm scripts place Cargo's target directory under `%LOCALAPPDATA%\Mai
 
 ## Publishing
 
-This repository has no GitHub Actions. Releases and publication are intentionally manual and require an explicit user instruction. See [AGENTS.md](AGENTS.md).
+This repository has no GitHub Actions. Releases and publication are intentionally manual and require an explicit user instruction. Run the release gate to build, test, package, hash, and write a manifest without publishing:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1
+```
+
+Only an explicit tag plus `-Publish` calls the GitHub CLI:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Publish -Tag v0.1.0
+```
+
+The default gate rejects a dirty working tree; use `-AllowDirty` only for a deliberate local build. There is no scheduled or automated release path.

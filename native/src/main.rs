@@ -124,7 +124,7 @@ fn default_minimize_to_tray() -> bool {
 }
 
 fn default_offline_mode() -> bool {
-    true
+    false
 }
 
 fn default_notifications_enabled() -> bool {
@@ -225,7 +225,7 @@ impl Default for PersistedState {
             folder_names: HashMap::new(),
             theme: "dark".to_string(),
             minimize_to_tray: true,
-            offline_mode: true,
+            offline_mode: false,
             notifications_enabled: true,
             remote_images_enabled: false,
             hide_ads: false,
@@ -407,6 +407,23 @@ fn account_for(shared: &Arc<Mutex<MailGoState>>, account_id: &str) -> Result<Per
         .find(|account| account.id == account_id)
         .cloned()
         .ok_or_else(|| anyhow!("account not found"))
+}
+
+fn offline_mode_enabled(shared: &Arc<Mutex<MailGoState>>) -> Result<bool> {
+    Ok(shared
+        .lock()
+        .map_err(|_| anyhow!("state lock poisoned"))?
+        .state
+        .offline_mode)
+}
+
+fn ensure_network_allowed(shared: &Arc<Mutex<MailGoState>>) -> Result<()> {
+    if offline_mode_enabled(shared)? {
+        return Err(anyhow!(
+            "MailGo is in offline-only mode; turn off offline mode before connecting"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn record_account_sync_failure(
@@ -778,6 +795,17 @@ fn handle_ipc(
                 app.save()?;
                 Ok(json!({ "enabled": enabled }))
             }
+            "app.set_offline_mode" => {
+                let enabled = message
+                    .payload
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                app.state.offline_mode = enabled;
+                app.save()?;
+                Ok(json!({ "enabled": enabled }))
+            }
             "app.set_remote_images" => {
                 let enabled = message
                     .payload
@@ -892,6 +920,7 @@ fn handle_ipc(
                 .unwrap_or_default();
                 let provider_kind = providers::ProviderKind::parse(&provider)?;
                 providers::validate_email(&email)?;
+                let offline_mode = offline_mode_enabled(shared)?;
                 let new_account = PersistedAccount {
                     id: id.clone(),
                     provider: provider_kind.as_str().to_string(),
@@ -899,8 +928,16 @@ fn handle_ipc(
                     email,
                     unread: 0,
                     accent: "#5f70ee".to_string(),
-                    status: "synced".to_string(),
-                    last_sync: "刚刚同步".to_string(),
+                    status: if offline_mode {
+                        "offline".to_string()
+                    } else {
+                        "synced".to_string()
+                    },
+                    last_sync: if offline_mode {
+                        "仅离线模式".to_string()
+                    } else {
+                        "刚刚同步".to_string()
+                    },
                     imap_host: optional_string_field(&message.payload, "imapHost"),
                     imap_port: optional_u16_field(&message.payload, "imapPort"),
                     imap_security: optional_string_field(&message.payload, "imapSecurity"),
@@ -1268,6 +1305,7 @@ fn handle_ipc(
                 Ok(json!({ "accountId": account_id, "reset": reset }))
             }
             "sync.account" => {
+                ensure_network_allowed(shared)?;
                 let account_id = string_field(&message.payload, "accountId")?;
                 let account = account_for(shared, &account_id)?;
                 let profile = match profile_for_account(&account) {
@@ -1324,6 +1362,7 @@ fn handle_ipc(
                 Ok(serde_json::to_value(result)?)
             }
             "sync.page" => {
+                ensure_network_allowed(shared)?;
                 let account_id = string_field(&message.payload, "accountId")?;
                 let folder = optional_string_field(&message.payload, "folder")
                     .unwrap_or_else(|| "INBOX".to_string());
@@ -1388,6 +1427,7 @@ fn handle_ipc(
                 Ok(serde_json::to_value(result)?)
             }
             "mail.search" => {
+                ensure_network_allowed(shared)?;
                 let query =
                     bounded_string_field(&message.payload, "query", MAX_SEARCH_QUERY_BYTES)?;
                 let requested_account_id = optional_string_field(&message.payload, "accountId");
@@ -1478,6 +1518,7 @@ fn handle_ipc(
                 }))
             }
             "sync.all" => {
+                ensure_network_allowed(shared)?;
                 let accounts = shared
                     .lock()
                     .map_err(|_| anyhow!("state lock poisoned"))?
@@ -1568,12 +1609,17 @@ fn handle_ipc(
                 let folder = optional_string_field(&message.payload, "folder")
                     .unwrap_or_else(|| "INBOX".to_string());
                 let account = account_for(shared, &account_id)?;
-                if let Some(message) =
-                    sync::load_cached_message(&cache_dir(), &account_id, &folder, uid)?
-                {
+                let cached_message =
+                    sync::load_cached_message(&cache_dir(), &account_id, &folder, uid)?;
+                if let Some(message) = cached_message.as_ref() {
                     if !message.text_body.is_empty() || message.html_body.is_some() {
                         return Ok(json!({ "offline": true, "message": message }));
                     }
+                }
+                if offline_mode_enabled(shared)? {
+                    return Err(anyhow!(
+                        "message body is not cached; turn off offline mode to download it"
+                    ));
                 }
                 let profile = profile_for_account(&account)?;
                 let credential = load_credential(&account)?;
@@ -1823,63 +1869,115 @@ fn handle_ipc(
                     .unwrap_or_else(|| "INBOX".to_string());
                 let target_folder = optional_string_field(&message.payload, "targetFolder");
                 let account = account_for(shared, &account_id)?;
-                let profile = profile_for_account(&account)?;
-                let credential = load_credential(&account)?;
                 let operation = match message.cmd.as_str() {
                     "mail.move" => "move",
                     "mail.archive" => "archive",
                     "mail.delete" => "delete",
                     _ => unreachable!("matched mail mutation command"),
                 };
-                let result = match operation {
-                    "move" => target_folder
+                if matches!(operation, "move" | "archive") && target_folder.is_none() {
+                    return Err(anyhow!("{operation} destination is required"));
+                }
+                if operation == "delete" {
+                    let profile = profile_for_account(&account)?;
+                    let permanent = target_folder
                         .as_deref()
-                        .ok_or_else(|| anyhow!("move destination is required"))
-                        .and_then(|target| {
-                            sync::move_message(
-                                profile,
-                                &account.email,
-                                &credential,
-                                &folder,
-                                uid,
-                                target,
-                            )
-                        }),
-                    "archive" => target_folder
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("archive destination is required"))
-                        .and_then(|target| {
-                            sync::archive_message(
-                                profile,
-                                &account.email,
-                                &credential,
-                                &folder,
-                                uid,
-                                target,
-                            )
-                        }),
-                    "delete" => {
-                        let permanent = target_folder
-                            .as_deref()
-                            .is_none_or(|target| target.eq_ignore_ascii_case(&folder));
-                        if permanent && !sync::is_trash_folder(profile.provider, &folder) {
-                            Err(anyhow!(
-                                "permanent delete is only allowed from the provider trash folder"
-                            ))
-                        } else {
-                            sync::delete_message(
-                                profile,
-                                &account.email,
-                                &credential,
-                                &folder,
-                                uid,
-                                target_folder.as_deref().unwrap_or(&folder),
-                            )
-                        }
+                        .is_none_or(|target| target.eq_ignore_ascii_case(&folder));
+                    if permanent && !sync::is_trash_folder(profile.provider, &folder) {
+                        return Err(anyhow!(
+                            "permanent delete is only allowed from the provider trash folder"
+                        ));
                     }
-                    _ => unreachable!("matched mail mutation command"),
+                }
+                let offline_mode = offline_mode_enabled(shared)?;
+                let result: Result<()> = if offline_mode {
+                    match operation {
+                        "move" => target_folder
+                            .as_deref()
+                            .ok_or_else(|| anyhow!("move destination is required"))
+                            .and_then(|_| Err(anyhow!("offline-only mode"))),
+                        "archive" => target_folder
+                            .as_deref()
+                            .ok_or_else(|| anyhow!("archive destination is required"))
+                            .and_then(|_| Err(anyhow!("offline-only mode"))),
+                        "delete" => {
+                            let profile = profile_for_account(&account)?;
+                            let permanent = target_folder
+                                .as_deref()
+                                .is_none_or(|target| target.eq_ignore_ascii_case(&folder));
+                            if permanent && !sync::is_trash_folder(profile.provider, &folder) {
+                                Err(anyhow!(
+                                    "permanent delete is only allowed from the provider trash folder"
+                                ))
+                            } else {
+                                Err(anyhow!("offline-only mode"))
+                            }
+                        }
+                        _ => unreachable!("matched mail mutation command"),
+                    }
+                } else {
+                    let profile = profile_for_account(&account)?;
+                    let credential = load_credential(&account)?;
+                    match operation {
+                        "move" => target_folder
+                            .as_deref()
+                            .ok_or_else(|| anyhow!("move destination is required"))
+                            .and_then(|target| {
+                                sync::move_message(
+                                    profile,
+                                    &account.email,
+                                    &credential,
+                                    &folder,
+                                    uid,
+                                    target,
+                                )
+                            }),
+                        "archive" => target_folder
+                            .as_deref()
+                            .ok_or_else(|| anyhow!("archive destination is required"))
+                            .and_then(|target| {
+                                sync::archive_message(
+                                    profile,
+                                    &account.email,
+                                    &credential,
+                                    &folder,
+                                    uid,
+                                    target,
+                                )
+                            }),
+                        "delete" => {
+                            let permanent = target_folder
+                                .as_deref()
+                                .is_none_or(|target| target.eq_ignore_ascii_case(&folder));
+                            if permanent && !sync::is_trash_folder(profile.provider, &folder) {
+                                Err(anyhow!(
+                                    "permanent delete is only allowed from the provider trash folder"
+                                ))
+                            } else {
+                                sync::delete_message(
+                                    profile,
+                                    &account.email,
+                                    &credential,
+                                    &folder,
+                                    uid,
+                                    target_folder.as_deref().unwrap_or(&folder),
+                                )
+                            }
+                        }
+                        _ => unreachable!("matched mail mutation command"),
+                    }
                 };
-                let queued = if let Err(error) = result {
+                let queued = if offline_mode {
+                    sync::queue_move_mutation(
+                        &cache_dir(),
+                        &account_id,
+                        operation,
+                        &folder,
+                        uid,
+                        target_folder.as_deref(),
+                    )?;
+                    true
+                } else if let Err(error) = result {
                     sync::queue_move_mutation(
                         &cache_dir(),
                         &account_id,
@@ -1929,22 +2027,12 @@ fn handle_ipc(
                 let folder = optional_string_field(&message.payload, "folder")
                     .unwrap_or_else(|| "INBOX".to_string());
                 let account = account_for(shared, &account_id)?;
-                let profile = profile_for_account(&account)?;
-                let credential = load_credential(&account)?;
                 let flag = if message.cmd == "mail.mark_read" {
                     "\\Seen"
                 } else {
                     "\\Flagged"
                 };
-                let queued = if let Err(error) = sync::set_flag(
-                    profile,
-                    &account.email,
-                    &credential,
-                    &folder,
-                    uid,
-                    flag,
-                    enabled,
-                ) {
+                let queued = if offline_mode_enabled(shared)? {
                     sync::queue_flag_mutation(
                         &cache_dir(),
                         &account_id,
@@ -1952,12 +2040,36 @@ fn handle_ipc(
                         uid,
                         flag,
                         enabled,
-                    )
-                    .with_context(|| format!("queue mail flag after provider failure: {error}"))?;
+                    )?;
                     true
                 } else {
-                    sync::remove_queued_flag(&cache_dir(), &account_id, &folder, uid, flag)?;
-                    false
+                    let profile = profile_for_account(&account)?;
+                    let credential = load_credential(&account)?;
+                    if let Err(error) = sync::set_flag(
+                        profile,
+                        &account.email,
+                        &credential,
+                        &folder,
+                        uid,
+                        flag,
+                        enabled,
+                    ) {
+                        sync::queue_flag_mutation(
+                            &cache_dir(),
+                            &account_id,
+                            &folder,
+                            uid,
+                            flag,
+                            enabled,
+                        )
+                        .with_context(|| {
+                            format!("queue mail flag after provider failure: {error}")
+                        })?;
+                        true
+                    } else {
+                        sync::remove_queued_flag(&cache_dir(), &account_id, &folder, uid, flag)?;
+                        false
+                    }
                 };
                 if let Err(error) = sync::update_cached_flags(
                     &cache_dir(),
@@ -2039,6 +2151,47 @@ fn handle_ipc(
                     attachments
                 };
                 let account = account_for(shared, &account_id)?;
+                if offline_mode_enabled(shared)? {
+                    if let Ok(mut app) = shared.lock() {
+                        for upload_id in &attachment_ids {
+                            app.attachment_uploads.remove(upload_id);
+                        }
+                    }
+                    let queued = outbox::enqueue(
+                        &cache_dir(),
+                        outbox::QueuedMessage {
+                            id: String::new(),
+                            account_id: account_id.clone(),
+                            to,
+                            cc: cc.unwrap_or_default(),
+                            bcc: bcc.unwrap_or_default(),
+                            subject,
+                            text_body,
+                            html_body,
+                            attachments: attachments
+                                .into_iter()
+                                .map(|attachment| outbox::QueuedAttachment {
+                                    file_name: attachment.file_name,
+                                    content_type: attachment.content_type,
+                                    content_id: attachment.content_id,
+                                    bytes: attachment.bytes,
+                                })
+                                .collect(),
+                            created_at: 0,
+                            updated_at: 0,
+                            attempts: 0,
+                            next_attempt_at: 0,
+                            paused: false,
+                            last_error: Some("仅离线模式：联网后将自动发送".to_string()),
+                        },
+                    )?;
+                    return Ok(json!({
+                        "sent": false,
+                        "queued": true,
+                        "outboxId": queued.id,
+                        "accountId": account_id,
+                    }));
+                }
                 let profile = profile_for_account(&account)?;
                 let credential = load_credential(&account)?;
                 let outgoing = send::OutgoingMessage {
@@ -2162,6 +2315,14 @@ mod tests {
         assert!(!state.notifications_enabled);
         assert!(!state.remote_images_enabled);
         assert!(!state.hide_ads);
+    }
+
+    #[test]
+    fn offline_mode_is_opt_in_and_defaults_to_online_sync() {
+        assert!(!default_offline_mode());
+        assert!(!PersistedState::default().offline_mode);
+        let state = decode_persisted_state(r#"{"accounts": []}"#).unwrap();
+        assert!(!state.offline_mode);
     }
 
     #[test]

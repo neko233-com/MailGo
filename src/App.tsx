@@ -293,6 +293,10 @@ function loadHideAds() {
   return readLocalStorageValue('mailgo-hide-ads') === 'true'
 }
 
+function loadOfflineMode() {
+  return readLocalStorageValue('mailgo-offline-mode') === 'true'
+}
+
 function loadCustomCss() {
   return (readLocalStorageValue('mailgo-custom-css') ?? '').slice(0, MAX_CUSTOM_CSS_LENGTH)
 }
@@ -320,6 +324,16 @@ function TooltipButton({ label, onClick, children, active = false, className = '
   return (
     <button className={`icon-button ${active ? 'is-active' : ''} ${className}`} onClick={onClick} aria-label={label} aria-expanded={ariaExpanded} title={label} type="button">
       {children}
+    </button>
+  )
+}
+
+function OfflineModeQuickSetting({ enabled, onToggle }: { enabled: boolean; onToggle: () => void }) {
+  return (
+    <button type="button" className={enabled ? 'is-on' : ''} aria-label={enabled ? '仅离线模式已开启' : '开启仅离线模式'} aria-pressed={enabled} onClick={onToggle}>
+      <Icon name={enabled ? 'cloud' : 'rotate'} size={15} />
+      <span>仅离线模式</span>
+      <small>{enabled ? '暂停联网' : '在线同步'}</small>
     </button>
   )
 }
@@ -366,6 +380,7 @@ function App() {
   const [transferFile, setTransferFile] = useState<File | null>(null)
   const [toasts, setToasts] = useState<Toast[]>([])
   const [minimizeToTray, setMinimizeToTray] = useState(true)
+  const [offlineMode, setOfflineMode] = useState(loadOfflineMode)
   const [notificationsEnabled, setNotificationsEnabled] = useState(true)
   const [remoteImagesEnabled, setRemoteImagesEnabled] = useState(loadRemoteImages)
   const [hideAds, setHideAds] = useState(loadHideAds)
@@ -540,6 +555,13 @@ function App() {
   }, [isNativeRuntime, nativeStateReady, theme])
 
   useEffect(() => {
+    writeLocalStorageValue('mailgo-offline-mode', String(offlineMode))
+    if (isNativeRuntime && nativeStateReady) {
+      void invoke('app.set_offline_mode', { enabled: offlineMode }).catch(() => undefined)
+    }
+  }, [isNativeRuntime, nativeStateReady, offlineMode])
+
+  useEffect(() => {
     let cancelled = false
     void readNativeState().then(async (nativeState) => {
       if (cancelled) return
@@ -551,6 +573,7 @@ function App() {
       if (isNativeRuntime) setNativeFolders(nativeState.folders ?? {})
       setTheme(nativeState.theme)
       setMinimizeToTray(nativeState.minimizeToTray)
+      setOfflineMode(nativeState.offlineMode ?? false)
       setNotificationsEnabled(nativeState.notificationsEnabled ?? true)
       setRemoteImagesEnabled(nativeState.remoteImagesEnabled ?? false)
       setHideAds(nativeState.hideAds ?? false)
@@ -602,9 +625,9 @@ function App() {
 
   useEffect(() => {
     const trimmedQuery = query.trim()
-    if (!isNativeRuntime || trimmedQuery.length < 2) {
+    if (!isNativeRuntime || offlineMode || trimmedQuery.length < 2) {
       setServerSearchMails([])
-      setServerSearchState('idle')
+      setServerSearchState(offlineMode && trimmedQuery.length >= 2 ? 'ready' : 'idle')
       setServerSearchTruncated(false)
       return
     }
@@ -640,7 +663,7 @@ function App() {
       cancelled = true
       window.clearTimeout(timer)
     }
-  }, [accountScopeKey, isNativeRuntime, query, searchAccountDirectory, selectedAccountId])
+  }, [accountScopeKey, isNativeRuntime, offlineMode, query, searchAccountDirectory, selectedAccountId])
 
   useEffect(() => {
     const styleId = 'mailgo-user-theme'
@@ -819,7 +842,7 @@ function App() {
       return
     }
     if (mail.unread) mapMailSources((item) => item.id === mail.id ? { ...item, unread: false } : item)
-    if (isNativeRuntime && mail.nativeUid) {
+    if (isNativeRuntime && !offlineMode && mail.nativeUid) {
       void invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: false }).then(() => refreshPendingOperations()).catch(() => undefined)
       try {
         const result = await invoke<NativeMessageResponse>('mail.get', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid })
@@ -1118,7 +1141,7 @@ function App() {
         : mail.folder === folder
     })
     if (first) setSelectedMailId(first.id)
-    if (isNativeRuntime && folder !== 'starred') {
+    if (isNativeRuntime && !offlineMode && folder !== 'starred') {
       void Promise.all(accounts.map(async (account) => {
         try {
           const serverFolder = nativeFolderName(account, folder)
@@ -1145,7 +1168,7 @@ function App() {
     setSelectedMailIds([])
     const first = allMails.find((mail) => mail.accountId === account.id && mail.nativeFolder && isSameNativeFolder(mail.nativeFolder, folder))
     if (first) setSelectedMailId(first.id)
-    if (!isNativeRuntime) return
+    if (!isNativeRuntime || offlineMode) return
     void invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, folder }).then((result) => {
       if (!result.mailbox) return
       const converted = result.mailbox.messages.map((message) => nativeMessageToUi(message, account))
@@ -1156,7 +1179,7 @@ function App() {
   }
 
   const loadEarlier = async () => {
-    if (!isNativeRuntime || selectedFolder === 'starred' || isLoadingEarlier) return
+    if (!isNativeRuntime || offlineMode || selectedFolder === 'starred' || isLoadingEarlier) return
     const targetAccounts = selectedNativeFolder
       ? accounts.filter((account) => account.id === selectedNativeFolder.accountId)
       : accounts.filter((account) => !selectedAccountId || account.id === selectedAccountId)
@@ -1210,6 +1233,10 @@ function App() {
   }
 
   const handleSync = async () => {
+    if (offlineMode) {
+      pushToast('仅离线模式已开启，当前使用本地缓存；关闭后可同步', 'info')
+      return
+    }
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       pushToast('当前处于离线模式，已保留本地缓存；联网后可重试同步', 'info')
       return
@@ -1250,10 +1277,14 @@ function App() {
         await refreshOutbox(accounts)
       }
     } catch {
-      // Browser preview has no account transport. Keep the design-time demo responsive.
-      await new Promise((resolve) => window.setTimeout(resolve, 700))
-      setAccounts((current) => current.map((account) => ({ ...account, status: 'synced', lastSync: '刚刚同步' })))
-      pushToast('所有账户已完成同步', 'success')
+      if (!isNativeRuntime) {
+        // Browser preview has no account transport. Keep the design-time demo responsive.
+        await new Promise((resolve) => window.setTimeout(resolve, 700))
+        setAccounts((current) => current.map((account) => ({ ...account, status: 'synced', lastSync: '刚刚同步' })))
+        pushToast('所有账户已完成同步', 'success')
+      } else {
+        pushToast('同步请求失败，请检查 native shell 或稍后重试', 'error')
+      }
     } finally {
       setSyncing(false)
     }
@@ -1261,6 +1292,10 @@ function App() {
 
   const retryPendingOutbox = async () => {
     if (!isNativeRuntime || !accounts.length) return
+    if (offlineMode) {
+      pushToast('仅离线模式已开启，联网后关闭该模式即可重试发件箱', 'info')
+      return
+    }
     try {
       const results = await Promise.all(accounts.map((account) => invoke<{ reset: number }>('mail.outbox.retry_all', { accountId: account.id })))
       const reset = results.reduce((total, result) => total + result.reset, 0)
@@ -1393,17 +1428,21 @@ function App() {
         } : {}),
       })
       accountStored = true
-      const result = await invoke<NativeSyncItem>('sync.account', { accountId: id }, 60_000)
-      if (result.folders?.length) setNativeFolders((current) => ({ ...current, [id]: result.folders! }))
-      setAccounts((current) => current.map((account) => account.id === id ? { ...account, unread: result.unread ?? 0, status: 'synced', lastSync: '刚刚同步' } : account))
-      if (isNativeRuntime) {
-        const mailbox = await invoke<NativeMailboxResponse>('mail.list', { accountId: id })
-        const converted = (mailbox.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, newAccount))
-        if (mailbox.mailbox) {
-          setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(id, mailbox.mailbox!.folder)]: { oldestUid: mailbox.mailbox!.oldestUid, hasMore: mailbox.mailbox!.hasMore } }))
+      if (offlineMode) {
+        setAccounts((current) => current.map((account) => account.id === id ? { ...account, unread: 0, status: 'offline', lastSync: '仅离线模式' } : account))
+      } else {
+        const result = await invoke<NativeSyncItem>('sync.account', { accountId: id }, 60_000)
+        if (result.folders?.length) setNativeFolders((current) => ({ ...current, [id]: result.folders! }))
+        setAccounts((current) => current.map((account) => account.id === id ? { ...account, unread: result.unread ?? 0, status: 'synced', lastSync: '刚刚同步' } : account))
+        if (isNativeRuntime) {
+          const mailbox = await invoke<NativeMailboxResponse>('mail.list', { accountId: id })
+          const converted = (mailbox.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, newAccount))
+          if (mailbox.mailbox) {
+            setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(id, mailbox.mailbox!.folder)]: { oldestUid: mailbox.mailbox!.oldestUid, hasMore: mailbox.mailbox!.hasMore } }))
+          }
+          setMails((current) => [...current.filter((mail) => mail.accountId !== id), ...converted])
+          if (converted.length) setSelectedMailId(converted[0].id)
         }
-        setMails((current) => [...current.filter((mail) => mail.accountId !== id), ...converted])
-        if (converted.length) setSelectedMailId(converted[0].id)
       }
     } catch (error) {
       if (accountStored) {
@@ -1723,6 +1762,11 @@ function App() {
           </div>
 
           <div className="sidebar-quick-settings">
+            <OfflineModeQuickSetting enabled={offlineMode} onToggle={() => setOfflineMode((value) => {
+              const next = !value
+              pushToast(next ? '仅离线模式已开启，后续邮件操作将保留在本机' : '已恢复在线模式，可重新同步和发送邮件', 'info')
+              return next
+            })} />
             <button type="button" className={hideAds ? 'is-on' : ''} aria-label={hideAds ? '广告已屏蔽' : '广告已分类'} aria-pressed={hideAds} onClick={() => { const next = !hideAds; setHideAds(next); void invoke('app.set_hide_ads', { enabled: next }).catch(() => undefined) }}>
               <Icon name="shield" size={15} />
               <span>广告 {hideAds ? '已屏蔽' : '已分类'}</span>

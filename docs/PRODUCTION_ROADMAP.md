@@ -66,6 +66,8 @@ The repository is deliberately split into a real desktop UI foundation and provi
 57. Medium desktop widths now move the authorization assistant into its existing drawer boundary and relax the reading-column minimum, eliminating horizontal overflow at 1280px and tighter laptop widths while keeping the four-pane large-screen layout.
 58. The desktop shell no longer imposes a 960px body minimum, so the responsive grid can honor the actual viewport before switching to the single-column mobile layout.
 59. Attachment upload metadata now rejects NUL and other unsafe control characters at the native IPC boundary, with regression coverage for file names, MIME types, and inline Content-ID values.
+60. Offline-only mode is now an enforced local-first policy: it pauses background/manual network sync and remote search, keeps cached mail readable, queues outgoing mail in the encrypted outbox without opening a network connection, and queues flag/move mutations for replay after the mode is disabled.
+61. The Windows release gate now performs build, format, clippy, Release-test, portable-package, SHA-256, and manifest checks; GitHub publication remains opt-in behind an explicit tag and `-Publish` flag with no automated workflow.
 
 ## Remaining production acceptance work
 

@@ -367,13 +367,21 @@ pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathB
         .name("mailgo-sync-scheduler".into())
         .spawn(move || loop {
             thread::sleep(Duration::from_secs(300));
-            let (accounts, notifications_enabled) = match shared.lock() {
-                Ok(app) => (app.state.accounts.clone(), app.state.notifications_enabled),
+            let (accounts, notifications_enabled, offline_mode) = match shared.lock() {
+                Ok(app) => (
+                    app.state.accounts.clone(),
+                    app.state.notifications_enabled,
+                    app.state.offline_mode,
+                ),
                 Err(_) => {
                     tracing::warn!("background sync state lock poisoned");
                     continue;
                 }
             };
+            if offline_mode {
+                tracing::debug!("background sync skipped because offline-only mode is enabled");
+                continue;
+            }
             for account in accounts {
                 let profile = match crate::profile_for_account(&account) {
                     Ok(profile) => profile,
