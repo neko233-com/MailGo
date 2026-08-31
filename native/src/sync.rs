@@ -21,6 +21,9 @@ const MAX_CACHED_MESSAGES_PER_FOLDER: usize = 5_000;
 const MAX_CACHE_FILE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 256 * 1024;
 const MAX_HEADER_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SEARCH_QUERY_BYTES: usize = 256;
+const MAX_SEARCH_RESULTS_PER_FOLDER: usize = 40;
+const MAX_SEARCH_RESULTS_PER_ACCOUNT: usize = 240;
 const MAX_MUTATIONS: usize = 1_000;
 const MAX_MUTATION_FILE_BYTES: usize = 2 * 1024 * 1024;
 const CACHE_FILE: &str = "inbox.bin";
@@ -69,6 +72,14 @@ pub struct SyncResult {
     pub cache_path: String,
     pub synced_at: String,
     pub folders: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResult {
+    pub messages: Vec<CachedMessage>,
+    pub truncated: bool,
+    pub folders_searched: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +271,131 @@ pub fn sync_account(
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Search the provider's full mailbox set without requiring the renderer to preload every
+/// message. Results are header-only, bounded, and immediately merged into the encrypted local
+/// folder cache so subsequent offline actions retain UIDVALIDITY context.
+pub fn search_account(
+    account_id: &str,
+    profile: ProviderProfile,
+    email: &str,
+    credential: &str,
+    query: &str,
+    limit: usize,
+    cache_root: &Path,
+) -> Result<SearchResult> {
+    if credential.trim().is_empty() {
+        return Err(anyhow!("account requires authorization before searching"));
+    }
+    let query = build_search_query(query)?;
+    let limit = limit.clamp(1, MAX_SEARCH_RESULTS_PER_ACCOUNT);
+    let mut session = authenticate(&profile, email, credential)?;
+    let folders = discover_folders(&mut session, profile.provider);
+    let mut messages = Vec::new();
+    let mut truncated = false;
+    let mut folders_searched = 0usize;
+
+    for folder in folders {
+        if messages.len() >= limit {
+            truncated = true;
+            break;
+        }
+        let mailbox = match session.select(&folder) {
+            Ok(mailbox) => mailbox,
+            Err(error) => {
+                tracing::debug!(account_id = %account_id, folder = %folder, "search skipped unavailable folder: {error}");
+                continue;
+            }
+        };
+        folders_searched += 1;
+        let mut uids = session
+            .uid_search(&query)
+            .with_context(|| format!("search {folder}"))?
+            .into_iter()
+            .collect::<Vec<_>>();
+        uids.sort_unstable_by(|left, right| right.cmp(left));
+        let remaining = limit.saturating_sub(messages.len());
+        let folder_limit = remaining.min(MAX_SEARCH_RESULTS_PER_FOLDER);
+        if uids.len() > folder_limit {
+            truncated = true;
+        }
+        let selected_uids = uids.into_iter().take(folder_limit).collect::<Vec<_>>();
+        let uid_set = selected_uids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        if uid_set.is_empty() {
+            continue;
+        }
+        let fetched = session
+            .uid_fetch(uid_set, HEADER_FETCH_QUERY)
+            .with_context(|| format!("fetch search results in {folder}"))?;
+        let mut header_bytes = 0usize;
+        let mut folder_messages = Vec::new();
+        for item in fetched.iter() {
+            if messages.len() >= limit {
+                truncated = true;
+                break;
+            }
+            let Some(uid) = item.uid else { continue };
+            let Some(header) = item.header() else {
+                continue;
+            };
+            if header.len() > MAX_HEADER_BYTES {
+                continue;
+            }
+            header_bytes = header_bytes.saturating_add(header.len());
+            if header_bytes > MAX_HEADER_TOTAL_BYTES {
+                truncated = true;
+                break;
+            }
+            let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
+            let starred = item
+                .flags()
+                .iter()
+                .any(|flag| matches!(flag, Flag::Flagged));
+            let Ok(message) = parse_header(account_id, &folder, uid, unread, starred, header)
+            else {
+                continue;
+            };
+            folder_messages.push(message);
+        }
+        save_search_messages(
+            cache_root,
+            account_id,
+            mailbox.uid_validity,
+            &folder_messages,
+        )?;
+        messages.extend(folder_messages);
+    }
+    session.logout().ok();
+    messages.sort_by(|left, right| right.received_at.cmp(&left.received_at));
+    Ok(SearchResult {
+        messages,
+        truncated,
+        folders_searched,
+    })
+}
+
+fn build_search_query(value: &str) -> Result<String> {
+    let normalized = value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>();
+    if normalized.is_empty() {
+        return Err(anyhow!("search query is empty"));
+    }
+    if normalized.len() > MAX_SEARCH_QUERY_BYTES {
+        return Err(anyhow!("search query is too long"));
+    }
+    let escaped = normalized.replace('\\', "\\\\").replace('"', "\\\"");
+    // IMAP SEARCH keys are nested left-to-right: (FROM OR TO) OR (SUBJECT OR TEXT).
+    Ok(format!(
+        "OR OR FROM \"{escaped}\" TO \"{escaped}\" OR SUBJECT \"{escaped}\" TEXT \"{escaped}\""
+    ))
 }
 
 fn sync_account_once(
@@ -977,6 +1113,42 @@ pub fn save_cached_message(
     mailbox
         .messages
         .sort_by_key(|cached| std::cmp::Reverse(cached.uid));
+    mailbox.oldest_uid = mailbox.messages.iter().map(|cached| cached.uid).min();
+    mailbox.synced_at = now_stamp();
+    save_mailbox_unlocked(cache_root, account_id, &mailbox).map(|_| ())
+}
+
+fn save_search_messages(
+    cache_root: &Path,
+    account_id: &str,
+    uid_validity: Option<u32>,
+    messages: &[CachedMessage],
+) -> Result<()> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let _write_guard = cache_write_guard();
+    let folder = messages[0].folder.as_str();
+    let mut mailbox = load_mailbox_for_folder(cache_root, account_id, folder)?
+        .unwrap_or_else(|| CachedMailbox::empty(account_id, folder));
+    if mailbox.uid_validity.is_some() && mailbox.uid_validity != uid_validity {
+        // A search can discover a folder before the regular sync scheduler does. Never merge
+        // results from a new UID namespace into an old cache.
+        mailbox.messages.clear();
+        mailbox.oldest_uid = None;
+        mailbox.has_more = false;
+    }
+    mailbox.uid_validity = uid_validity;
+    for message in messages {
+        mailbox
+            .messages
+            .retain(|cached| cached.uid != message.uid || cached.folder != message.folder);
+        mailbox.messages.push(message.clone());
+    }
+    mailbox
+        .messages
+        .sort_by_key(|cached| std::cmp::Reverse(cached.uid));
+    mailbox.messages.truncate(MAX_CACHED_MESSAGES_PER_FOLDER);
     mailbox.oldest_uid = mailbox.messages.iter().map(|cached| cached.uid).min();
     mailbox.synced_at = now_stamp();
     save_mailbox_unlocked(cache_root, account_id, &mailbox).map(|_| ())
@@ -1999,6 +2171,17 @@ mod tests {
             "OAuth access token expired; reauthorization is required"
         )));
         assert!(!needs_reauthorization(&anyhow!("connection reset by peer")));
+    }
+
+    #[test]
+    fn server_search_query_is_bounded_and_quoted() {
+        let query = build_search_query("  release \\\"candidate\\\"  ").unwrap();
+        assert!(query.contains("FROM \"release \\\\\\\"candidate\\\\\\\"\""));
+        assert!(query.contains("TEXT \"release \\\\\\\"candidate\\\\\\\"\""));
+        assert!(!query.contains('\r'));
+        assert!(!query.contains('\n'));
+        assert!(build_search_query(" ").is_err());
+        assert!(build_search_query(&"x".repeat(MAX_SEARCH_QUERY_BYTES + 1)).is_err());
     }
 
     #[test]

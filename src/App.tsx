@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Icon, type IconName } from './components/Icon'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
 import { invoke, readNativeState } from './lib/ipc'
-import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeDraft, NativeMailboxResponse, NativeMessageResponse, NativeOutboxStatus, NativeQueueStatus, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
+import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeDraft, NativeMailboxResponse, NativeMessageResponse, NativeOutboxStatus, NativeQueueStatus, NativeSearchResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 type ToastTone = 'info' | 'success' | 'error'
 type Toast = { id: number; message: string; tone: ToastTone }
@@ -293,6 +293,9 @@ function App() {
   const [theme, setTheme] = useState<ThemeMode>(loadTheme)
   const [accounts, setAccounts] = useState<MailAccount[]>(sampleAccounts)
   const [mails, setMails] = useState<MailMessage[]>(() => sampleMails.map((mail) => ({ ...mail, body: [...mail.body], attachments: mail.attachments?.map((attachment) => ({ ...attachment })) })))
+  const [serverSearchMails, setServerSearchMails] = useState<MailMessage[]>([])
+  const [serverSearchState, setServerSearchState] = useState<'idle' | 'searching' | 'ready' | 'error'>('idle')
+  const [serverSearchTruncated, setServerSearchTruncated] = useState(false)
   const [selectedFolder, setSelectedFolder] = useState<FolderId>('inbox')
   const [selectedCategory, setSelectedCategory] = useState<SmartCategory | null>(null)
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null)
@@ -408,6 +411,16 @@ function App() {
     setComposeMode(mode)
     setComposeSource(source)
     setComposeOpen(true)
+  }
+
+  const mapMailSources = (updater: (mail: MailMessage) => MailMessage) => {
+    setMails((current) => current.map(updater))
+    setServerSearchMails((current) => current.map(updater))
+  }
+
+  const filterMailSources = (predicate: (mail: MailMessage) => boolean) => {
+    setMails((current) => current.filter(predicate))
+    setServerSearchMails((current) => current.filter(predicate))
   }
 
   const handleDraftChanged = useCallback((draft: NativeDraft) => {
@@ -532,6 +545,51 @@ function App() {
     }
   }, [isNativeRuntime])
 
+  const accountScopeKey = accounts.map((account) => `${account.id}:${account.provider}:${account.label}:${account.email}:${account.accent}`).join('|')
+  const searchAccountDirectory = useMemo(() => new Map(accounts.map((account) => [account.id, account])), [accountScopeKey])
+
+  useEffect(() => {
+    const trimmedQuery = query.trim()
+    if (!isNativeRuntime || trimmedQuery.length < 2) {
+      setServerSearchMails([])
+      setServerSearchState('idle')
+      setServerSearchTruncated(false)
+      return
+    }
+    if (!accountScopeKey) {
+      setServerSearchMails([])
+      setServerSearchState('ready')
+      setServerSearchTruncated(false)
+      return
+    }
+    let cancelled = false
+    setServerSearchState('searching')
+    const timer = window.setTimeout(() => {
+      void invoke<NativeSearchResponse>('mail.search', {
+        query: trimmedQuery,
+        ...(selectedAccountId ? { accountId: selectedAccountId } : {}),
+        limit: 240,
+      }, 60_000).then((result) => {
+        if (cancelled) return
+        setServerSearchMails((result.messages ?? []).flatMap((message) => {
+          const account = searchAccountDirectory.get(message.accountId)
+          return account ? [nativeMessageToUi(message, account)] : []
+        }))
+        setServerSearchTruncated(Boolean(result.truncated))
+        setServerSearchState(result.failed?.length && !result.messages?.length ? 'error' : 'ready')
+      }).catch(() => {
+        if (cancelled) return
+        setServerSearchMails([])
+        setServerSearchTruncated(false)
+        setServerSearchState('error')
+      })
+    }, 420)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [accountScopeKey, isNativeRuntime, query, searchAccountDirectory, selectedAccountId])
+
   useEffect(() => {
     const styleId = 'mailgo-user-theme'
     let style = document.getElementById(styleId) as HTMLStyleElement | null
@@ -606,7 +664,13 @@ function App() {
     const account = accounts.find((item) => item.id === draft.accountId)
     return account ? [draftToUi(draft, account)] : []
   }), [accounts, nativeDrafts])
-  const allMails = useMemo(() => isNativeRuntime ? [...mails, ...localDraftMails] : mails, [isNativeRuntime, localDraftMails, mails])
+  const allMails = useMemo(() => {
+    const merged = new Map<string, MailMessage>()
+    for (const mail of serverSearchMails) merged.set(mail.id, mail)
+    for (const mail of mails) merged.set(mail.id, mail)
+    for (const mail of localDraftMails) merged.set(mail.id, mail)
+    return [...merged.values()]
+  }, [localDraftMails, mails, serverSearchMails])
   const displayedFolderLabels = useMemo(() => {
     if (!isNativeRuntime) return folderLabels
     const matchesFixedFolder = (mail: MailMessage, folder: FolderId) => {
@@ -692,7 +756,7 @@ function App() {
       openCompose(localDraft.id)
       return
     }
-    if (mail.unread) setMails((current) => current.map((item) => item.id === mail.id ? { ...item, unread: false } : item))
+    if (mail.unread) mapMailSources((item) => item.id === mail.id ? { ...item, unread: false } : item)
     if (isNativeRuntime && mail.nativeUid) {
       void invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: false }).then(() => refreshPendingOperations()).catch(() => undefined)
       try {
@@ -700,7 +764,7 @@ function App() {
         const account = accounts.find((item) => item.id === mail.accountId)
         if (account && result.message) {
           const converted = nativeMessageToUi(result.message, account)
-          setMails((current) => current.map((item) => item.id === mail.id ? converted : item))
+          mapMailSources((item) => item.id === mail.id ? converted : item)
         }
       } catch {
         pushToast('邮件正文加载失败，仍可查看本地摘要', 'info')
@@ -710,7 +774,7 @@ function App() {
 
   const toggleStar = (mail: MailMessage) => {
     const nextStarred = !mail.starred
-    setMails((current) => current.map((item) => item.id === mail.id ? { ...item, starred: nextStarred } : item))
+    mapMailSources((item) => item.id === mail.id ? { ...item, starred: nextStarred } : item)
     setSelectedMailId(mail.id)
     if (isNativeRuntime && mail.nativeUid) {
       void invoke('mail.star', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: nextStarred }).then(() => refreshPendingOperations()).catch(() => pushToast('星标同步失败，可稍后重试', 'error'))
@@ -736,7 +800,7 @@ function App() {
 
   const setMailReadState = async (mail: MailMessage, unread: boolean) => {
     if (mail.id === 'empty-mail' || mail.unread === unread) return
-    setMails((current) => current.map((item) => item.id === mail.id ? { ...item, unread } : item))
+    mapMailSources((item) => item.id === mail.id ? { ...item, unread } : item)
     setAccounts((current) => current.map((account) => account.id === mail.accountId
       ? { ...account, unread: Math.max(0, account.unread + (unread ? 1 : -1)) }
       : account))
@@ -752,7 +816,8 @@ function App() {
       return
     }
     const selected = selectedVisibleMails.filter((mail) => mail.unread !== unread)
-    setMails((current) => current.map((mail) => selected.some((item) => item.id === mail.id) ? { ...mail, unread } : mail))
+    const selectedIds = new Set(selected.map((mail) => mail.id))
+    mapMailSources((mail) => selectedIds.has(mail.id) ? { ...mail, unread } : mail)
     setAccounts((current) => current.map((account) => {
       const count = selected.filter((mail) => mail.accountId === account.id).length
       return count ? { ...account, unread: Math.max(0, account.unread + (unread ? count : -count)) } : account
@@ -784,7 +849,8 @@ function App() {
       return
     }
     const selected = selectedVisibleMails.filter((mail) => mail.starred !== starred)
-    setMails((current) => current.map((mail) => selected.some((item) => item.id === mail.id) ? { ...mail, starred } : mail))
+    const selectedIds = new Set(selected.map((mail) => mail.id))
+    mapMailSources((mail) => selectedIds.has(mail.id) ? { ...mail, starred } : mail)
     let failed = 0
     if (isNativeRuntime) {
       const results = await Promise.all(selected.map(async (mail) => {
@@ -823,16 +889,16 @@ function App() {
       await refreshPendingOperations()
     }
     if (isPermanentDelete) {
-      setMails((current) => current.filter((item) => item.id !== mail.id))
+      filterMailSources((item) => item.id !== mail.id)
       if (selectedMailId === mail.id) {
         const next = visibleMails.find((item) => item.id !== mail.id)
         setSelectedMailId(next?.id ?? '')
       }
     } else {
       const nextFolder = operation === 'archive' ? 'archive' : 'trash'
-      setMails((current) => current.map((item) => item.id === mail.id
+      mapMailSources((item) => item.id === mail.id
         ? { ...item, folder: nextFolder, nativeFolder: targetFolder ?? item.nativeFolder }
-        : item))
+        : item)
     }
     if (mail.unread && mail.folder === 'inbox') {
       setAccounts((current) => current.map((item) => item.id === mail.accountId
@@ -1601,7 +1667,7 @@ function App() {
 
         <main className="mail-list-panel">
           <div className="panel-toolbar">
-            <div className="search-wrap"><Icon name="search" size={19} /><input id="mail-search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索邮件" aria-label="搜索邮件" /><kbd>Ctrl K</kbd></div>
+            <div className="search-wrap"><Icon name="search" size={19} /><input id="mail-search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索邮件" aria-label="搜索邮件" /><kbd>Ctrl K</kbd>{query.trim().length >= 2 && isNativeRuntime && <span className={`search-status search-${serverSearchState}`} aria-live="polite">{serverSearchState === 'searching' ? '服务端搜索中…' : serverSearchState === 'error' ? '服务端搜索失败，显示本地结果' : serverSearchTruncated ? '已显示部分结果' : '本地 + 服务端'}</span>}</div>
             <button className={`filter-button ${filterUnread ? 'is-active' : ''}`} type="button" onClick={() => setFilterUnread((value) => !value)}><Icon name="filter" size={17} /> 筛选{filterUnread && <span className="filter-dot" />}</button>
           </div>
           <div className="list-toolbar">

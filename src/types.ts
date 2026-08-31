@@ -106,6 +106,12 @@ export interface NativeSyncResponse {
   failed: { accountId: string; message: string }[]
 }
 
+export interface NativeSearchResponse {
+  messages: NativeCachedMessage[]
+  truncated: boolean
+  failed: { accountId: string; message: string }[]
+}
+
 export interface NativeQueueStatus {
   flags: number
   moves: number

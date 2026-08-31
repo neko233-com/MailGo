@@ -46,6 +46,8 @@ const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 const MAX_RECIPIENT_BYTES: usize = 320;
 const MAX_SUBJECT_BYTES: usize = 998;
 const MAX_MESSAGE_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SEARCH_QUERY_BYTES: usize = 256;
+const MAX_SEARCH_RESULTS: usize = 240;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1307,6 +1309,96 @@ fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcRespo
                 record_account_sync_success_with_mode(&mut app, &result, false);
                 app.save()?;
                 Ok(serde_json::to_value(result)?)
+            }
+            "mail.search" => {
+                let query =
+                    bounded_string_field(&message.payload, "query", MAX_SEARCH_QUERY_BYTES)?;
+                let requested_account_id = optional_string_field(&message.payload, "accountId");
+                let limit = message
+                    .payload
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(MAX_SEARCH_RESULTS)
+                    .clamp(1, MAX_SEARCH_RESULTS);
+                let accounts = if let Some(account_id) = requested_account_id.as_deref() {
+                    vec![account_for(shared, account_id)?]
+                } else {
+                    shared
+                        .lock()
+                        .map_err(|_| anyhow!("state lock poisoned"))?
+                        .state
+                        .accounts
+                        .clone()
+                };
+                let mut messages = Vec::new();
+                let mut failed = Vec::new();
+                let mut truncated = false;
+                for account in accounts {
+                    if messages.len() >= limit {
+                        truncated = true;
+                        break;
+                    }
+                    let remaining = limit.saturating_sub(messages.len());
+                    let profile = match profile_for_account(&account) {
+                        Ok(profile) => profile,
+                        Err(error) => {
+                            record_account_sync_failure(
+                                shared,
+                                &account.id,
+                                sync::needs_reauthorization(&error),
+                            );
+                            failed.push(json!({
+                                "accountId": account.id,
+                                "message": error.to_string(),
+                            }));
+                            continue;
+                        }
+                    };
+                    let credential = match load_credential(&account) {
+                        Ok(credential) => credential,
+                        Err(error) => {
+                            let needs_auth = sync::needs_reauthorization(&error);
+                            record_account_sync_failure(shared, &account.id, needs_auth);
+                            failed.push(json!({
+                                "accountId": account.id,
+                                "message": if needs_auth { "requires authorization" } else { "credential store unavailable" },
+                            }));
+                            continue;
+                        }
+                    };
+                    match sync::search_account(
+                        &account.id,
+                        profile,
+                        &account.email,
+                        &credential,
+                        &query,
+                        remaining,
+                        &cache_dir(),
+                    ) {
+                        Ok(result) => {
+                            truncated |= result.truncated;
+                            messages.extend(result.messages);
+                        }
+                        Err(error) => {
+                            record_account_sync_failure(
+                                shared,
+                                &account.id,
+                                sync::needs_reauthorization(&error),
+                            );
+                            failed.push(json!({
+                                "accountId": account.id,
+                                "message": error.to_string(),
+                            }));
+                        }
+                    }
+                }
+                messages.sort_by(|left, right| right.received_at.cmp(&left.received_at));
+                Ok(json!({
+                    "messages": messages,
+                    "truncated": truncated,
+                    "failed": failed,
+                }))
             }
             "sync.all" => {
                 let accounts = shared

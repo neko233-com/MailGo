@@ -153,6 +153,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .search-wrap:focus-within { border-color: rgba(117, 128, 255, .8); box-shadow: 0 0 0 3px rgba(108, 112, 255, .12); }
 .search-wrap input { min-width: 0; flex: 1; border: 0; outline: 0; color: var(--text); background: transparent; font-size: 13px; }
 .search-wrap input::placeholder { color: #7f8da7; }
+.search-status { max-width: 92px; overflow: hidden; color: var(--muted); font-size: 9px; line-height: 1.2; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+.search-status.search-searching { color: var(--accent); }
+.search-status.search-error { color: #f0a0ad; }
 kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--muted); background: var(--surface-strong); font-size: 9px; white-space: nowrap; }
 .filter-button { height: 42px; display: inline-flex; align-items: center; gap: 7px; padding: 0 13px; border: 1px solid var(--line); border-radius: 9px; color: var(--muted-strong); background: var(--surface); font-size: 12px; }
 .filter-button:hover, .filter-button.is-active { border-color: rgba(119, 129, 255, .55); color: #d9dcff; background: var(--accent-soft); }

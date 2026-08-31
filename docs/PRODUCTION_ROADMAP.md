@@ -50,6 +50,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 41. The documented desktop shortcuts now match the implementation: compose, reply, search focus, and transient UI dismissal are keyboard-accessible.
 42. Transient send failures now enter a bounded DPAPI-protected offline outbox without storing provider credentials; automatic retry uses safe backoff, permanent/authentication failures pause, and the desktop exposes status and manual retry controls.
 43. MIME text/HTML and CID expansion, IMAP header payloads, UID discovery, mailbox caches, Base64 upload chunks, and import files now have explicit pre-allocation or post-expansion bounds; cache mutations are UIDVALIDITY-bound and cache writes are serialized.
+44. Search now keeps local filtering instant while a debounced native IMAP query searches the full discovered folder set across selected or all accounts; bounded header hits are merged into UIDVALIDITY-aware encrypted caches so they remain actionable offline.
 
 ## Remaining production acceptance work
 
