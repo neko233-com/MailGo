@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +16,20 @@ use crate::providers::ProviderKind;
 
 const SESSION_TTL_SECONDS: u64 = 10 * 60;
 const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:8765/oauth/callback";
+const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const HTTP_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+static HTTP_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+fn http_agent() -> &'static ureq::Agent {
+    HTTP_AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(HTTP_CONNECT_TIMEOUT)
+            .timeout_read(HTTP_IO_TIMEOUT)
+            .timeout_write(HTTP_IO_TIMEOUT)
+            .build()
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct PendingSession {
@@ -209,7 +223,8 @@ pub fn start_device(
     let mut form = Serializer::new(String::new());
     form.append_pair("client_id", &config.client_id)
         .append_pair("scope", config.scopes);
-    let response = ureq::post(endpoint)
+    let response = http_agent()
+        .post(endpoint)
         .set("Accept", "application/json")
         .set("Content-Type", "application/x-www-form-urlencoded")
         .send_string(&form.finish())
@@ -286,7 +301,8 @@ pub fn poll_device(session: &PendingSession) -> Result<DevicePollResult> {
     if let Some(client_secret) = &session.client_secret {
         form.append_pair("client_secret", client_secret);
     }
-    let response = match ureq::post(&session.token_endpoint)
+    let response = match http_agent()
+        .post(&session.token_endpoint)
         .set("Accept", "application/json")
         .set("Content-Type", "application/x-www-form-urlencoded")
         .send_string(&form.finish())
@@ -388,7 +404,8 @@ pub fn exchange_code(
     if let Some(client_secret) = &session.client_secret {
         form.append_pair("client_secret", client_secret);
     }
-    let response = ureq::post(&session.token_endpoint)
+    let response = http_agent()
+        .post(&session.token_endpoint)
         .set("Accept", "application/json")
         .set("Content-Type", "application/x-www-form-urlencoded")
         .send_string(&form.finish())
@@ -455,7 +472,8 @@ pub fn refresh_if_needed(provider: ProviderKind, raw: &str) -> Result<String> {
     if let Some(client_secret) = &config.client_secret {
         form.append_pair("client_secret", client_secret);
     }
-    let response = ureq::post(config.token_endpoint)
+    let response = http_agent()
+        .post(config.token_endpoint)
         .set("Accept", "application/json")
         .set("Content-Type", "application/x-www-form-urlencoded")
         .send_string(&form.finish())

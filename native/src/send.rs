@@ -2,11 +2,13 @@ use anyhow::{anyhow, Context, Result};
 use lettre::message::{header::ContentType, Attachment, Mailbox, MultiPart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{Message, SmtpTransport, Transport};
+use std::time::Duration;
 
 use crate::providers::{Authentication, ProviderProfile, TransportSecurity};
 
 const MAX_RECIPIENTS_PER_FIELD: usize = 50;
 const MAX_RECIPIENTS_PER_MESSAGE: usize = 100;
+const SMTP_IO_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Sending can fail after the message has been fully validated, for example when a laptop goes
 /// offline or an SMTP service temporarily throttles the connection. These failures are safe to
@@ -153,6 +155,7 @@ pub fn send_message(
     }
     .with_context(|| format!("configure SMTP host {}", profile.smtp.host))?
     .port(profile.smtp.port)
+    .timeout(Some(SMTP_IO_TIMEOUT))
     .credentials(credentials);
 
     transport = match profile.authentication {

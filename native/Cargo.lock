@@ -1849,6 +1849,7 @@ dependencies = [
  "keyring",
  "lettre",
  "mail-parser",
+ "native-tls",
  "rand",
  "rdesktop-core",
  "rdesktop-webview",

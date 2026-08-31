@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -7,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use imap::types::Flag;
+use native_tls::{TlsConnector, TlsStream};
 use serde::{Deserialize, Serialize};
 
 use crate::mail::{parse_full, parse_header, CachedMailbox, CachedMessage};
@@ -26,6 +29,8 @@ const MAX_SEARCH_RESULTS_PER_FOLDER: usize = 40;
 const MAX_SEARCH_RESULTS_PER_ACCOUNT: usize = 240;
 const MAX_MUTATIONS: usize = 1_000;
 const MAX_MUTATION_FILE_BYTES: usize = 2 * 1024 * 1024;
+const IMAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const IMAP_IO_TIMEOUT: Duration = Duration::from_secs(60);
 const CACHE_FILE: &str = "inbox.bin";
 const MUTATION_FILE: &str = "mutations.bin";
 const MOVE_MUTATION_FILE: &str = "moves.bin";
@@ -104,14 +109,112 @@ pub struct AttachmentData {
 }
 
 fn connect(profile: &ProviderProfile) -> Result<imap::Client<imap::Connection>> {
-    let mode = match profile.imap.security {
-        TransportSecurity::Tls => imap::ConnectionMode::Tls,
-        TransportSecurity::StartTls => imap::ConnectionMode::StartTls,
-    };
-    imap::ClientBuilder::new(profile.imap.host.as_str(), profile.imap.port)
-        .mode(mode)
-        .connect()
-        .with_context(|| format!("connect IMAP host {}", profile.imap.host))
+    let tcp = connect_socket(&profile.imap.host, profile.imap.port)?;
+    match profile.imap.security {
+        TransportSecurity::Tls => {
+            let tls = tls_connect(&profile.imap.host, tcp)?;
+            let mut client = imap::Client::new(Box::new(tls) as imap::Connection);
+            client
+                .read_greeting()
+                .with_context(|| format!("read IMAP greeting from {}", profile.imap.host))?;
+            Ok(client)
+        }
+        TransportSecurity::StartTls => {
+            let mut client = imap::Client::new(tcp);
+            client
+                .read_greeting()
+                .with_context(|| format!("read IMAP greeting from {}", profile.imap.host))?;
+            let tcp = client
+                .into_inner()
+                .context("take IMAP socket before TLS handshake")?;
+            let mut tcp = tcp;
+            start_tls(&mut tcp)
+                .with_context(|| format!("start TLS on IMAP host {}", profile.imap.host))?;
+            let tls = tls_connect(&profile.imap.host, tcp)?;
+            // The IMAP greeting was already consumed before STARTTLS. LOGIN/AUTHENTICATE is the
+            // next legal command after the TLS negotiation, so do not wait for a second greeting.
+            Ok(imap::Client::new(Box::new(tls) as imap::Connection))
+        }
+    }
+}
+
+fn connect_socket(host: &str, port: u16) -> Result<TcpStream> {
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolve IMAP host {host}"))?;
+    let mut last_error = None;
+    for address in addresses {
+        match TcpStream::connect_timeout(&address, IMAP_CONNECT_TIMEOUT) {
+            Ok(stream) => {
+                stream
+                    .set_read_timeout(Some(IMAP_IO_TIMEOUT))
+                    .context("set IMAP read timeout")?;
+                stream
+                    .set_write_timeout(Some(IMAP_IO_TIMEOUT))
+                    .context("set IMAP write timeout")?;
+                return Ok(stream);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(anyhow!(
+        "could not connect to IMAP host {host}:{port}: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no socket address was returned".to_string())
+    ))
+}
+
+fn start_tls(tcp: &mut TcpStream) -> Result<()> {
+    const STARTTLS_TAG: &[u8] = b"MAILGO1";
+    tcp.write_all(STARTTLS_TAG)
+        .and_then(|_| tcp.write_all(b" STARTTLS\r\n"))
+        .and_then(|_| tcp.flush())
+        .context("write IMAP STARTTLS command")?;
+
+    let cloned = tcp.try_clone().context("clone IMAP socket for response")?;
+    let mut reader = BufReader::new(cloned);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .context("read IMAP STARTTLS response")?;
+        if read == 0 {
+            return Err(anyhow!("IMAP server closed the connection before STARTTLS"));
+        }
+        if line.len() > 64 * 1024 {
+            return Err(anyhow!("IMAP STARTTLS response is too large"));
+        }
+        if !line.starts_with(STARTTLS_TAG) {
+            continue;
+        }
+        let status = line
+            .split(|byte| byte.is_ascii_whitespace())
+            .nth(1)
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .unwrap_or_default();
+        if status.eq_ignore_ascii_case("OK") {
+            return Ok(());
+        }
+        return Err(anyhow!("IMAP STARTTLS command was rejected"));
+    }
+}
+
+fn tls_connect(host: &str, tcp: TcpStream) -> Result<TlsStream<TcpStream>> {
+    let connector = TlsConnector::builder()
+        .build()
+        .context("build IMAP TLS connector")?;
+    let mut tls = connector
+        .connect(host, tcp)
+        .map_err(|error| anyhow!("IMAP TLS handshake failed: {error}"))?;
+    tls.get_mut()
+        .set_read_timeout(Some(IMAP_IO_TIMEOUT))
+        .context("set IMAP TLS read timeout")?;
+    tls.get_mut()
+        .set_write_timeout(Some(IMAP_IO_TIMEOUT))
+        .context("set IMAP TLS write timeout")?;
+    Ok(tls)
 }
 
 fn authenticate(
@@ -2072,6 +2175,15 @@ fn folders_for(provider: crate::providers::ProviderKind) -> Vec<&'static str> {
 mod tests {
     use super::*;
     use crate::classifier::SmartCategory;
+
+    #[test]
+    fn imap_socket_applies_connect_and_io_timeouts() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture socket");
+        let port = listener.local_addr().expect("fixture address").port();
+        let stream = connect_socket("127.0.0.1", port).expect("connect fixture socket");
+        assert_eq!(stream.read_timeout().unwrap(), Some(IMAP_IO_TIMEOUT));
+        assert_eq!(stream.write_timeout().unwrap(), Some(IMAP_IO_TIMEOUT));
+    }
 
     fn fixture_message(uid: u32, folder: &str) -> CachedMessage {
         CachedMessage {
