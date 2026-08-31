@@ -413,6 +413,15 @@ function App() {
   const isNativeRuntime = Boolean(window.ipc?.postMessage)
   const [nativeStateReady, setNativeStateReady] = useState(!isNativeRuntime)
 
+  const openExternalUrl = async (url: string) => {
+    if (isNativeRuntime) {
+      await invoke('app.open_external', { url })
+      return
+    }
+    const opened = window.open(url, '_blank', 'noopener,noreferrer')
+    if (!opened) throw new Error('当前环境阻止了外部浏览器跳转')
+  }
+
   useEffect(() => () => {
     attachmentCancelsRef.current.forEach((cancel) => cancel())
     attachmentCancelsRef.current.clear()
@@ -1328,7 +1337,7 @@ function App() {
             retryAfter: flow.interval,
             status: 'pending',
           })
-          window.open(flow.verificationUri, '_blank', 'noopener,noreferrer')
+          await openExternalUrl(flow.verificationUri)
           pushToast(`Outlook 设备码 ${flow.userCode} 已生成，完成验证后会自动检测`, 'info')
           return
         }
@@ -1338,14 +1347,14 @@ function App() {
         })
         setOauthSessionId(flow.sessionId)
         setOauthState(flow.state)
-        window.open(flow.authorizationUrl, '_blank', 'noopener,noreferrer')
+        await openExternalUrl(flow.authorizationUrl)
         pushToast('OAuth 授权页面已打开，完成后返回 MailGo 点击“开始同步”；回调不可用时再手动粘贴授权码', 'info')
         return
       } catch (error) {
         pushToast(error instanceof Error ? error.message : 'OAuth 客户端尚未配置，将打开帮助页面', 'error')
       }
     }
-    window.open(selectedProvider.authUrl, '_blank', 'noopener,noreferrer')
+    await openExternalUrl(selectedProvider.authUrl)
     pushToast(`${selectedProvider.label}设置已在浏览器中打开`, 'info')
   }
 

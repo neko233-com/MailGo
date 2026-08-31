@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "windows")]
+use std::ptr::null;
+
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rand::{distributions::Alphanumeric, Rng};
@@ -52,6 +55,7 @@ const MAX_SEARCH_QUERY_BYTES: usize = 256;
 const MAX_SEARCH_RESULTS: usize = 240;
 const IPC_CAPABILITY_FIELD: &str = "__mailgoCapability";
 const IPC_CAPABILITY_LENGTH: usize = 48;
+const MAX_EXTERNAL_URL_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -367,6 +371,56 @@ fn dist_root() -> Result<PathBuf> {
     }
     Err(anyhow!(
         "MailGo renderer assets are missing; run npm run build or place dist next to the executable"
+    ))
+}
+
+fn validate_external_url(value: &str) -> Result<url::Url> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > MAX_EXTERNAL_URL_BYTES {
+        return Err(anyhow!("external URL is empty or too long"));
+    }
+    let parsed = url::Url::parse(value).context("invalid external URL")?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(anyhow!(
+            "external links must use HTTPS without embedded credentials"
+        ));
+    }
+    Ok(parsed)
+}
+
+#[cfg(target_os = "windows")]
+fn open_external_url(value: &str) -> Result<()> {
+    let parsed = validate_external_url(value)?;
+    let wide = parsed
+        .as_str()
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        windows_sys::Win32::UI::Shell::ShellExecuteW(
+            0,
+            windows_sys::core::w!("open"),
+            wide.as_ptr(),
+            null(),
+            null(),
+            windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        )
+    };
+    if result <= 32 {
+        return Err(anyhow!("Windows could not open the external URL"));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_external_url(value: &str) -> Result<()> {
+    let _ = validate_external_url(value)?;
+    Err(anyhow!(
+        "native external URL opening is only available on Windows"
     ))
 }
 
@@ -857,6 +911,11 @@ fn handle_ipc(
             "app.hide_window" => {
                 tray::hide_main_window();
                 Ok(json!({ "hidden": true }))
+            }
+            "app.open_external" => {
+                let url = text_field(&message.payload, "url", MAX_EXTERNAL_URL_BYTES)?;
+                open_external_url(&url)?;
+                Ok(json!({ "opened": true }))
             }
             "app.set_theme" => {
                 let theme = string_field(&message.payload, "theme")?;
@@ -2502,6 +2561,14 @@ mod tests {
         assert!(!valid_account_id("."));
         assert!(!valid_account_id(".."));
         assert!(valid_account_id("qq-account-1"));
+    }
+
+    #[test]
+    fn external_url_validation_is_https_only_and_has_no_embedded_credentials() {
+        assert!(validate_external_url("https://accounts.example.invalid/settings").is_ok());
+        assert!(validate_external_url("http://accounts.example.invalid/settings").is_err());
+        assert!(validate_external_url("javascript:alert(1)").is_err());
+        assert!(validate_external_url("https://name:token@example.invalid/").is_err());
     }
 
     #[test]
