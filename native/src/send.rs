@@ -14,7 +14,37 @@ const SMTP_IO_TIMEOUT: Duration = Duration::from_secs(60);
 /// offline or an SMTP service temporarily throttles the connection. These failures are safe to
 /// hand to the encrypted outbox; authentication and message-construction failures are not.
 pub fn is_retryable_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
+    if let Some(smtp_error) = error
+        .chain()
+        .find_map(|source| source.downcast_ref::<lettre::transport::smtp::Error>())
+    {
+        if smtp_error.is_permanent() {
+            return false;
+        }
+        if smtp_error.is_transient() || smtp_error.is_timeout() {
+            return true;
+        }
+    }
+
+    let message = error_chain_text(error);
+    if [
+        "authentication",
+        "authorization",
+        "invalid credential",
+        "requires authorization",
+        "auth failed",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+    {
+        return false;
+    }
+    if let Some(code) = smtp_response_code(&message) {
+        if code == 552 && message.contains("too many recipients") {
+            return true;
+        }
+        return (400..500).contains(&code);
+    }
     [
         "timed out",
         "timeout",
@@ -27,24 +57,60 @@ pub fn is_retryable_error(error: &anyhow::Error) -> bool {
         "could not resolve",
         "dns",
         "rate limit",
+        "user-rate limit exceeded",
+        "bandwidth limit exceeded",
         "too many requests",
+        "too many connections",
+        "maximum number of connections",
+        "connection limit exceeded",
         "throttl",
+        "server busy",
+        "system busy",
         "try again later",
-        "smtp response code: 421",
-        "smtp response code: 450",
-        "smtp response code: 451",
-        "smtp response code: 452",
-        "smtp response code: 503",
-        "smtp response code: 554",
     ]
     .iter()
     .any(|marker| message.contains(marker))
 }
 
+/// Extract an SMTP reply code only from transport-shaped error text. RFC 5321 requires clients
+/// to decide retryability from the first digit, not from provider-specific prose.
+fn smtp_response_code(message: &str) -> Option<u16> {
+    for marker in [
+        "smtp response code:",
+        "transient error (",
+        "permanent error (",
+    ] {
+        let Some(start) = message.find(marker) else {
+            continue;
+        };
+        let digits = message[start + marker.len()..]
+            .chars()
+            .skip_while(|character| !character.is_ascii_digit())
+            .take(3)
+            .collect::<String>();
+        if digits.len() != 3 {
+            continue;
+        }
+        if let Ok(code @ 200..=599) = digits.parse::<u16>() {
+            return Some(code);
+        }
+    }
+    None
+}
+
+fn error_chain_text(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(|source| source.to_string())
+        .collect::<Vec<_>>()
+        .join(": ")
+        .to_ascii_lowercase()
+}
+
 /// Extract a numeric Retry-After hint when the transport includes one in its error text. The
 /// value is capped by the outbox caller and is never persisted as provider response text.
 pub fn retry_after_seconds(error: &anyhow::Error) -> Option<u64> {
-    let message = error.to_string().to_ascii_lowercase();
+    let message = error_chain_text(error);
     for marker in ["retry-after", "retry after", "retry_after"] {
         let Some(start) = message.find(marker) else {
             continue;
@@ -379,5 +445,51 @@ mod tests {
         assert_eq!(cc.len(), 1);
         assert_eq!(bcc.len(), 1);
         assert!(parse_recipients("one@example.com,", "recipient").is_err());
+    }
+
+    #[test]
+    fn retries_transient_smtp_codes_but_not_permanent_failures() {
+        for code in [421, 450, 451, 452] {
+            assert!(is_retryable_error(&anyhow!(
+                "send message: SMTP response code: {code}"
+            )));
+        }
+        for code in [503, 535, 550, 554] {
+            assert!(!is_retryable_error(&anyhow!(
+                "send message: SMTP response code: {code}"
+            )));
+        }
+        assert!(is_retryable_error(&anyhow!(
+            "send message: SMTP response code: 552 too many recipients"
+        )));
+        assert!(!is_retryable_error(&anyhow!(
+            "send message: SMTP response code: 552 message too large"
+        )));
+    }
+
+    #[test]
+    fn recognizes_lettre_and_provider_throttling_error_shapes() {
+        assert!(is_retryable_error(&anyhow!(
+            "send message: transient error (451): server busy"
+        )));
+        assert!(!is_retryable_error(&anyhow!(
+            "send message: permanent error (554): transaction failed"
+        )));
+        assert!(!is_retryable_error(&anyhow!(
+            "SMTP authentication failed: user-rate limit exceeded"
+        )));
+        assert!(is_retryable_error(&anyhow!(
+            "maximum number of connections reached"
+        )));
+        assert!(is_retryable_error(&anyhow!(
+            "mailbox is throttled; retry later"
+        )));
+        assert!(is_retryable_error(
+            &anyhow!("SMTP response code: 451 server busy").context("send message")
+        ));
+        assert_eq!(
+            retry_after_seconds(&anyhow!("Retry-After: 45").context("send message")),
+            Some(45)
+        );
     }
 }

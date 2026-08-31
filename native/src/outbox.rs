@@ -334,7 +334,12 @@ fn record_failure(
 }
 
 fn is_authentication_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
+    let message = error
+        .chain()
+        .map(|source| source.to_string())
+        .collect::<Vec<_>>()
+        .join(": ")
+        .to_ascii_lowercase();
     [
         "authentication",
         "authorization",
@@ -611,6 +616,9 @@ mod tests {
         assert!(crate::send::is_retryable_error(&anyhow!(
             "SMTP connection timed out"
         )));
+        assert!(is_authentication_error(
+            &anyhow!("SMTP authentication failed").context("send message")
+        ));
         let _ = profile_for(ProviderKind::Google);
     }
 }

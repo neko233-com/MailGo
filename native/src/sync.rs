@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::mail::{parse_full, parse_header, CachedMailbox, CachedMessage};
-use crate::providers::{Authentication, ProviderProfile, TransportSecurity};
+use crate::providers::{Authentication, ProviderKind, ProviderProfile, TransportSecurity};
 
 const HEADER_FETCH_QUERY: &str = "UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]";
 const FULL_FETCH_QUERY: &str = "UID FLAGS RFC822";
@@ -509,12 +509,13 @@ pub fn sync_account(
     credential: &str,
     cache_root: &Path,
 ) -> Result<SyncResult> {
+    let provider = profile.provider;
     let mut attempt = 0u32;
     loop {
         match sync_account_once(account_id, profile.clone(), email, credential, cache_root) {
             Ok(result) => return Ok(result),
             Err(error) if attempt < 2 => {
-                let Some(delay) = retry_delay(&error, attempt) else {
+                let Some(delay) = retry_delay(&error, provider, attempt) else {
                     return Err(error);
                 };
                 attempt += 1;
@@ -538,7 +539,7 @@ pub fn search_account(
     limit: usize,
     cache_root: &Path,
 ) -> Result<SearchResult> {
-    retry_imap_operation(account_id, "server search", || {
+    retry_imap_operation(account_id, "server search", profile.provider, || {
         search_account_once(
             account_id,
             profile.clone(),
@@ -1131,6 +1132,7 @@ pub fn sync_folder_page(
     cache_root: &Path,
 ) -> Result<SyncResult> {
     validate_mailbox_name(folder)?;
+    let provider = profile.provider;
     let mut attempt = 0u32;
     loop {
         match sync_folder_page_once(
@@ -1145,7 +1147,7 @@ pub fn sync_folder_page(
         ) {
             Ok(result) => return Ok(result),
             Err(error) if attempt < 2 => {
-                let Some(delay) = retry_delay(&error, attempt) else {
+                let Some(delay) = retry_delay(&error, provider, attempt) else {
                     return Err(error);
                 };
                 attempt += 1;
@@ -1344,7 +1346,7 @@ pub fn is_retryable_error(error: &anyhow::Error) -> bool {
 }
 
 fn classify_sync_error(error: &anyhow::Error) -> SyncErrorClass {
-    let message = error.to_string().to_ascii_lowercase();
+    let message = error_chain_text(error);
     if [
         "authentication",
         "authorization",
@@ -1360,8 +1362,11 @@ fn classify_sync_error(error: &anyhow::Error) -> SyncErrorClass {
         "rate limit",
         "too many requests",
         "too many connections",
+        "connection limit exceeded",
         "throttl",
         "quota exceeded",
+        "server busy",
+        "system busy",
         "try again later",
     ]
     .iter()
@@ -1388,11 +1393,44 @@ fn classify_sync_error(error: &anyhow::Error) -> SyncErrorClass {
     SyncErrorClass::Permanent
 }
 
-fn retry_delay(error: &anyhow::Error, attempt: u32) -> Option<Duration> {
+fn classify_sync_error_for_provider(
+    error: &anyhow::Error,
+    provider: ProviderKind,
+) -> SyncErrorClass {
+    let generic = classify_sync_error(error);
+    if generic != SyncErrorClass::Permanent {
+        return generic;
+    }
+    let message = error_chain_text(error);
+    let provider_markers: &[&str] = match provider {
+        ProviderKind::Google => &[
+            "[limit]",
+            "user-rate limit exceeded",
+            "bandwidth limit exceeded",
+            "maximum number of connections",
+        ],
+        ProviderKind::Outlook => &[
+            "mailbox is throttled",
+            "maximum number of connections",
+            "resource temporarily unavailable",
+        ],
+        ProviderKind::Qq | ProviderKind::Other => &[],
+    };
+    if provider_markers
+        .iter()
+        .any(|marker| message.contains(marker))
+    {
+        SyncErrorClass::RateLimited
+    } else {
+        SyncErrorClass::Permanent
+    }
+}
+
+fn retry_delay(error: &anyhow::Error, provider: ProviderKind, attempt: u32) -> Option<Duration> {
     if let Some(retry_after) = retry_after_seconds(error) {
         return Some(Duration::from_secs(retry_after.clamp(1, 300)));
     }
-    let delay_seconds = match classify_sync_error(error) {
+    let delay_seconds = match classify_sync_error_for_provider(error, provider) {
         SyncErrorClass::Transport => 1u64 << attempt,
         SyncErrorClass::RateLimited => 5u64.saturating_mul(1u64 << attempt),
         SyncErrorClass::Authentication | SyncErrorClass::Permanent => return None,
@@ -1402,7 +1440,12 @@ fn retry_delay(error: &anyhow::Error, attempt: u32) -> Option<Duration> {
 
 /// Retry read-only IMAP operations a small, bounded number of times. Mutating commands are
 /// intentionally excluded: replaying a command after a server-side timeout could apply it twice.
-fn retry_imap_operation<T, F>(account_id: &str, operation: &str, mut operation_fn: F) -> Result<T>
+fn retry_imap_operation<T, F>(
+    account_id: &str,
+    operation: &str,
+    provider: ProviderKind,
+    mut operation_fn: F,
+) -> Result<T>
 where
     F: FnMut() -> Result<T>,
 {
@@ -1411,7 +1454,7 @@ where
         match operation_fn() {
             Ok(value) => return Ok(value),
             Err(error) if attempt < 2 => {
-                let Some(delay) = retry_delay(&error, attempt) else {
+                let Some(delay) = retry_delay(&error, provider, attempt) else {
                     return Err(error);
                 };
                 attempt += 1;
@@ -1433,7 +1476,7 @@ where
 /// does not expose arbitrary response headers, so this parser is intentionally conservative and
 /// falls back to bounded exponential delays when no numeric hint is present.
 fn retry_after_seconds(error: &anyhow::Error) -> Option<u64> {
-    let message = error.to_string().to_ascii_lowercase();
+    let message = error_chain_text(error);
     for marker in ["retry-after", "retry after", "retry_after"] {
         let Some(start) = message.find(marker) else {
             continue;
@@ -1450,6 +1493,15 @@ fn retry_after_seconds(error: &anyhow::Error) -> Option<u64> {
     None
 }
 
+fn error_chain_text(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(|source| source.to_string())
+        .collect::<Vec<_>>()
+        .join(": ")
+        .to_ascii_lowercase()
+}
+
 /// Download and parse one full message only when the reader asks for it. The raw message can be
 /// retained by a caller in an account cache, but the returned representation is sanitized.
 pub fn fetch_message(
@@ -1461,7 +1513,7 @@ pub fn fetch_message(
     uid: u32,
     cache_root: &Path,
 ) -> Result<MailDetail> {
-    retry_imap_operation(account_id, "full message fetch", || {
+    retry_imap_operation(account_id, "full message fetch", profile.provider, || {
         fetch_message_once(
             account_id,
             profile.clone(),
@@ -2922,23 +2974,41 @@ mod tests {
     #[test]
     fn sync_retries_transport_and_rate_limits_but_not_auth_failures() {
         assert_eq!(
-            retry_delay(&anyhow!("connect IMAP host timed out"), 0),
+            retry_delay(&anyhow!("connect IMAP host timed out"), ProviderKind::Qq, 0),
             Some(Duration::from_secs(1))
         );
         assert_eq!(
-            retry_delay(&anyhow!("IMAP provider rate limit: too many requests"), 1),
+            retry_delay(
+                &anyhow!("IMAP provider rate limit: too many requests"),
+                ProviderKind::Google,
+                1
+            ),
             Some(Duration::from_secs(10))
         );
         assert_eq!(
-            retry_delay(&anyhow!("HTTP 429 Retry-After: 37"), 0),
+            retry_delay(
+                &anyhow!("HTTP 429 Retry-After: 37"),
+                ProviderKind::Outlook,
+                0
+            ),
             Some(Duration::from_secs(37))
         );
         assert_eq!(
-            retry_delay(&anyhow!("retry_after=9999"), 0),
+            retry_delay(&anyhow!("retry_after=9999"), ProviderKind::Other, 0),
             Some(Duration::from_secs(300))
         );
-        assert!(retry_delay(&anyhow!("IMAP authentication failed"), 0).is_none());
-        assert!(retry_delay(&anyhow!("unsupported mail provider"), 0).is_none());
+        assert!(retry_delay(
+            &anyhow!("IMAP authentication failed"),
+            ProviderKind::Google,
+            0
+        )
+        .is_none());
+        assert!(retry_delay(
+            &anyhow!("unsupported mail provider"),
+            ProviderKind::Other,
+            0
+        )
+        .is_none());
         assert_eq!(
             classify_sync_error(&anyhow!("IMAP authentication failed")),
             SyncErrorClass::Authentication
@@ -2965,6 +3035,46 @@ mod tests {
         )));
         assert!(!is_retryable_error(&anyhow!("IMAP authentication failed")));
         assert!(!is_retryable_error(&anyhow!("mailbox does not exist")));
+    }
+
+    #[test]
+    fn provider_specific_imap_throttling_is_bounded_and_not_overgeneralized() {
+        assert_eq!(
+            classify_sync_error_for_provider(
+                &anyhow!("NO [LIMIT] Bandwidth limit exceeded").context("select INBOX"),
+                ProviderKind::Google,
+            ),
+            SyncErrorClass::RateLimited
+        );
+        assert_eq!(
+            classify_sync_error_for_provider(
+                &anyhow!("maximum number of connections exceeded"),
+                ProviderKind::Outlook,
+            ),
+            SyncErrorClass::RateLimited
+        );
+        assert_eq!(
+            classify_sync_error_for_provider(
+                &anyhow!("maximum number of connections exceeded"),
+                ProviderKind::Qq,
+            ),
+            SyncErrorClass::Permanent
+        );
+        assert_eq!(
+            retry_delay(
+                &anyhow!("NO [LIMIT] user-rate limit exceeded"),
+                ProviderKind::Google,
+                9,
+            ),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            classify_sync_error_for_provider(
+                &anyhow!("mailbox does not exist"),
+                ProviderKind::Outlook,
+            ),
+            SyncErrorClass::Permanent
+        );
     }
 
     #[test]
