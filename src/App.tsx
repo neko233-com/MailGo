@@ -12,6 +12,7 @@ type DeviceFlowState = { sessionId: string; userCode: string; verificationUri: s
 type ActionMenu = 'bulk' | 'message'
 type TransferMode = 'export-encrypted' | 'import-encrypted'
 type MobilePane = 'list' | 'reading'
+type MailMoveTarget = { folder: string; label: string; icon: IconName }
 const MAX_CUSTOM_CSS_LENGTH = 64 * 1024
 
 const smartCategories: { id: SmartCategory; label: string; icon: IconName; color: string }[] = [
@@ -131,6 +132,25 @@ function customNativeFolders(account: MailAccount, folders: string[] | undefined
     if (result.length === 64) break
   }
   return result
+}
+
+function nativeMoveTargets(account: MailAccount, folders: string[] | undefined): MailMoveTarget[] {
+  const fixedTargets: Array<{ id: Extract<FolderId, 'inbox' | 'archive' | 'spam' | 'trash'>; label: string; icon: IconName }> = [
+    { id: 'inbox', label: '收件箱', icon: 'inbox' },
+    { id: 'archive', label: '归档', icon: 'archive' },
+    { id: 'spam', label: '垃圾邮件', icon: 'shield' },
+    { id: 'trash', label: '回收站', icon: 'trash' },
+  ]
+  const targets = fixedTargets.map(({ id, label, icon }) => ({
+    folder: nativeFolderName(account, id),
+    label,
+    icon,
+  }))
+  return targets.concat(customNativeFolders(account, folders).map((folder) => ({
+    folder,
+    label: nativeFolderLabel(folder),
+    icon: 'folder' as const,
+  })))
 }
 
 function nativeMailboxKey(accountId: string, folder: string) {
@@ -842,6 +862,11 @@ function App() {
   } satisfies MailMessage
   selectedMailRef.current = selectedMail
   const selectedMailAccount = accounts.find((account) => account.id === selectedMail.accountId)
+  const selectedMailMoveTargets = useMemo(() => {
+    if (!isNativeRuntime || !selectedMailAccount || selectedMail.nativeUid == null) return []
+    return nativeMoveTargets(selectedMailAccount, nativeFolders[selectedMailAccount.id])
+      .filter((target) => !selectedMail.nativeFolder || !isSameNativeFolder(target.folder, selectedMail.nativeFolder))
+  }, [isNativeRuntime, nativeFolders, selectedMail.nativeFolder, selectedMail.nativeUid, selectedMailAccount])
 
   const groupedMails = useMemo(() => {
     return visibleMails.reduce<Record<string, MailMessage[]>>((groups, mail) => {
@@ -1024,6 +1049,37 @@ function App() {
         : item))
     }
     return queued
+  }
+
+  const moveMailToFolder = async (mail: MailMessage, targetFolder: string) => {
+    if (mail.id === 'empty-mail' || !isNativeRuntime || mail.nativeUid == null) return false
+    const account = accounts.find((item) => item.id === mail.accountId)
+    if (!account || !targetFolder.trim()) return false
+    const result = await invoke<{ queued?: boolean }>('mail.move', {
+      accountId: mail.accountId,
+      folder: mail.nativeFolder ?? 'INBOX',
+      uid: mail.nativeUid,
+      targetFolder,
+    })
+    await refreshPendingOperations()
+    mapMailSources((item) => item.id === mail.id
+      ? { ...item, folder: uiFolderForNative(targetFolder), nativeFolder: targetFolder }
+      : item)
+    if (mail.unread && mail.folder === 'inbox' && !isSameNativeFolder(targetFolder, nativeFolderName(account, 'inbox'))) {
+      setAccounts((current) => current.map((item) => item.id === mail.accountId
+        ? { ...item, unread: Math.max(0, item.unread - 1) }
+        : item))
+    }
+    return Boolean(result.queued)
+  }
+
+  const runMoveToFolder = async (mail: MailMessage, target: MailMoveTarget) => {
+    try {
+      const queued = await moveMailToFolder(mail, target.folder)
+      pushToast(queued ? '操作已保存，联网后会自动同步' : `邮件已移入${target.label}`, 'success')
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : '邮件操作失败，请稍后重试', 'error')
+    }
   }
 
   const runMove = async (mail: MailMessage, operation: 'archive' | 'delete' | 'spam' | 'inbox') => {
@@ -1865,6 +1921,7 @@ function App() {
               {openMenu === 'message' && <div className="action-menu" role="menu" aria-label="更多邮件操作">
                 <button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail'} onClick={() => { void markSelectedMessageUnread() }}><Icon name="message" size={16} />标为未读</button>
                 {selectedMail.folder !== 'inbox' && <button type="button" role="menuitem" onClick={() => { setOpenMenu(null); void runMove(selectedMail, 'inbox') }}><Icon name="inbox" size={16} />移回收件箱</button>}
+                {selectedMailMoveTargets.length > 0 && <div className="action-menu-section"><span className="action-menu-label">移动到</span>{selectedMailMoveTargets.map((target) => <button key={target.folder} type="button" role="menuitem" onClick={() => { setOpenMenu(null); void runMoveToFolder(selectedMail, target) }}><Icon name={target.icon} size={16} />{target.label}</button>)}</div>}
                 <button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail'} onClick={() => { void copySelectedMessage() }}><Icon name="copy" size={16} />复制邮件正文</button>
                 <button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail'} onClick={() => { setOpenMenu(null); window.print() }}><Icon name="document" size={16} />打印邮件</button>
               </div>}

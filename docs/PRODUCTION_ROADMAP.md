@@ -88,6 +88,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 79. Mail actions now expose a provider-mapped “move to spam” command for single messages and batches; it reuses the UID-based native move path, encrypted offline mutation queue, UIDVALIDITY checks, and immediate local cache updates for Gmail, QQ, Outlook, and custom accounts.
 80. Messages can also be restored to `INBOX` from archive, spam, trash, or custom folders through a dedicated native-validated command, with the same offline replay and immediate cache semantics.
 81. The per-user rdesktop updater now places Cargo build artifacts under the already validated `%LOCALAPPDATA%\MailGo\cargo-target` root, avoiding temporary-directory application-control failures while preserving exact upstream HEAD installation.
+82. Native users can move a message from the reading menu into any discovered server folder, including provider-mapped system folders; the target list is deduplicated and current-folder aware, while the existing UID-based offline queue handles replay.
 
 ## Remaining production acceptance work
 
