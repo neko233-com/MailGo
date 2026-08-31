@@ -2,6 +2,12 @@ import type { NativeState } from '../types'
 
 type IpcResponse<T> = { id: string; success: boolean; data: T }
 
+type PendingRequest = {
+  resolve: (value: unknown) => void
+  reject: (reason: Error) => void
+  timeoutId: number
+}
+
 declare global {
   interface Window {
     ipc?: { postMessage: (message: string) => void }
@@ -15,7 +21,7 @@ declare global {
   }
 }
 
-const pending = new Map<string, { resolve: (value: unknown) => void; reject: (reason: Error) => void }>()
+const pending = new Map<string, PendingRequest>()
 
 function readNativeCapability() {
   if (typeof window === 'undefined' || !window.location.hash.startsWith('#ipc=')) return undefined
@@ -30,6 +36,7 @@ if (typeof window !== 'undefined') {
     const request = pending.get(response.id)
     if (!request) return
     pending.delete(response.id)
+    window.clearTimeout(request.timeoutId)
     if (response.success) request.resolve(response.data)
     else {
       const data = response.data as { message?: unknown } | string | null | undefined
@@ -40,18 +47,28 @@ if (typeof window !== 'undefined') {
 }
 
 export async function invoke<T>(cmd: string, payload: Record<string, unknown> = {}, timeoutMs = 12_000): Promise<T> {
-  const id = `mailgo-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const requestSuffix = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const id = `mailgo-${requestSuffix}`
 
   if (window.ipc?.postMessage) {
     return new Promise<T>((resolve, reject) => {
-      pending.set(id, { resolve: resolve as (value: unknown) => void, reject })
-      const nativePayload = nativeCapability ? { ...payload, __mailgoCapability: nativeCapability } : payload
-      window.ipc?.postMessage(JSON.stringify({ id, cmd, payload: nativePayload }))
-      window.setTimeout(() => {
-        if (!pending.has(id)) return
+      const timeoutId = window.setTimeout(() => {
+        const request = pending.get(id)
+        if (!request) return
         pending.delete(id)
-        reject(new Error(`Native request timed out: ${cmd}`))
+        request.reject(new Error(`Native request timed out: ${cmd}`))
       }, timeoutMs)
+      pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timeoutId })
+      const nativePayload = nativeCapability ? { ...payload, __mailgoCapability: nativeCapability } : payload
+      try {
+        window.ipc?.postMessage(JSON.stringify({ id, cmd, payload: nativePayload }))
+      } catch (error) {
+        window.clearTimeout(timeoutId)
+        pending.delete(id)
+        reject(error instanceof Error ? error : new Error(`Native request failed: ${cmd}`))
+      }
     })
   }
 

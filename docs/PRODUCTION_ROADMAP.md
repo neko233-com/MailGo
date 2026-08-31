@@ -92,6 +92,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 83. The documented native smoke command now launches the Release shell, while the development build remains available separately; this avoids Windows application-control policies rejecting the Debug binary during packaged-startup verification.
 84. Local smart classification now recognizes official App Store Connect, Developer, TestFlight, Apple Ads, and Search Ads subdomains before falling back to Apple-specific subject signals; security notices remain higher priority and advertising classification stays opt-in to hiding.
 85. Closing or switching away from account authorization now cancels native OAuth/device sessions and clears the renderer's authorization-code input, including ready device-flow credentials, instead of retaining abandoned temporary secrets until TTL cleanup.
+86. Renderer IPC requests now clear their timeout after a response and clean up both pending state and timers when native `postMessage` fails; request IDs use a cryptographic UUID when the runtime provides one, improving long-lived background stability.
 
 ## Remaining production acceptance work
 
