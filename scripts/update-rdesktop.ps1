@@ -7,6 +7,8 @@ $ErrorActionPreference = 'Stop'
 $cargo = Get-Command cargo -ErrorAction Stop
 $git = Get-Command git -ErrorAction Stop
 $repository = 'https://github.com/neko233-com/rdesktop'
+$rdesktopTargetRoot = Join-Path $env:LOCALAPPDATA 'MailGo\cargo-target'
+New-Item -ItemType Directory -Force -Path $rdesktopTargetRoot | Out-Null
 # Resolve the upstream default branch to an exact commit before invoking Cargo. This keeps the
 # scheduled install on the real latest revision without handing Cargo a mutable branch name.
 # Release fallback is disabled unless the deployment supplies the reviewed Authenticode
@@ -88,6 +90,10 @@ Write-Host "Updating rdesktop-cli from $repository"
 try {
     $latestRevision = Get-LatestRevision
     Write-Host "Installing latest upstream rdesktop revision $latestRevision"
+    # Keep Cargo's build scripts under the same trusted per-user root used by MailGo's native
+    # builds. Some Windows application-control policies block custom build executables in %TEMP%.
+    $env:CARGO_TARGET_DIR = $rdesktopTargetRoot
+    Write-Host "Using trusted Cargo target directory $rdesktopTargetRoot"
     & $cargo.Source install rdesktop-cli --git $repository --rev $latestRevision --locked --force
     if ($LASTEXITCODE -ne 0) {
         throw "cargo install rdesktop-cli failed with exit code $LASTEXITCODE"

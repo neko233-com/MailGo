@@ -61,6 +61,8 @@ The redirect URI must be registered exactly with the provider. MailGo keeps a sh
 
 For safety, configured Google and Outlook redirect URIs must remain explicit loopback HTTP callbacks such as `http://127.0.0.1:8765/oauth/callback`; MailGo rejects remote hosts, embedded credentials, query strings, and fragments.
 
+The per-user `MailGo-rdesktop-updater` scheduled task resolves the upstream rdesktop HEAD to an exact commit and installs through the already validated `%LOCALAPPDATA%\MailGo\cargo-target` Cargo directory, which is compatible with Windows application-control policies that reject build executables in `%TEMP%`.
+
 Use the settings panel's encrypted account transfer actions when moving fully configured accounts between Windows machines. Choose a strong transfer password of at least 12 characters; the password is never stored, and a bundle cannot be recovered if it is forgotten. The browser preview intentionally disables credential-bearing transfer actions.
 
 ## Run the browser development surface
