@@ -2185,6 +2185,28 @@ mod tests {
         assert_eq!(stream.write_timeout().unwrap(), Some(IMAP_IO_TIMEOUT));
     }
 
+    #[test]
+    fn starttls_fixture_accepts_only_the_fixed_tagged_ok_response() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind STARTTLS fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept STARTTLS fixture");
+            let mut request = [0_u8; 18];
+            std::io::Read::read_exact(&mut stream, &mut request).expect("read STARTTLS command");
+            assert_eq!(&request, b"MAILGO1 STARTTLS\r\n");
+            std::io::Write::write_all(
+                &mut stream,
+                b"* OK ready\r\nMAILGO1 OK Begin TLS negotiation now\r\n",
+            )
+            .expect("write STARTTLS response");
+        });
+        let mut tcp = TcpStream::connect(address).expect("connect STARTTLS fixture");
+        tcp.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set fixture read timeout");
+        start_tls(&mut tcp).expect("STARTTLS fixture should be accepted");
+        server.join().expect("join STARTTLS fixture");
+    }
+
     fn fixture_message(uid: u32, folder: &str) -> CachedMessage {
         CachedMessage {
             id: format!("fixture-{uid}"),
