@@ -94,6 +94,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 85. Closing or switching away from account authorization now cancels native OAuth/device sessions and clears the renderer's authorization-code input, including ready device-flow credentials, instead of retaining abandoned temporary secrets until TTL cleanup.
 86. Renderer IPC requests now clear their timeout after a response and clean up both pending state and timers when native `postMessage` fails; request IDs use a cryptographic UUID when the runtime provides one, improving long-lived background stability.
 87. Account onboarding now uses a cryptographic UUID-based account ID for new accounts and guards the asynchronous save/sync path against duplicate submissions; the account dialog exposes a busy label and cannot close mid-commit.
+88. MIME parsing now rejects messages exceeding the attachment-count limit before collecting attachment metadata, with regression coverage for oversized multipart attachment sets; this keeps rich HTML/inline-image support bounded against multi-part abuse.
 
 ## Remaining production acceptance work
 

@@ -132,6 +132,7 @@ pub fn parse_full(
     let parsed = MessageParser::default()
         .parse(raw)
         .ok_or_else(|| anyhow!("message could not be parsed"))?;
+    ensure_attachment_count(&parsed)?;
     build_message(account_id, folder, uid, unread, starred, &parsed, Some(raw))
 }
 
@@ -243,6 +244,7 @@ pub fn extract_attachment_payloads(raw: &[u8]) -> Result<Vec<AttachmentPayload>>
     let parsed = MessageParser::default()
         .parse(raw)
         .ok_or_else(|| anyhow!("message could not be parsed"))?;
+    ensure_attachment_count(&parsed)?;
     let mut payloads = Vec::new();
     let mut total_bytes = 0usize;
     for (index, part) in parsed.attachments().enumerate() {
@@ -263,6 +265,17 @@ pub fn extract_attachment_payloads(raw: &[u8]) -> Result<Vec<AttachmentPayload>>
         });
     }
     Ok(payloads)
+}
+
+fn ensure_attachment_count(parsed: &Message<'_>) -> Result<()> {
+    let count = parsed
+        .attachments()
+        .take(MAX_ATTACHMENTS_PER_MESSAGE + 1)
+        .count();
+    if count > MAX_ATTACHMENTS_PER_MESSAGE {
+        return Err(anyhow!("message contains too many attachments"));
+    }
+    Ok(())
 }
 
 pub fn embed_inline_images(html: &mut Option<String>, payloads: &[AttachmentPayload]) {
@@ -497,6 +510,23 @@ mod tests {
         assert!(!name.contains('/'));
         assert!(!name.contains('\\'));
         assert!(!name.starts_with('.'));
+    }
+
+    #[test]
+    fn rejects_excessive_attachment_parts_before_collecting_metadata() {
+        let mut raw = String::from(
+            "From: sender@example.com\r\nSubject: Many attachments\r\nContent-Type: multipart/mixed; boundary=parts\r\n\r\n",
+        );
+        for index in 0..=MAX_ATTACHMENTS_PER_MESSAGE {
+            raw.push_str(&format!(
+                "--parts\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename=\"{index}.txt\"\r\n\r\npart\r\n"
+            ));
+        }
+        raw.push_str("--parts--\r\n");
+
+        let error = parse_full("account", "INBOX", 11, false, false, raw.as_bytes())
+            .expect_err("attachment count should be bounded during parse");
+        assert!(error.to_string().contains("too many attachments"));
     }
 
     #[test]
