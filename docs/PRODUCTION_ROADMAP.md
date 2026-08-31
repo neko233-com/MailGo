@@ -107,6 +107,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 98. The OAuth loopback listener now reads a bounded complete HTTP header instead of assuming one TCP read contains the browser request, with regression coverage for split callback packets.
 99. Desktop widths from 1100–1400px now reserve the authorization assistant as a fourth column, keeping reading actions such as rich HTML rendering reachable while narrower layouts retain drawer behavior.
 100. Online move, archive, delete, read, and star actions now enqueue only classified transient transport/rate-limit failures; authentication and permanent provider errors return immediately, while optimistic renderer state rolls back and marks affected accounts for reauthorization.
+101. Server-wide IMAP search and full-message downloads now use bounded read-only retries with the same transport/rate-limit backoff as mailbox synchronization; mutating commands remain single-attempt to avoid replaying a command after an ambiguous timeout.
 
 ## Remaining production acceptance work
 

@@ -538,6 +538,28 @@ pub fn search_account(
     limit: usize,
     cache_root: &Path,
 ) -> Result<SearchResult> {
+    retry_imap_operation(account_id, "server search", || {
+        search_account_once(
+            account_id,
+            profile.clone(),
+            email,
+            credential,
+            query,
+            limit,
+            cache_root,
+        )
+    })
+}
+
+fn search_account_once(
+    account_id: &str,
+    profile: ProviderProfile,
+    email: &str,
+    credential: &str,
+    query: &str,
+    limit: usize,
+    cache_root: &Path,
+) -> Result<SearchResult> {
     if credential.trim().is_empty() {
         return Err(anyhow!("account requires authorization before searching"));
     }
@@ -1378,6 +1400,35 @@ fn retry_delay(error: &anyhow::Error, attempt: u32) -> Option<Duration> {
     Some(Duration::from_secs(delay_seconds.min(60)))
 }
 
+/// Retry read-only IMAP operations a small, bounded number of times. Mutating commands are
+/// intentionally excluded: replaying a command after a server-side timeout could apply it twice.
+fn retry_imap_operation<T, F>(account_id: &str, operation: &str, mut operation_fn: F) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match operation_fn() {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt < 2 => {
+                let Some(delay) = retry_delay(&error, attempt) else {
+                    return Err(error);
+                };
+                attempt += 1;
+                tracing::warn!(
+                    account_id = %account_id,
+                    operation,
+                    attempt,
+                    delay = delay.as_secs(),
+                    "recoverable IMAP read failure; retrying"
+                );
+                thread::sleep(delay);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Honor a provider's Retry-After hint when it survives the transport error text. The IMAP crate
 /// does not expose arbitrary response headers, so this parser is intentionally conservative and
 /// falls back to bounded exponential delays when no numeric hint is present.
@@ -1402,6 +1453,28 @@ fn retry_after_seconds(error: &anyhow::Error) -> Option<u64> {
 /// Download and parse one full message only when the reader asks for it. The raw message can be
 /// retained by a caller in an account cache, but the returned representation is sanitized.
 pub fn fetch_message(
+    account_id: &str,
+    profile: ProviderProfile,
+    email: &str,
+    credential: &str,
+    folder: &str,
+    uid: u32,
+    cache_root: &Path,
+) -> Result<MailDetail> {
+    retry_imap_operation(account_id, "full message fetch", || {
+        fetch_message_once(
+            account_id,
+            profile.clone(),
+            email,
+            credential,
+            folder,
+            uid,
+            cache_root,
+        )
+    })
+}
+
+fn fetch_message_once(
     account_id: &str,
     profile: ProviderProfile,
     email: &str,
