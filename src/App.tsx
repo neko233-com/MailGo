@@ -246,25 +246,37 @@ function composeSeed(mode: ComposeMode, source: MailMessage | undefined, ownEmai
   }
 }
 
+function readLocalStorageValue(key: string) {
+  try {
+    return window.localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+function writeLocalStorageValue(key: string, value: string) {
+  try {
+    window.localStorage.setItem(key, value)
+  } catch {
+    // Native state or the in-memory session remains authoritative when storage is unavailable.
+  }
+}
+
 function loadTheme(): ThemeMode {
-  const stored = window.localStorage.getItem('mailgo-theme')
+  const stored = readLocalStorageValue('mailgo-theme')
   return stored === 'light' ? 'light' : 'dark'
 }
 
 function loadRemoteImages() {
-  return window.localStorage.getItem('mailgo-remote-images') === 'true'
+  return readLocalStorageValue('mailgo-remote-images') === 'true'
 }
 
 function loadHideAds() {
-  return window.localStorage.getItem('mailgo-hide-ads') === 'true'
+  return readLocalStorageValue('mailgo-hide-ads') === 'true'
 }
 
 function loadCustomCss() {
-  try {
-    return (window.localStorage.getItem('mailgo-custom-css') ?? '').slice(0, MAX_CUSTOM_CSS_LENGTH)
-  } catch {
-    return ''
-  }
+  return (readLocalStorageValue('mailgo-custom-css') ?? '').slice(0, MAX_CUSTOM_CSS_LENGTH)
 }
 
 function ProviderMark({ provider, size = 'md' }: { provider: Provider; size?: 'sm' | 'md' | 'lg' }) {
@@ -503,7 +515,7 @@ function App() {
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme
-    window.localStorage.setItem('mailgo-theme', theme)
+    writeLocalStorageValue('mailgo-theme', theme)
     if (isNativeRuntime && nativeStateReady) {
       void invoke('app.set_theme', { theme }).catch(() => undefined)
     }
@@ -622,11 +634,7 @@ function App() {
     }
     const boundedCss = customCss.slice(0, MAX_CUSTOM_CSS_LENGTH)
     style.textContent = boundedCss
-    try {
-      window.localStorage.setItem('mailgo-custom-css', boundedCss)
-    } catch {
-      // The visual override remains active for this session if WebView storage is unavailable.
-    }
+    writeLocalStorageValue('mailgo-custom-css', boundedCss)
   }, [customCss])
 
   useEffect(() => {
@@ -636,11 +644,11 @@ function App() {
   }, [customCss])
 
   useEffect(() => {
-    window.localStorage.setItem('mailgo-remote-images', String(remoteImagesEnabled))
+    writeLocalStorageValue('mailgo-remote-images', String(remoteImagesEnabled))
   }, [remoteImagesEnabled])
 
   useEffect(() => {
-    window.localStorage.setItem('mailgo-hide-ads', String(hideAds))
+    writeLocalStorageValue('mailgo-hide-ads', String(hideAds))
   }, [hideAds])
 
   useEffect(() => {
@@ -665,6 +673,8 @@ function App() {
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
+      const eventTarget = event.target instanceof HTMLElement ? event.target : null
+      const isEditableTarget = Boolean(eventTarget?.matches('input, textarea, select, [contenteditable="true"]'))
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault()
         document.getElementById('mail-search')?.focus()
@@ -679,11 +689,11 @@ function App() {
         setOpenMenu(null)
         setHelpOpen(false)
       }
-      if (!event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 'c' && !(event.target as HTMLElement).matches('input, textarea, select')) {
+      if (!event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 'c' && !isEditableTarget) {
         event.preventDefault()
         openCompose()
       }
-      if (!event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 'r' && !(event.target as HTMLElement).matches('input, textarea, select') && selectedMailRef.current?.id !== 'empty-mail') {
+      if (!event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 'r' && !isEditableTarget && selectedMailRef.current?.id !== 'empty-mail') {
         event.preventDefault()
         if (selectedMailRef.current) openCompose(undefined, 'reply', selectedMailRef.current)
       }
