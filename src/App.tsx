@@ -432,6 +432,8 @@ function App() {
   const importInputRef = useRef<HTMLInputElement>(null)
   const encryptedTransferInputRef = useRef<HTMLInputElement>(null)
   const accountPrefillRef = useRef<string | null>(null)
+  const oauthSessionIdRef = useRef('')
+  const authAttemptRef = useRef(0)
   const selectedMailRef = useRef<MailMessage | undefined>(undefined)
   const attachmentCancelsRef = useRef(new Map<string, () => void>())
   const [nativeStateReady, setNativeStateReady] = useState(!isNativeRuntime)
@@ -535,7 +537,31 @@ function App() {
     setNativeDrafts((current) => current.filter((draft) => draft.id !== draftId))
   }, [])
 
+  const cancelNativeAuthSession = (sessionId: string) => {
+    if (!isNativeRuntime || !sessionId) return
+    void invoke('auth.cancel', { sessionId }).catch(() => undefined)
+  }
+
+  const invalidateAuthFlow = () => {
+    authAttemptRef.current += 1
+    const sessionId = oauthSessionIdRef.current || oauthSessionId
+    cancelNativeAuthSession(sessionId)
+    oauthSessionIdRef.current = ''
+    return authAttemptRef.current
+  }
+
+  const closeAccountModal = () => {
+    invalidateAuthFlow()
+    setAccountModalOpen(false)
+    setAuthorizationCode('')
+    setShowAuthorizationCode(false)
+    setOauthSessionId('')
+    setOauthState('')
+    setDeviceFlow(null)
+  }
+
   const changeProvider = (nextProvider: Provider) => {
+    invalidateAuthFlow()
     setProvider(nextProvider)
     setCustomAuthentication(nextProvider === 'outlook' || nextProvider === 'google' ? 'oauth2' : nextProvider === 'other' ? 'password' : 'app-password')
     setAuthorizationCode('')
@@ -558,6 +584,17 @@ function App() {
     setCustomSmtpSecurity('tls')
     setAccountModalOpen(true)
   }
+
+  useEffect(() => {
+    oauthSessionIdRef.current = oauthSessionId
+  }, [oauthSessionId])
+
+  useEffect(() => {
+    if (!isAccountModalOpen) {
+      setAuthorizationCode('')
+      setShowAuthorizationCode(false)
+    }
+  }, [isAccountModalOpen])
 
   useEffect(() => {
     if (!isNativeRuntime || !deviceFlow || deviceFlow.status !== 'pending') return
@@ -775,7 +812,7 @@ function App() {
         setComposeDraftId(undefined)
         setComposeMode('new')
         setComposeSource(undefined)
-        setAccountModalOpen(false)
+        closeAccountModal()
         setSettingsOpen(false)
         setOpenMenu(null)
         setHelpOpen(false)
@@ -1402,12 +1439,21 @@ function App() {
 
   const handleOpenProvider = async () => {
     if (isNativeRuntime && customAuthentication === 'oauth2' && accountEmail.trim()) {
+      const attempt = invalidateAuthFlow()
+      setOauthSessionId('')
+      setOauthState('')
+      setDeviceFlow(null)
       try {
         if (provider === 'outlook') {
           const flow = await invoke<NativeDeviceStartResponse>('auth.device.start', {
             provider,
             email: accountEmail.trim(),
           })
+          if (attempt !== authAttemptRef.current) {
+            cancelNativeAuthSession(flow.sessionId)
+            return
+          }
+          oauthSessionIdRef.current = flow.sessionId
           setOauthSessionId(flow.sessionId)
           setDeviceFlow({
             sessionId: flow.sessionId,
@@ -1425,12 +1471,22 @@ function App() {
           provider,
           email: accountEmail.trim(),
         })
+        if (attempt !== authAttemptRef.current) {
+          cancelNativeAuthSession(flow.sessionId)
+          return
+        }
+        oauthSessionIdRef.current = flow.sessionId
         setOauthSessionId(flow.sessionId)
         setOauthState(flow.state)
         await openExternalUrl(flow.authorizationUrl)
         pushToast('OAuth 授权页面已打开，完成后返回 MailGo 点击“开始同步”；回调不可用时再手动粘贴授权码', 'info')
         return
       } catch (error) {
+        if (attempt !== authAttemptRef.current) return
+        invalidateAuthFlow()
+        setOauthSessionId('')
+        setOauthState('')
+        setDeviceFlow(null)
         pushToast(error instanceof Error ? error.message : 'OAuth 客户端尚未配置，将打开帮助页面', 'error')
       }
     }
@@ -1540,13 +1596,9 @@ function App() {
         setAccounts((current) => current.map((account) => account.id === id
           ? { ...newAccount, status: needsAuth ? 'needs-auth' : 'offline', lastSync: needsAuth ? '等待重新授权' : '首次同步失败，可重试' }
           : account))
-        setAuthorizationCode('')
-        setOauthSessionId('')
-        setOauthState('')
-        setDeviceFlow(null)
         setAccountEmail('')
         setEditingAccountId(null)
-        setAccountModalOpen(false)
+        closeAccountModal()
         setSelectedAccountId(id)
         pushToast(needsAuth ? '账户已保存，但需要重新授权' : '账户已保存，首次同步失败；可稍后点击账户重试', needsAuth ? 'error' : 'info')
         return
@@ -1558,13 +1610,9 @@ function App() {
       return
     }
     await refreshPendingOperations([...accounts.filter((account) => account.id !== id), newAccount])
-    setAuthorizationCode('')
-    setOauthSessionId('')
-    setOauthState('')
-    setDeviceFlow(null)
     setAccountEmail('')
     setEditingAccountId(null)
-    setAccountModalOpen(false)
+    closeAccountModal()
     setSelectedAccountId(id)
     pushToast(`${selectedProvider.label}账户${existingAccount ? '已重新授权' : '已加入'}，正在同步邮件`, 'success')
   }
@@ -1587,7 +1635,7 @@ function App() {
       setMailboxMeta((current) => Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${account.id}::`))))
       setSelectedAccountId((current) => current === account.id ? null : current)
       setEditingAccountId(null)
-      setAccountModalOpen(false)
+      closeAccountModal()
       pushToast(`${account.label} 已移除，本机凭据与缓存已清理`, 'success')
     } catch (error) {
       pushToast(error instanceof Error ? error.message : '账户移除失败，请稍后重试', 'error')
@@ -1958,7 +2006,7 @@ function App() {
 
       <AnimatePresence>{isHelpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}</AnimatePresence>
       <AnimatePresence>{isComposeOpen && <ComposeModal mode={composeMode} source={composeSource} accountId={composeSource?.accountId ?? selectedAccountId ?? accounts[0]?.id} senderEmail={accounts.find((account) => account.id === (composeSource?.accountId ?? selectedAccountId))?.email ?? accounts[0]?.email} draftId={composeDraftId} onDraftChanged={handleDraftChanged} onDraftRemoved={handleDraftRemoved} onClose={() => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts() }} onSent={(queued) => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts(); void refreshOutbox(); pushToast(queued ? '网络暂不可用，邮件已加入发件箱，联网后自动重试' : '邮件已发送', 'success') }} onError={(message) => pushToast(message, 'error')} />}</AnimatePresence>
-      <AnimatePresence>{isAccountModalOpen && <AccountModal editingAccountId={editingAccountId} provider={provider} setProvider={changeProvider} providerDefinition={selectedProvider} accountEmail={accountEmail} setAccountEmail={setAccountEmail} authorizationCode={authorizationCode} setAuthorizationCode={setAuthorizationCode} showAuthorizationCode={showAuthorizationCode} setShowAuthorizationCode={setShowAuthorizationCode} customImapHost={customImapHost} setCustomImapHost={setCustomImapHost} customImapPort={customImapPort} setCustomImapPort={setCustomImapPort} customImapSecurity={customImapSecurity} setCustomImapSecurity={setCustomImapSecurity} customSmtpHost={customSmtpHost} setCustomSmtpHost={setCustomSmtpHost} customSmtpPort={customSmtpPort} setCustomSmtpPort={setCustomSmtpPort} customSmtpSecurity={customSmtpSecurity} setCustomSmtpSecurity={setCustomSmtpSecurity} customAuthentication={customAuthentication} setCustomAuthentication={setCustomAuthentication} deviceFlow={deviceFlow} onClose={() => setAccountModalOpen(false)} onOpenProvider={() => { void handleOpenProvider() }} onCopy={handleCopy} onAdd={handleAddAccount} onRemove={handleRemoveAccount} />}</AnimatePresence>
+      <AnimatePresence>{isAccountModalOpen && <AccountModal editingAccountId={editingAccountId} provider={provider} setProvider={changeProvider} providerDefinition={selectedProvider} accountEmail={accountEmail} setAccountEmail={setAccountEmail} authorizationCode={authorizationCode} setAuthorizationCode={setAuthorizationCode} showAuthorizationCode={showAuthorizationCode} setShowAuthorizationCode={setShowAuthorizationCode} customImapHost={customImapHost} setCustomImapHost={setCustomImapHost} customImapPort={customImapPort} setCustomImapPort={setCustomImapPort} customImapSecurity={customImapSecurity} setCustomImapSecurity={setCustomImapSecurity} customSmtpHost={customSmtpHost} setCustomSmtpHost={setCustomSmtpHost} customSmtpPort={customSmtpPort} setCustomSmtpPort={setCustomSmtpPort} customSmtpSecurity={customSmtpSecurity} setCustomSmtpSecurity={setCustomSmtpSecurity} customAuthentication={customAuthentication} setCustomAuthentication={setCustomAuthentication} deviceFlow={deviceFlow} onClose={closeAccountModal} onOpenProvider={() => { void handleOpenProvider() }} onCopy={handleCopy} onAdd={handleAddAccount} onRemove={handleRemoveAccount} />}</AnimatePresence>
       <AnimatePresence>{transferMode && <TransferModal mode={transferMode} fileName={transferFile?.name} isBusy={isImporting} onClose={() => { if (!isImporting) { setTransferMode(null); setTransferFile(null) } }} onSubmit={handleEncryptedTransfer} />}</AnimatePresence>
       <div className="toast-stack" aria-live="polite">{toasts.map((toast) => <motion.div key={toast.id} className={`toast toast-${toast.tone}`} initial={{ opacity: 0, y: 12, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 12 }}><Icon name={toast.tone === 'success' ? 'checkCircle' : toast.tone === 'error' ? 'info' : 'bell'} size={17} /><span>{toast.message}</span></motion.div>)}</div>
     </div>

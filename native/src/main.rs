@@ -777,11 +777,30 @@ fn valid_upload_content_id(value: Option<String>) -> Result<Option<String>> {
 }
 
 fn purge_expired_auth_sessions(app: &mut MailGoState) {
-    app.auth_sessions
-        .retain(|_, session| !oauth::is_expired(session));
+    let expired_ids = app
+        .auth_sessions
+        .iter()
+        .filter(|(_, session)| oauth::is_expired(session))
+        .map(|(session_id, _)| session_id.clone())
+        .collect::<Vec<_>>();
+    for session_id in expired_ids {
+        if let Some(session) = app.auth_sessions.remove(&session_id) {
+            oauth::cancel(&session);
+        }
+    }
     let active_sessions = app.auth_sessions.keys().cloned().collect::<HashSet<_>>();
     app.ready_oauth_credentials
         .retain(|session_id, _| active_sessions.contains(session_id));
+}
+
+fn cancel_auth_session(app: &mut MailGoState, session_id: &str) -> bool {
+    let pending = app.auth_sessions.remove(session_id);
+    let had_pending = pending.is_some();
+    if let Some(session) = pending {
+        oauth::cancel(&session);
+    }
+    let had_ready_credential = app.ready_oauth_credentials.remove(session_id).is_some();
+    had_pending || had_ready_credential
 }
 
 fn ensure_auth_session_capacity(app: &mut MailGoState) -> Result<()> {
@@ -932,6 +951,12 @@ fn handle_ipc(
                 app.save()?;
                 Ok(json!({ "theme": theme }))
             }
+            "auth.cancel" => {
+                let session_id = bounded_string_field(&message.payload, "sessionId", 128)?;
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                let cancelled = cancel_auth_session(&mut app, &session_id);
+                Ok(json!({ "sessionId": session_id, "cancelled": cancelled }))
+            }
             "auth.start" => {
                 let provider =
                     providers::ProviderKind::parse(&string_field(&message.payload, "provider")?)?;
@@ -943,7 +968,10 @@ fn handle_ipc(
                 }
                 let (session, response) = oauth::start(provider, &email)?;
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-                ensure_auth_session_capacity(&mut app)?;
+                if let Err(error) = ensure_auth_session_capacity(&mut app) {
+                    oauth::cancel(&session);
+                    return Err(error);
+                }
                 app.auth_sessions.insert(session.id.clone(), session);
                 Ok(serde_json::to_value(response)?)
             }
@@ -1059,6 +1087,7 @@ fn handle_ipc(
                         let pending = app.auth_sessions.remove(&session_id).ok_or_else(|| {
                             anyhow!("OAuth sign-in session is missing or expired")
                         })?;
+                        oauth::cancel(&pending);
                         (pending, app.ready_oauth_credentials.remove(&session_id))
                     };
                     if pending.provider != provider_kind
@@ -2474,6 +2503,24 @@ mod tests {
         assert_eq!(next, ATTACHMENT_CHUNK_BYTES + 10);
         assert!(done);
         assert!(attachment_chunk_bounds(10, 11).is_err());
+    }
+
+    #[test]
+    fn cancelling_auth_session_discards_ready_credential_and_is_idempotent() {
+        let mut app = MailGoState {
+            state_path: PathBuf::new(),
+            state: PersistedState::default(),
+            auth_sessions: HashMap::new(),
+            ready_oauth_credentials: HashMap::from([(
+                "session-1".to_string(),
+                Zeroizing::new("credential-that-must-not-linger".to_string()),
+            )]),
+            attachment_downloads: HashMap::new(),
+            attachment_uploads: HashMap::new(),
+        };
+        assert!(cancel_auth_session(&mut app, "session-1"));
+        assert!(app.ready_oauth_credentials.is_empty());
+        assert!(!cancel_auth_session(&mut app, "session-1"));
     }
 
     #[test]

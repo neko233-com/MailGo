@@ -134,6 +134,10 @@ pub fn is_expired(session: &PendingSession) -> bool {
     now_seconds() >= expires_at
 }
 
+pub fn cancel(session: &PendingSession) {
+    unregister_loopback_callback(&session.redirect_uri, &session.state);
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredCredential {
@@ -672,6 +676,37 @@ fn register_loopback_listener(
             expires_at: now.saturating_add(SESSION_TTL_SECONDS),
         },
     );
+}
+
+fn unregister_loopback_callback(redirect_uri: &str, state: &str) {
+    if redirect_uri.is_empty() || state.is_empty() {
+        return;
+    }
+    let Ok(parsed) = url::Url::parse(redirect_uri) else {
+        return;
+    };
+    if parsed.scheme() != "http" || parsed.host_str() != Some("127.0.0.1") {
+        return;
+    }
+    let Some(port) = parsed.port_or_known_default() else {
+        return;
+    };
+    let listener_key = format!("{port}:{}", parsed.path());
+    let Some(listeners) = LOOPBACK_LISTENERS.get() else {
+        return;
+    };
+    let Ok(listeners) = listeners.lock() else {
+        return;
+    };
+    let listener = listeners.get(&listener_key).cloned();
+    drop(listeners);
+    let Some(listener) = listener else {
+        return;
+    };
+    let Ok(mut callbacks) = listener.callbacks.lock() else {
+        return;
+    };
+    callbacks.remove(state);
 }
 
 fn run_loopback_listener(listener: TcpListener, state: Arc<LoopbackListener>) {
