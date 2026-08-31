@@ -2400,6 +2400,9 @@ fn handle_ipc(
                     )?;
                     true
                 } else if let Err(error) = result {
+                    if !sync::is_retryable_error(&error) {
+                        return Err(error);
+                    }
                     sync::queue_move_mutation(
                         &cache_dir(),
                         &account_id,
@@ -2467,7 +2470,7 @@ fn handle_ipc(
                 } else {
                     let profile = profile_for_account(&account)?;
                     let credential = load_credential(&account)?;
-                    if let Err(error) = sync::set_flag(
+                    match sync::set_flag(
                         profile,
                         &account.email,
                         &credential,
@@ -2476,21 +2479,31 @@ fn handle_ipc(
                         flag,
                         enabled,
                     ) {
-                        sync::queue_flag_mutation(
-                            &cache_dir(),
-                            &account_id,
-                            &folder,
-                            uid,
-                            flag,
-                            enabled,
-                        )
-                        .with_context(|| {
-                            format!("queue mail flag after provider failure: {error}")
-                        })?;
-                        true
-                    } else {
-                        sync::remove_queued_flag(&cache_dir(), &account_id, &folder, uid, flag)?;
-                        false
+                        Ok(()) => {
+                            sync::remove_queued_flag(
+                                &cache_dir(),
+                                &account_id,
+                                &folder,
+                                uid,
+                                flag,
+                            )?;
+                            false
+                        }
+                        Err(error) if sync::is_retryable_error(&error) => {
+                            sync::queue_flag_mutation(
+                                &cache_dir(),
+                                &account_id,
+                                &folder,
+                                uid,
+                                flag,
+                                enabled,
+                            )
+                            .with_context(|| {
+                                format!("queue mail flag after provider failure: {error}")
+                            })?;
+                            true
+                        }
+                        Err(error) => return Err(error),
                     }
                 };
                 if let Err(error) = sync::update_cached_flags(

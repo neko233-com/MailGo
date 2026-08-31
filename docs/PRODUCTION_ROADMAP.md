@@ -106,6 +106,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 97. The portable deployment script now verifies the release manifest, rejects ZIP traversal and oversized extraction, checks WebView2, deploys through a temporary directory, creates shortcuts, and retains the prior install for rollback; signed MSIX remains the production distribution path.
 98. The OAuth loopback listener now reads a bounded complete HTTP header instead of assuming one TCP read contains the browser request, with regression coverage for split callback packets.
 99. Desktop widths from 1100–1400px now reserve the authorization assistant as a fourth column, keeping reading actions such as rich HTML rendering reachable while narrower layouts retain drawer behavior.
+100. Online move, archive, delete, read, and star actions now enqueue only classified transient transport/rate-limit failures; authentication and permanent provider errors return immediately, while optimistic renderer state rolls back and marks affected accounts for reauthorization.
 
 ## Remaining production acceptance work
 

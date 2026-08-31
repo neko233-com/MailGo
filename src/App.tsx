@@ -480,6 +480,14 @@ function App() {
     window.setTimeout(() => setToasts((current) => current.filter((toast) => toast.id !== id)), 3600)
   }
 
+  const markAccountNeedsReauth = (accountId: string, error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error)
+    if (!/auth|credential|login|password|authorization/i.test(message)) return
+    setAccounts((current) => current.map((account) => account.id === accountId
+      ? { ...account, status: 'needs-auth' as const, lastSync: '等待重新授权' }
+      : account))
+  }
+
   const refreshPendingOperations = async (accountList: MailAccount[] = accounts) => {
     if (!isNativeRuntime) {
       setPendingOperations(0)
@@ -946,7 +954,16 @@ function App() {
     }
     if (mail.unread) mapMailSources((item) => item.id === mail.id ? { ...item, unread: false } : item)
     if (isNativeRuntime && !offlineMode && mail.nativeUid) {
-      void invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: false }).then(() => refreshPendingOperations()).catch(() => undefined)
+      void invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: false })
+        .then(() => refreshPendingOperations())
+        .catch((error) => {
+          markAccountNeedsReauth(mail.accountId, error)
+          mapMailSources((item) => item.id === mail.id ? { ...item, unread: true } : item)
+          setAccounts((current) => current.map((account) => account.id === mail.accountId
+            ? { ...account, unread: account.unread + 1 }
+            : account))
+          pushToast('邮件仍未标记为已读，请重新授权或稍后重试', 'error')
+        })
       try {
         const result = await invoke<NativeMessageResponse>('mail.get', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid })
         const account = accounts.find((item) => item.id === mail.accountId)
@@ -965,7 +982,13 @@ function App() {
     mapMailSources((item) => item.id === mail.id ? { ...item, starred: nextStarred } : item)
     setSelectedMailId(mail.id)
     if (isNativeRuntime && mail.nativeUid) {
-      void invoke('mail.star', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: nextStarred }).then(() => refreshPendingOperations()).catch(() => pushToast('星标同步失败，可稍后重试', 'error'))
+      void invoke('mail.star', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: nextStarred })
+        .then(() => refreshPendingOperations())
+        .catch((error) => {
+          markAccountNeedsReauth(mail.accountId, error)
+          mapMailSources((item) => item.id === mail.id ? { ...item, starred: mail.starred } : item)
+          pushToast('星标同步失败，已恢复原状态', 'error')
+        })
     }
     pushToast(nextStarred ? '已添加到星标' : '已移出星标', 'success')
   }
@@ -993,8 +1016,17 @@ function App() {
       ? { ...account, unread: Math.max(0, account.unread + (unread ? 1 : -1)) }
       : account))
     if (isNativeRuntime && mail.nativeUid) {
-      await invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: unread })
-      await refreshPendingOperations()
+      try {
+        await invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: unread })
+        await refreshPendingOperations()
+      } catch (error) {
+        markAccountNeedsReauth(mail.accountId, error)
+        mapMailSources((item) => item.id === mail.id ? { ...item, unread: mail.unread } : item)
+        setAccounts((current) => current.map((account) => account.id === mail.accountId
+          ? { ...account, unread: Math.max(0, account.unread + (mail.unread ? 1 : -1)) }
+          : account))
+        throw error
+      }
     }
   }
 
@@ -1013,15 +1045,29 @@ function App() {
     let failed = 0
     if (isNativeRuntime) {
       const results = await Promise.all(selected.map(async (mail) => {
-        if (!mail.nativeUid) return true
+        if (!mail.nativeUid) return { mail, ok: true }
         try {
           await invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: unread })
-          return true
-        } catch {
-          return false
+          return { mail, ok: true }
+        } catch (error) {
+          markAccountNeedsReauth(mail.accountId, error)
+          return { mail, ok: false }
         }
       }))
-      failed = results.filter((result) => !result).length
+      const failedMails = results.filter((result) => !result.ok).map((result) => result.mail)
+      failed = failedMails.length
+      if (failedMails.length) {
+        const failedState = new Map(failedMails.map((mail) => [mail.id, mail]))
+        mapMailSources((currentMail) => {
+          const previous = failedState.get(currentMail.id)
+          return previous ? { ...currentMail, unread: previous.unread } : currentMail
+        })
+        setAccounts((current) => current.map((account) => {
+          const count = failedMails.filter((mail) => mail.accountId === account.id)
+            .reduce((total, mail) => total + (mail.unread ? 1 : -1), 0)
+          return count ? { ...account, unread: Math.max(0, account.unread + count) } : account
+        }))
+      }
       await refreshPendingOperations()
     }
     setSelectedMailIds([])
@@ -1042,15 +1088,24 @@ function App() {
     let failed = 0
     if (isNativeRuntime) {
       const results = await Promise.all(selected.map(async (mail) => {
-        if (!mail.nativeUid) return true
+        if (!mail.nativeUid) return { mail, ok: true }
         try {
           await invoke('mail.star', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: starred })
-          return true
-        } catch {
-          return false
+          return { mail, ok: true }
+        } catch (error) {
+          markAccountNeedsReauth(mail.accountId, error)
+          return { mail, ok: false }
         }
       }))
-      failed = results.filter((result) => !result).length
+      const failedMails = results.filter((result) => !result.ok).map((result) => result.mail)
+      failed = failedMails.length
+      if (failedMails.length) {
+        const failedState = new Map(failedMails.map((mail) => [mail.id, mail]))
+        mapMailSources((currentMail) => {
+          const previous = failedState.get(currentMail.id)
+          return previous ? { ...currentMail, starred: previous.starred } : currentMail
+        })
+      }
       await refreshPendingOperations()
     }
     setSelectedMailIds([])

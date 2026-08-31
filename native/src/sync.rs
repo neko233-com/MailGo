@@ -1311,6 +1311,16 @@ pub fn needs_reauthorization(error: &anyhow::Error) -> bool {
     classify_sync_error(error) == SyncErrorClass::Authentication
 }
 
+/// Only transient provider failures may enter the encrypted offline mutation queue. Permanent
+/// command failures and authentication errors must reach the renderer immediately instead of
+/// being replayed forever with stale credentials or an invalid destination.
+pub fn is_retryable_error(error: &anyhow::Error) -> bool {
+    matches!(
+        classify_sync_error(error),
+        SyncErrorClass::RateLimited | SyncErrorClass::Transport
+    )
+}
+
 fn classify_sync_error(error: &anyhow::Error) -> SyncErrorClass {
     let message = error.to_string().to_ascii_lowercase();
     if [
@@ -2876,6 +2886,12 @@ mod tests {
             "OAuth access token expired; reauthorization is required"
         )));
         assert!(!needs_reauthorization(&anyhow!("connection reset by peer")));
+        assert!(is_retryable_error(&anyhow!("connection reset by peer")));
+        assert!(is_retryable_error(&anyhow!(
+            "IMAP rate limit: try again later"
+        )));
+        assert!(!is_retryable_error(&anyhow!("IMAP authentication failed")));
+        assert!(!is_retryable_error(&anyhow!("mailbox does not exist")));
     }
 
     #[test]
