@@ -9,6 +9,9 @@ $repository = 'https://github.com/neko233-com/rdesktop'
 # Keep the updater on the exact rdesktop revision audited by this workspace. Move this
 # trust root only as part of a reviewed dependency update; never follow an unpinned branch.
 $trustedRevision = 'e9b2ba8d7a6c22138d37ca0cccfc41bbfeb28439'
+# Release fallback is disabled unless the deployment supplies the reviewed Authenticode
+# publisher thumbprint. A digest from the same release API is not an authenticity proof.
+$trustedSignerThumbprint = [string]$env:MAILGO_RDESKTOP_SIGNER_THUMBPRINT
 $releaseApi = 'https://api.github.com/repos/neko233-com/rdesktop/releases/latest'
 
 function Get-InstalledRdesktop {
@@ -44,6 +47,18 @@ function Try-InstallVerifiedRelease($installed) {
             $expectedDigest = ($asset.digest -replace '^sha256:', '').ToLowerInvariant()
             if ($actualDigest -ne $expectedDigest) {
                 throw 'official rdesktop release checksum mismatch'
+            }
+            if ([string]::IsNullOrWhiteSpace($trustedSignerThumbprint)) {
+                throw 'official rdesktop release fallback is disabled until a trusted signer thumbprint is configured'
+            }
+            $signature = Get-AuthenticodeSignature -LiteralPath $temporaryPath
+            if ($signature.Status -ne 'Valid' -or !$signature.SignerCertificate) {
+                throw 'official rdesktop release is not Authenticode-signed by a trusted publisher'
+            }
+            $actualThumbprint = ($signature.SignerCertificate.Thumbprint -replace '\s', '').ToUpperInvariant()
+            $expectedThumbprint = ($trustedSignerThumbprint -replace '\s', '').ToUpperInvariant()
+            if ($actualThumbprint -ne $expectedThumbprint) {
+                throw 'official rdesktop release signer thumbprint mismatch'
             }
             Copy-Item -LiteralPath $temporaryPath -Destination $installed.Path -Force
             Write-Host "Installed verified rdesktop release $releaseVersion from GitHub."
