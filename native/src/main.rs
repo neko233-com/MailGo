@@ -380,13 +380,18 @@ fn validate_external_url(value: &str) -> Result<url::Url> {
         return Err(anyhow!("external URL is empty or too long"));
     }
     let parsed = url::Url::parse(value).context("invalid external URL")?;
-    if parsed.scheme() != "https"
-        || parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-    {
+    let is_https = parsed.scheme() == "https"
+        && parsed.host_str().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none();
+    let is_mailto = parsed.scheme() == "mailto"
+        && parsed.host_str().is_none()
+        && !parsed.path().trim().is_empty()
+        && !value.to_ascii_lowercase().contains("%0d")
+        && !value.to_ascii_lowercase().contains("%0a");
+    if !is_https && !is_mailto {
         return Err(anyhow!(
-            "external links must use HTTPS without embedded credentials"
+            "external links must use HTTPS or mailto without embedded credentials"
         ));
     }
     Ok(parsed)
@@ -2569,6 +2574,8 @@ mod tests {
         assert!(validate_external_url("http://accounts.example.invalid/settings").is_err());
         assert!(validate_external_url("javascript:alert(1)").is_err());
         assert!(validate_external_url("https://name:token@example.invalid/").is_err());
+        assert!(validate_external_url("mailto:person@example.invalid?subject=Hello").is_ok());
+        assert!(validate_external_url("mailto:person@example.invalid?body=%0Aunsafe").is_err());
     }
 
     #[test]

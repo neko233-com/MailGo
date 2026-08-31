@@ -422,6 +422,19 @@ function App() {
     if (!opened) throw new Error('当前环境阻止了外部浏览器跳转')
   }
 
+  const handleRenderedLinkClick = (event: React.MouseEvent<HTMLDivElement>) => {
+    const anchor = event.target instanceof Element ? event.target.closest('a') : null
+    const href = anchor?.getAttribute('href')?.trim()
+    if (!anchor || !href || href.startsWith('#')) return
+    if (!/^(https:\/\/|mailto:)/i.test(href)) {
+      event.preventDefault()
+      pushToast('已阻止不安全的邮件链接', 'error')
+      return
+    }
+    event.preventDefault()
+    void openExternalUrl(href).catch((error) => pushToast(error instanceof Error ? error.message : '无法打开邮件链接', 'error'))
+  }
+
   useEffect(() => () => {
     attachmentCancelsRef.current.forEach((cancel) => cancel())
     attachmentCancelsRef.current.clear()
@@ -1848,7 +1861,7 @@ function App() {
             <div className="sender-row"><Avatar message={selectedMail} size="lg" /><div className="sender-copy"><div><strong>{selectedMail.senderName}</strong> <span>&lt;{selectedMail.from}&gt;</span></div><div className="recipient">收件人： {selectedMailAccount?.label ?? '当前账户'} &lt;{selectedMailAccount?.email ?? '—'}&gt;</div></div><time>{selectedMail.timestamp}<br /><span>今天</span></time><TooltipButton label="发件人更多信息"><Icon name="more" size={19} /></TooltipButton></div>
             <div className="message-content">
               {selectedMail.hasHtml && <div className="content-mode-row"><span>此邮件包含富文本内容{(!remoteImagesEnabled || offlineMode) && ` · ${offlineMode ? '仅离线模式，远程图片已屏蔽' : '远程图片已屏蔽'}`}</span><button type="button" className="text-action" onClick={() => setHtmlMode((value) => !value)}>{isHtmlMode ? '查看纯文本' : '渲染 HTML'} <Icon name="grid" size={14} /></button></div>}
-              {isHtmlMode && selectedMail.hasHtml ? <div className="html-rendered" dangerouslySetInnerHTML={{ __html: sanitizeHtml(selectedMail.htmlBody ?? initialHtml, remoteImagesEnabled && !offlineMode) }} /> : selectedMail.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
+              {isHtmlMode && selectedMail.hasHtml ? <div className="html-rendered" onClick={handleRenderedLinkClick} dangerouslySetInnerHTML={{ __html: sanitizeHtml(selectedMail.htmlBody ?? initialHtml, remoteImagesEnabled && !offlineMode) }} /> : selectedMail.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
             </div>
             {selectedMail.attachments && <div className="attachments"><div className="attachments-heading"><span><Icon name="paperclip" size={20} /> {selectedMail.attachments.length} 个附件</span><div><button type="button" onClick={() => { void Promise.all(selectedMail.attachments?.map(downloadAttachment) ?? []) }}><Icon name="download" size={17} /> 全部下载</button><button type="button" onClick={() => pushToast('正在保存到本地缓存', 'success')}><Icon name="cloud" size={17} /> 保存到云盘</button></div></div><div className="attachment-grid">{selectedMail.attachments.map((attachment) => { const progress = attachmentProgress[attachment.id]; return <button type="button" className="attachment-card" key={attachment.id} onClick={() => { if (progress != null) cancelAttachment(attachment.id); else void downloadAttachment(attachment) }}><span className={`file-glyph file-${attachment.kind}`}>{attachment.kind === 'pdf' ? 'PDF' : attachment.kind === 'sheet' ? 'X' : 'FILE'}</span><span className="attachment-copy"><strong>{attachment.name}</strong><small>{progress != null ? `${progress}% · 点击取消` : attachment.size}</small></span><Icon name={progress != null ? 'close' : 'download'} size={17} /></button> })}</div></div>}
             <div className="reply-composer"><Avatar message={{ ...selectedMail, avatar: 'OC', accent: '#2a5596' }} size="sm" /><div className="reply-input" onClick={() => openCompose(undefined, 'reply', selectedMail)}>点击回复，或按 R 快速回复<div className="reply-tools"><span><Icon name="paperclip" size={19} /></span><span><Icon name="image" size={19} /></span><span className="reply-emoji">☺</span><span className="reply-a">A</span><button type="button" onClick={(event) => { event.stopPropagation(); openCompose(undefined, 'reply', selectedMail) }}>回复 <span>⌄</span></button></div></div></div>
