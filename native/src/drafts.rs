@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
@@ -14,6 +15,15 @@ const MAX_DRAFT_ID_BYTES: usize = 128;
 const MAX_RECIPIENT_BYTES: usize = 320;
 const MAX_SUBJECT_BYTES: usize = 998;
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+static DRAFTS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn drafts_guard() -> std::sync::MutexGuard<'static, ()> {
+    DRAFTS_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("MailGo drafts lock poisoned")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +50,7 @@ struct DraftStore {
 }
 
 pub fn list(cache_root: &Path, account_id: &str) -> Result<Vec<Draft>> {
+    let _drafts_guard = drafts_guard();
     validate_account_id(account_id)?;
     let mut drafts = load(cache_root)?
         .drafts
@@ -51,6 +62,7 @@ pub fn list(cache_root: &Path, account_id: &str) -> Result<Vec<Draft>> {
 }
 
 pub fn save(cache_root: &Path, mut draft: Draft) -> Result<Draft> {
+    let _drafts_guard = drafts_guard();
     validate(&draft)?;
     if draft.id.is_empty() {
         draft.id = format!("draft-{:016x}", rand::random::<u64>());
@@ -75,6 +87,7 @@ pub fn save(cache_root: &Path, mut draft: Draft) -> Result<Draft> {
 }
 
 pub fn remove(cache_root: &Path, account_id: &str, draft_id: &str) -> Result<bool> {
+    let _drafts_guard = drafts_guard();
     validate_account_id(account_id)?;
     validate_draft_id(draft_id)?;
     let mut store = load(cache_root)?;
@@ -90,6 +103,7 @@ pub fn remove(cache_root: &Path, account_id: &str, draft_id: &str) -> Result<boo
 }
 
 pub fn remove_account(cache_root: &Path, account_id: &str) -> Result<()> {
+    let _drafts_guard = drafts_guard();
     validate_account_id(account_id)?;
     let mut store = load(cache_root)?;
     let original_len = store.drafts.len();
@@ -265,6 +279,30 @@ mod tests {
         let mut other = fixture();
         other.account_id = "account-2".into();
         assert!(save(&root, other).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_saves_preserve_each_draft() {
+        let root = std::env::temp_dir().join(format!(
+            "mailgo-drafts-concurrent-test-{}",
+            std::process::id()
+        ));
+        let workers = (0..12)
+            .map(|index| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let mut draft = fixture();
+                    draft.id = format!("draft-{index}");
+                    draft.subject = format!("Subject {index}");
+                    save(&root, draft).expect("concurrent draft save");
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("draft worker should finish");
+        }
+        assert_eq!(list(&root, "account-1").unwrap().len(), 12);
         let _ = fs::remove_dir_all(root);
     }
 }

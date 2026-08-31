@@ -379,6 +379,21 @@ fn credential_entry(account_id: &str) -> Result<keyring::Entry> {
         .map_err(|error| anyhow!("credential store unavailable: {error}"))
 }
 
+fn snapshot_credential(account_id: &str) -> Result<Option<String>> {
+    match credential_entry(account_id)?.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(anyhow!("credential store unavailable: {error}")),
+    }
+}
+
+fn delete_credential_if_present(account_id: &str) -> Result<()> {
+    match credential_entry(account_id)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(anyhow!("remove credential: {error}")),
+    }
+}
+
 fn load_credential(account: &PersistedAccount) -> Result<String> {
     let entry = credential_entry(&account.id)?;
     let raw = entry.get_password().map_err(|error| match error {
@@ -724,6 +739,17 @@ fn account_capacity_available(accounts: &[PersistedAccount], id: &str) -> bool {
     accounts.iter().any(|account| account.id == id) || accounts.len() < MAX_IMPORTED_ACCOUNTS
 }
 
+fn transfer_fits_account_capacity(
+    existing: &[PersistedAccount],
+    incoming_ids: &HashSet<String>,
+) -> bool {
+    let retained = existing
+        .iter()
+        .filter(|account| !incoming_ids.contains(&account.id))
+        .count();
+    retained.saturating_add(incoming_ids.len()) <= MAX_IMPORTED_ACCOUNTS
+}
+
 fn attachment_chunk_bounds(total: usize, offset: usize) -> Result<(usize, bool)> {
     if offset > total {
         return Err(anyhow!("attachment download offset is invalid"));
@@ -1002,16 +1028,35 @@ fn handle_ipc(
                 // Authorization codes and access tokens never enter PersistedState or logs. The
                 // resulting provider credential is kept in the OS credential store. OAuth flows
                 // retain refresh tokens only inside this same protected entry.
-                credential_entry(&id)?
-                    .set_password(credential.as_str())
-                    .map_err(|error| anyhow!("save credential: {error}"))?;
-
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-                app.state.accounts.retain(|account| account.id != id);
-                app.state.accounts.push(new_account);
-                app.state.folder_names.remove(&id);
-                app.save()?;
-                outbox::resume_account(&cache_dir(), &id)?;
+                if !account_capacity_available(&app.state.accounts, &id) {
+                    return Err(anyhow!(
+                        "MailGo supports at most {MAX_IMPORTED_ACCOUNTS} accounts"
+                    ));
+                }
+                let previous_accounts = app.state.accounts.clone();
+                let previous_folders = app.state.folder_names.clone();
+                let mut previous_credentials = vec![(id.clone(), snapshot_credential(&id)?)];
+                let commit_result = (|| -> Result<()> {
+                    credential_entry(&id)?
+                        .set_password(credential.as_str())
+                        .map_err(|error| anyhow!("save credential: {error}"))?;
+                    app.state.accounts.retain(|account| account.id != id);
+                    app.state.accounts.push(new_account);
+                    app.state.folder_names.remove(&id);
+                    app.save()
+                })();
+                if let Err(error) = commit_result {
+                    app.state.accounts = previous_accounts;
+                    app.state.folder_names = previous_folders;
+                    restore_credentials(&mut previous_credentials);
+                    return Err(error);
+                }
+                clear_credential_snapshots(&mut previous_credentials);
+                drop(app);
+                if let Err(error) = outbox::resume_account(&cache_dir(), &id) {
+                    tracing::warn!(account_id = %id, "could not resume account outbox: {error}");
+                }
                 Ok(json!({ "id": id, "stored": true }))
             }
             "accounts.import" => {
@@ -1020,8 +1065,8 @@ fn handle_ipc(
                     .get("accounts")
                     .and_then(Value::as_array)
                     .ok_or_else(|| anyhow!("accounts must be an array"))?;
-                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-                let mut imported = 0u32;
+                let mut imported_accounts = Vec::new();
+                let mut seen_ids = HashSet::new();
                 for raw in accounts.iter().take(MAX_IMPORTED_ACCOUNTS) {
                     let id = raw
                         .get("id")
@@ -1050,6 +1095,7 @@ fn handle_ipc(
                     if !valid_account_id(id)
                         || label.len() > MAX_ACCOUNT_LABEL_LENGTH
                         || providers::validate_email(email).is_err()
+                        || !seen_ids.insert(id.to_string())
                     {
                         continue;
                     }
@@ -1091,25 +1137,62 @@ fn handle_ipc(
                             .and_then(Value::as_str)
                             .map(ToOwned::to_owned),
                     };
-                    if profile_for_account(&imported_account).is_err() {
-                        continue;
+                    if profile_for_account(&imported_account).is_ok() {
+                        imported_accounts.push(imported_account);
                     }
-                    if !account_capacity_available(&app.state.accounts, id) {
-                        break;
-                    }
-                    sync::remove_account_cache(&cache_dir(), id)?;
-                    let _ = drafts::remove_account(&cache_dir(), id);
-                    outbox::remove_account(&cache_dir(), id)?;
-                    if let Ok(entry) = credential_entry(id) {
-                        let _ = entry.delete_credential();
-                    }
-                    app.state.accounts.retain(|account| account.id != id);
-                    app.state.accounts.push(imported_account);
-                    app.state.folder_names.remove(id);
-                    imported += 1;
                 }
-                app.save()?;
-                Ok(json!({ "imported": imported, "requiresReauth": true }))
+
+                let incoming_ids = imported_accounts
+                    .iter()
+                    .map(|account| account.id.clone())
+                    .collect::<HashSet<_>>();
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                if !transfer_fits_account_capacity(&app.state.accounts, &incoming_ids) {
+                    return Err(anyhow!(
+                        "importing these accounts would exceed the {MAX_IMPORTED_ACCOUNTS}-account limit"
+                    ));
+                }
+                let mut previous_credentials = Vec::with_capacity(imported_accounts.len());
+                for account in &imported_accounts {
+                    previous_credentials
+                        .push((account.id.clone(), snapshot_credential(&account.id)?));
+                }
+                let cleanup_result = (|| -> Result<()> {
+                    for account in &imported_accounts {
+                        sync::remove_account_cache(&cache_dir(), &account.id)?;
+                        drafts::remove_account(&cache_dir(), &account.id)?;
+                        outbox::remove_account(&cache_dir(), &account.id)?;
+                        delete_credential_if_present(&account.id).with_context(|| {
+                            format!("remove credential for account {}", account.id)
+                        })?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = cleanup_result {
+                    restore_credentials(&mut previous_credentials);
+                    return Err(error);
+                }
+
+                let previous_accounts = app.state.accounts.clone();
+                let previous_folders = app.state.folder_names.clone();
+                for imported_account in &imported_accounts {
+                    app.state
+                        .accounts
+                        .retain(|account| account.id != imported_account.id);
+                    app.state.accounts.push(imported_account.clone());
+                    app.state.folder_names.remove(&imported_account.id);
+                }
+                if let Err(error) = app.save() {
+                    app.state.accounts = previous_accounts;
+                    app.state.folder_names = previous_folders;
+                    restore_credentials(&mut previous_credentials);
+                    return Err(error);
+                }
+                clear_credential_snapshots(&mut previous_credentials);
+                Ok(json!({
+                    "imported": imported_accounts.len(),
+                    "requiresReauth": true
+                }))
             }
             "accounts.remove" => {
                 let id = string_field(&message.payload, "id")?;
@@ -1185,6 +1268,19 @@ fn handle_ipc(
                         validate_transfer_account(record)?;
                         if !seen.insert(record.account.id.clone()) {
                             return Err(anyhow!("duplicate account in encrypted bundle"));
+                        }
+                    }
+
+                    let incoming_ids = records
+                        .iter()
+                        .map(|record| record.account.id.clone())
+                        .collect::<HashSet<_>>();
+                    {
+                        let app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                        if !transfer_fits_account_capacity(&app.state.accounts, &incoming_ids) {
+                            return Err(anyhow!(
+                                "importing these accounts would exceed the {MAX_IMPORTED_ACCOUNTS}-account limit"
+                            ));
                         }
                     }
 
@@ -2385,6 +2481,37 @@ mod tests {
         assert!(!valid_account_id("."));
         assert!(!valid_account_id(".."));
         assert!(valid_account_id("qq-account-1"));
+    }
+
+    #[test]
+    fn encrypted_import_respects_account_capacity_when_replacing_accounts() {
+        let existing = (0..MAX_IMPORTED_ACCOUNTS)
+            .map(|index| PersistedAccount {
+                id: format!("account-{index}"),
+                provider: "qq".into(),
+                label: format!("Account {index}"),
+                email: format!("account-{index}@example.invalid"),
+                unread: 0,
+                accent: "#5f70ee".into(),
+                status: "offline".into(),
+                last_sync: "never".into(),
+                imap_host: None,
+                imap_port: None,
+                imap_security: None,
+                smtp_host: None,
+                smtp_port: None,
+                smtp_security: None,
+                authentication: None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!transfer_fits_account_capacity(
+            &existing,
+            &HashSet::from(["new-account".to_string()])
+        ));
+        assert!(transfer_fits_account_capacity(
+            &existing,
+            &HashSet::from(["account-0".to_string()])
+        ));
     }
 
     #[test]

@@ -34,6 +34,11 @@ The current foundation includes:
 - Native mode automatically saves and restores the latest text draft per account in a DPAPI-protected local store; sending removes the draft, while attachments remain intentionally session-scoped.
 - Mailbox caches and MIME payloads have explicit byte/count limits; cached mutations are bound to UIDVALIDITY, and cache/outbox writes are serialized to avoid scheduler/IPC races.
 - Native mode also surfaces those encrypted local drafts in the 草稿箱 list, with per-account counts, draft-specific continue-editing actions, and an explicit discard action.
+- Draft persistence is serialized across concurrent compose autosaves, preventing two windows from corrupting or losing each other's encrypted draft store.
+- Encrypted account imports validate the combined account count before touching Credential Manager, so replacing existing accounts cannot silently exceed the 64-account ceiling.
+- Redacted account imports preflight every record and commit the state change only after cache and credential cleanup succeeds; a failed import restores the prior in-memory state and credentials.
+- Missing credentials are treated as an expected reauthorization state during redacted import, while unexpected Credential Manager failures abort the import before state is committed.
+- Account reauthorization now commits the new credential and metadata as one recoverable operation; a persistence failure restores the previous account state and credential, and outbox-resume errors cannot falsely report the account as unsaved.
 - Windows tray lifecycle is implemented with the generated `resources/icons/mailgo.ico`: close-to-tray, restore on click, deliberate quit, and a five-minute background sync scheduler.
 - The tray icon re-registers itself after Windows Explorer/taskbar restarts, so a hidden MailGo window remains recoverable without restarting the app.
 - Custom IMAP/SMTP onboarding accepts host, port, TLS mode, and password/app-password/OAuth2 settings without putting credentials in metadata.

@@ -72,6 +72,11 @@ The repository is deliberately split into a real desktop UI foundation and provi
 63. The packaged renderer no longer depends on remote web fonts, and the Windows packaging gate rejects Google Fonts references so offline startup does not create an implicit font-network dependency.
 64. HTML rendering now suppresses HTTPS image requests while only-offline mode is active, even when the persistent remote-image preference is enabled; same-message CID images remain available.
 65. The Windows tray window listens for the system `TaskbarCreated` broadcast and re-adds the MailGo icon after Explorer restarts; failed notification updates also attempt a safe re-registration.
+66. Encrypted draft read-modify-write operations now share a process-wide lock, with concurrent-save regression coverage to prevent autosave races from corrupting the draft store.
+67. Encrypted account import now checks the combined post-replacement account count before writing credentials, preserving the shared 64-account ceiling transactionally.
+68. Redacted account import now preflights and de-duplicates records, performs cache/credential cleanup before state mutation, and restores the prior account state and credentials if cleanup or persistence fails.
+69. Redacted import distinguishes an absent credential (normal reauthorization) from an unavailable Credential Manager, failing closed before committing state in the latter case.
+70. Account reauthorization now snapshots and restores the prior state/credential when persistence fails, while committed accounts remain usable if local outbox resumption needs a later retry.
 
 ## Remaining production acceptance work
 
