@@ -103,6 +103,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 94. Manual sync, pagination, server search, background refresh, and account reauthorization/removal now coordinate through a per-account in-flight lease, preventing duplicate IMAP work and cache recreation after destructive account operations.
 95. A fail-closed MSIX packaging path now reuses the deterministic Release portable build, emits an explicit desktop manifest, requires Windows SDK tooling and a production certificate, and verifies the Authenticode signature before handing off the installer.
 96. IMAP folder discovery now retains only a bounded selectable-folder index while preserving provider-preferred folders; the underlying IMAP library response buffer remains a release-host integration limitation for UID result sets.
+97. The portable deployment script now verifies the release manifest, rejects ZIP traversal and oversized extraction, checks WebView2, deploys through a temporary directory, creates shortcuts, and retains the prior install for rollback; signed MSIX remains the production distribution path.
 
 ## Remaining production acceptance work
 

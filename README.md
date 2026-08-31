@@ -101,6 +101,14 @@ npm run package:windows
 Extract the archive and launch `MailGo.exe`. The package expects a compatible WebView2 runtime on Windows. The installed rdesktop 0.1.8 CLI currently emits a small NSIS placeholder from `rdesktop bundle`; do not distribute that generated file as an installer. Generate the portable archive on a release build host where the Windows application-control policy permits Cargo Release build scripts; this repository intentionally does not ship an unsigned or placeholder installer.
 The Windows npm scripts place Cargo's target directory under `%LOCALAPPDATA%\MailGo\cargo-target` so application-control policies do not block dependency build scripts in the repository checkout.
 
+For a user-level portable installation, pass the release ZIP and its adjacent manifest to the recoverable installer. It verifies the manifest hash, rejects unsafe/oversized archives, checks WebView2, creates a Start Menu shortcut, and keeps the previous install as a backup:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-portable.ps1 `
+  -ArchivePath artifacts\MailGo-0.1.0-windows-x64.zip `
+  -ManifestPath artifacts\MailGo-0.1.0-windows-x64.manifest.json
+```
+
 Build a signed MSIX on a Windows release host with the Windows SDK (`makeappx.exe` and `signtool.exe`) and a trusted production certificate. The command fails closed without those tools and a certificate; it does not create an unsigned production installer:
 
 ```powershell
