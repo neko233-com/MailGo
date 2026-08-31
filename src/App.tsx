@@ -1482,6 +1482,45 @@ function App() {
     }
   }
 
+  const refreshAccountMailbox = async (account: MailAccount) => {
+    if (!isNativeRuntime) return
+    const mailbox = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id })
+    const converted = (mailbox.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, account))
+    if (mailbox.mailbox) {
+      setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(account.id, mailbox.mailbox!.folder)]: { oldestUid: mailbox.mailbox!.oldestUid, hasMore: mailbox.mailbox!.hasMore } }))
+    }
+    setMails((current) => [...current.filter((mail) => mail.accountId !== account.id), ...converted])
+    if (converted.length) setSelectedMailId((current) => current === '' || current === 'launch-plan' ? converted[0].id : current)
+  }
+
+  const syncAccountInBackground = async (account: MailAccount, accountList: MailAccount[]) => {
+    if (!isNativeRuntime || offlineMode) return
+    try {
+      const result = await invoke<NativeSyncItem>('sync.account', { accountId: account.id }, 60_000)
+      if (result.folders?.length) setNativeFolders((current) => ({ ...current, [account.id]: result.folders! }))
+      setAccounts((current) => current.map((item) => item.id === account.id
+        ? { ...item, unread: result.unread ?? 0, status: 'synced', lastSync: '刚刚同步' }
+        : item))
+      try {
+        await refreshAccountMailbox(account)
+      } catch {
+        // A cache read failure must not downgrade a successful remote sync.
+      }
+      await Promise.all([
+        refreshPendingOperations(accountList),
+        refreshOutbox(accountList),
+      ])
+      pushToast(`${account.label} 已完成首次同步`, 'success')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : ''
+      const needsAuth = /auth|credential|login|password|authorization/i.test(message)
+      setAccounts((current) => current.map((item) => item.id === account.id
+        ? { ...item, status: needsAuth ? 'needs-auth' as const : 'offline' as const, lastSync: needsAuth ? '等待重新授权' : '首次同步失败，可重试' }
+        : item))
+      pushToast(needsAuth ? `${account.label} 需要重新授权` : `${account.label} 首次同步失败，可稍后重试`, needsAuth ? 'error' : 'info')
+    }
+  }
+
   const retryPendingOutbox = async () => {
     if (!isNativeRuntime || !accounts.length) return
     if (offlineMode) {
@@ -1638,7 +1677,6 @@ function App() {
         return next
       })
     }
-    let accountStored = false
     try {
       await invoke('accounts.add', {
         id,
@@ -1659,38 +1697,7 @@ function App() {
           authentication: customAuthentication,
         } : {}),
       })
-      accountStored = true
-      if (offlineMode) {
-        setAccounts((current) => current.map((account) => account.id === id ? { ...account, unread: 0, status: 'offline', lastSync: '仅离线模式' } : account))
-      } else {
-        const result = await invoke<NativeSyncItem>('sync.account', { accountId: id }, 60_000)
-        if (result.folders?.length) setNativeFolders((current) => ({ ...current, [id]: result.folders! }))
-        setAccounts((current) => current.map((account) => account.id === id ? { ...account, unread: result.unread ?? 0, status: 'synced', lastSync: '刚刚同步' } : account))
-        if (isNativeRuntime) {
-          const mailbox = await invoke<NativeMailboxResponse>('mail.list', { accountId: id })
-          const converted = (mailbox.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, newAccount))
-          if (mailbox.mailbox) {
-            setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(id, mailbox.mailbox!.folder)]: { oldestUid: mailbox.mailbox!.oldestUid, hasMore: mailbox.mailbox!.hasMore } }))
-          }
-          setMails((current) => [...current.filter((mail) => mail.accountId !== id), ...converted])
-          if (converted.length) setSelectedMailId(converted[0].id)
-        }
-      }
-      await refreshPendingOperations([...accounts.filter((account) => account.id !== id), newAccount])
     } catch (error) {
-      if (accountStored) {
-        const message = error instanceof Error ? error.message : ''
-        const needsAuth = /auth|credential|login|password|authorization/i.test(message)
-        setAccounts((current) => current.map((account) => account.id === id
-          ? { ...newAccount, status: needsAuth ? 'needs-auth' : 'offline', lastSync: needsAuth ? '等待重新授权' : '首次同步失败，可重试' }
-          : account))
-        setAccountEmail('')
-        setEditingAccountId(null)
-        closeAccountModal()
-        setSelectedAccountId(id)
-        pushToast(needsAuth ? '账户已保存，但需要重新授权' : '账户已保存，首次同步失败；可稍后点击账户重试', needsAuth ? 'error' : 'info')
-        return
-      }
       setAccounts((current) => existingAccount
         ? current.map((account) => account.id === existingAccount.id ? existingAccount : account)
         : current.filter((account) => account.id !== id))
@@ -1704,7 +1711,16 @@ function App() {
     setEditingAccountId(null)
     closeAccountModal()
     setSelectedAccountId(id)
-    pushToast(`${selectedProvider.label}账户${existingAccount ? '已重新授权' : '已加入'}，正在同步邮件`, 'success')
+    const nextAccounts = existingAccount
+      ? accounts.map((account) => account.id === id ? newAccount : account)
+      : [...accounts, newAccount]
+    if (offlineMode) {
+      setAccounts((current) => current.map((account) => account.id === id ? { ...account, unread: 0, status: 'offline', lastSync: '仅离线模式' } : account))
+      pushToast(`${selectedProvider.label}账户${existingAccount ? '已重新授权' : '已加入'}，当前为离线模式`, 'success')
+      return
+    }
+    pushToast(`${selectedProvider.label}账户${existingAccount ? '已重新授权' : '已加入'}，后台同步中`, 'success')
+    void syncAccountInBackground(newAccount, nextAccounts)
   }
 
   const handleRemoveAccount = async () => {
@@ -1976,7 +1992,7 @@ function App() {
                   <ProviderMark provider={account.provider} size="sm" />
                   <span className="account-copy"><strong>{account.label}</strong><small>{account.email}</small></span>
                   {account.unread > 0 && <span className="account-count">{account.unread}</span>}
-                  <span className={`sync-dot sync-${account.status}`} aria-label={account.status === 'synced' ? '已同步' : account.status === 'offline' ? '离线' : '需要授权'} />
+                  <span className={`sync-dot sync-${account.status}`} aria-label={account.status === 'synced' ? '已同步' : account.status === 'syncing' ? '同步中' : account.status === 'offline' ? '离线' : '需要授权'} />
                 </button>
               ))}
             </div>
