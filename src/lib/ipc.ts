@@ -17,6 +17,14 @@ declare global {
 
 const pending = new Map<string, { resolve: (value: unknown) => void; reject: (reason: Error) => void }>()
 
+function readNativeCapability() {
+  if (typeof window === 'undefined' || !window.location.hash.startsWith('#ipc=')) return undefined
+  const value = new URLSearchParams(window.location.hash.slice(1)).get('ipc')?.trim()
+  return value && value.length <= 128 ? value : undefined
+}
+
+const nativeCapability = readNativeCapability()
+
 if (typeof window !== 'undefined') {
   window.__RDESKTOP_IPC__ = (response) => {
     const request = pending.get(response.id)
@@ -37,7 +45,8 @@ export async function invoke<T>(cmd: string, payload: Record<string, unknown> = 
   if (window.ipc?.postMessage) {
     return new Promise<T>((resolve, reject) => {
       pending.set(id, { resolve: resolve as (value: unknown) => void, reject })
-      window.ipc?.postMessage(JSON.stringify({ id, cmd, payload }))
+      const nativePayload = nativeCapability ? { ...payload, __mailgoCapability: nativeCapability } : payload
+      window.ipc?.postMessage(JSON.stringify({ id, cmd, payload: nativePayload }))
       window.setTimeout(() => {
         if (!pending.has(id)) return
         pending.delete(id)

@@ -58,6 +58,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 49. Non-Windows builds now protect mailbox and attachment caches with a random XChaCha20-Poly1305 key stored in the platform keyring; the Windows DPAPI path remains unchanged.
 50. OAuth device, authorization-code, and refresh requests now retain bounded numeric `Retry-After` guidance for HTTP 429 responses without exposing response bodies or credentials.
 51. Incremental and UID fallback syncs retain the previous delta cursor while bounded header windows are incomplete, fetch unseen UIDs oldest-first, and only advance the cursor after every requested header parses successfully.
+52. Packaged native RPC now requires a per-launch capability carried by the trusted app URL, while the renderer also ships a restrictive CSP that blocks executable HTML, frames, plugins, and unapproved network destinations.
 
 ## Remaining production acceptance work
 

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use rand::{distributions::Alphanumeric, Rng};
 use rdesktop_core::config::{AppConfig, RendererConfig, WindowConfig};
 use rdesktop_core::ipc::{FnIpcHandler, IpcMessage, IpcResponse};
 use rdesktop_core::renderer::Renderer;
@@ -49,6 +50,8 @@ const MAX_SUBJECT_BYTES: usize = 998;
 const MAX_MESSAGE_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SEARCH_QUERY_BYTES: usize = 256;
 const MAX_SEARCH_RESULTS: usize = 240;
+const IPC_CAPABILITY_FIELD: &str = "__mailgoCapability";
+const IPC_CAPABILITY_LENGTH: usize = 48;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -705,8 +708,33 @@ fn response(message: &IpcMessage, success: bool, data: Value) -> IpcResponse {
     }
 }
 
-fn handle_ipc(shared: &Arc<Mutex<MailGoState>>, message: IpcMessage) -> IpcResponse {
+fn generate_ipc_capability() -> String {
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(IPC_CAPABILITY_LENGTH)
+        .map(char::from)
+        .collect()
+}
+
+fn validate_ipc_capability(message: &IpcMessage, expected: &str) -> Result<()> {
+    let received = message
+        .payload
+        .get(IPC_CAPABILITY_FIELD)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if received != expected {
+        return Err(anyhow!("native IPC caller is not trusted"));
+    }
+    Ok(())
+}
+
+fn handle_ipc(
+    shared: &Arc<Mutex<MailGoState>>,
+    message: IpcMessage,
+    ipc_capability: &str,
+) -> IpcResponse {
     let result = (|| -> Result<Value> {
+        validate_ipc_capability(&message, ipc_capability)?;
         match message.cmd.as_str() {
             "app.get_state" => Ok(shared
                 .lock()
@@ -2172,6 +2200,25 @@ mod tests {
     }
 
     #[test]
+    fn ipc_capability_validation_rejects_forged_or_missing_callers() {
+        let message = IpcMessage {
+            id: "capability-test".into(),
+            cmd: "app.get_state".into(),
+            payload: json!({ IPC_CAPABILITY_FIELD: "expected" }),
+        };
+        assert!(validate_ipc_capability(&message, "forged").is_err());
+        assert!(validate_ipc_capability(&message, "expected").is_ok());
+        assert!(validate_ipc_capability(
+            &IpcMessage {
+                payload: json!({}),
+                ..message
+            },
+            "expected"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn state_decoder_drops_unsafe_or_duplicate_accounts() {
         let state = decode_persisted_state(
             r##"{
@@ -2201,8 +2248,11 @@ fn main() -> Result<()> {
     };
     let shared_state = Arc::new(Mutex::new(MailGoState::load()?));
     let state_for_handler = shared_state.clone();
-    let handler =
-        FnIpcHandler::new(move |message: IpcMessage| handle_ipc(&state_for_handler, message));
+    let ipc_capability = generate_ipc_capability();
+    let handler_capability = ipc_capability.clone();
+    let handler = FnIpcHandler::new(move |message: IpcMessage| {
+        handle_ipc(&state_for_handler, message, &handler_capability)
+    });
 
     let config = AppConfig {
         identifier: "com.neko233.mailgo".to_string(),
@@ -2231,7 +2281,8 @@ fn main() -> Result<()> {
     renderer.init()?;
     renderer.set_ipc_handler(Box::new(handler));
     let window = renderer.create_window(&config.window)?;
-    renderer.load_url(window, "rdesktop://localhost/index.html")?;
+    let app_url = format!("rdesktop://localhost/index.html#ipc={ipc_capability}");
+    renderer.load_url(window, &app_url)?;
     let minimize_to_tray = shared_state
         .lock()
         .map_err(|_| anyhow!("state lock poisoned"))?
