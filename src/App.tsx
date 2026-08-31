@@ -986,16 +986,17 @@ function App() {
     else pushToast(selected.length ? `已${starred ? '添加' : '移除'} ${selected.length} 封邮件的星标` : `所选邮件已经${starred ? '全部加星' : '全部取消星标'}`, 'success')
   }
 
-  const moveMail = async (mail: MailMessage, operation: 'archive' | 'delete' | 'spam') => {
+  const moveMail = async (mail: MailMessage, operation: 'archive' | 'delete' | 'spam' | 'inbox') => {
     if (mail.id === 'empty-mail') return false
     const account = accounts.find((item) => item.id === mail.accountId)
     if (operation === 'archive' && mail.folder === 'archive') return false
     if (operation === 'spam' && mail.folder === 'spam') return false
+    if (operation === 'inbox' && mail.folder === 'inbox') return false
     const isPermanentDelete = operation === 'delete' && mail.folder === 'trash'
-    const targetFolder = isPermanentDelete || !account ? undefined : nativeFolderName(account, operation === 'archive' ? 'archive' : operation === 'spam' ? 'spam' : 'trash')
+    const targetFolder = isPermanentDelete || !account ? undefined : nativeFolderName(account, operation === 'archive' ? 'archive' : operation === 'spam' ? 'spam' : operation === 'inbox' ? 'inbox' : 'trash')
     let queued = false
     if (isNativeRuntime && account && mail.nativeUid != null) {
-      const command = operation === 'spam' ? 'mail.spam' : 'mail.' + operation
+      const command = operation === 'spam' ? 'mail.spam' : operation === 'inbox' ? 'mail.inbox' : 'mail.' + operation
       const result = await invoke<{ queued?: boolean }>(command, {
         accountId: mail.accountId,
         folder: mail.nativeFolder ?? 'INBOX',
@@ -1012,7 +1013,7 @@ function App() {
         setSelectedMailId(next?.id ?? '')
       }
     } else {
-      const nextFolder = operation === 'archive' ? 'archive' : operation === 'spam' ? 'spam' : 'trash'
+      const nextFolder = operation === 'archive' ? 'archive' : operation === 'spam' ? 'spam' : operation === 'inbox' ? 'inbox' : 'trash'
       mapMailSources((item) => item.id === mail.id
         ? { ...item, folder: nextFolder, nativeFolder: targetFolder ?? item.nativeFolder }
         : item)
@@ -1025,16 +1026,16 @@ function App() {
     return queued
   }
 
-  const runMove = async (mail: MailMessage, operation: 'archive' | 'delete' | 'spam') => {
+  const runMove = async (mail: MailMessage, operation: 'archive' | 'delete' | 'spam' | 'inbox') => {
     try {
       const queued = await moveMail(mail, operation)
-      pushToast(queued ? '操作已保存，联网后会自动同步' : operation === 'archive' ? '邮件已归档' : operation === 'spam' ? '邮件已移入垃圾邮件' : '邮件已移入回收站', 'success')
+      pushToast(queued ? '操作已保存，联网后会自动同步' : operation === 'archive' ? '邮件已归档' : operation === 'spam' ? '邮件已移入垃圾邮件' : operation === 'inbox' ? '邮件已移回收件箱' : '邮件已移入回收站', 'success')
     } catch (error) {
       pushToast(error instanceof Error ? error.message : '邮件操作失败，请稍后重试', 'error')
     }
   }
 
-  const applyBulkMove = async (operation: 'archive' | 'delete' | 'spam') => {
+  const applyBulkMove = async (operation: 'archive' | 'delete' | 'spam' | 'inbox') => {
     if (!selectedVisibleMails.length) {
       pushToast('请先选择邮件', 'info')
       return
@@ -1051,7 +1052,7 @@ function App() {
     const count = selectedVisibleMails.length - failed
     setSelectedMailIds([])
     if (failed) pushToast(`${count} 封邮件已处理，${failed} 封处理失败`, 'error')
-    else pushToast(`${operation === 'archive' ? `已归档 ${count} 封邮件` : operation === 'spam' ? `已将 ${count} 封邮件移入垃圾邮件` : `已将 ${count} 封邮件移入回收站`}${queued ? `，${queued} 封将在联网后同步` : ''}`, 'success')
+    else pushToast(`${operation === 'archive' ? `已归档 ${count} 封邮件` : operation === 'spam' ? `已将 ${count} 封邮件移入垃圾邮件` : operation === 'inbox' ? `已将 ${count} 封邮件移回收件箱` : `已将 ${count} 封邮件移入回收站`}${queued ? `，${queued} 封将在联网后同步` : ''}`, 'success')
   }
 
   const markSelectedRead = () => { void setSelectedReadState(false) }
@@ -1830,6 +1831,7 @@ function App() {
                 <button type="button" role="menuitem" disabled={!selectedVisibleMails.length} onClick={() => { void setSelectedStarred(true) }}><Icon name="star" size={16} />批量加星</button>
                 <button type="button" role="menuitem" disabled={!selectedVisibleMails.length} onClick={() => { void setSelectedStarred(false) }}><Icon name="star" size={16} />批量取消星标</button>
                 <button type="button" role="menuitem" disabled={!selectedVisibleMails.length} onClick={() => { void applyBulkMove('spam') }}><Icon name="shield" size={16} />移入垃圾邮件</button>
+                <button type="button" role="menuitem" disabled={!selectedVisibleMails.length} onClick={() => { void applyBulkMove('inbox') }}><Icon name="inbox" size={16} />移回收件箱</button>
                 <button type="button" role="menuitem" disabled={!selectedVisibleMails.length} onClick={() => { setSelectedMailIds([]); setOpenMenu(null) }}><Icon name="close" size={16} />取消选择</button>
               </div>}
             </div>
@@ -1862,6 +1864,7 @@ function App() {
               <TooltipButton label="更多邮件操作" active={openMenu === 'message'} ariaExpanded={openMenu === 'message'} onClick={() => setOpenMenu((current) => current === 'message' ? null : 'message')}><Icon name="more" size={19} /></TooltipButton>
               {openMenu === 'message' && <div className="action-menu" role="menu" aria-label="更多邮件操作">
                 <button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail'} onClick={() => { void markSelectedMessageUnread() }}><Icon name="message" size={16} />标为未读</button>
+                {selectedMail.folder !== 'inbox' && <button type="button" role="menuitem" onClick={() => { setOpenMenu(null); void runMove(selectedMail, 'inbox') }}><Icon name="inbox" size={16} />移回收件箱</button>}
                 <button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail'} onClick={() => { void copySelectedMessage() }}><Icon name="copy" size={16} />复制邮件正文</button>
                 <button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail'} onClick={() => { setOpenMenu(null); window.print() }}><Icon name="document" size={16} />打印邮件</button>
               </div>}

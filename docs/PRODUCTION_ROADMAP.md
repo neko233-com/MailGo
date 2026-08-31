@@ -86,6 +86,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 77. The native scheduler performs one delayed startup sync before entering its five-minute background cadence, so a resumed desktop refreshes stale cached headers promptly while offline-only mode still prevents all network work.
 78. User CSS is bounded, persisted only after sanitization, and cannot load `@import`, `url()`, script protocols, legacy behavior properties, CSS comments, or escape-obfuscated equivalents; theme variables, layout rules, gradients, media queries, and animations remain supported.
 79. Mail actions now expose a provider-mapped “move to spam” command for single messages and batches; it reuses the UID-based native move path, encrypted offline mutation queue, UIDVALIDITY checks, and immediate local cache updates for Gmail, QQ, Outlook, and custom accounts.
+80. Messages can also be restored to `INBOX` from archive, spam, trash, or custom folders through a dedicated native-validated command, with the same offline replay and immediate cache semantics.
 
 ## Remaining production acceptance work
 

@@ -2043,7 +2043,7 @@ fn handle_ipc(
                     "dataBase64": STANDARD.encode(attachment.bytes),
                 }))
             }
-            "mail.move" | "mail.archive" | "mail.delete" | "mail.spam" => {
+            "mail.move" | "mail.archive" | "mail.delete" | "mail.spam" | "mail.inbox" => {
                 let account_id = string_field(&message.payload, "accountId")?;
                 let uid = u32_field(&message.payload, "uid")?;
                 let folder = optional_string_field(&message.payload, "folder")
@@ -2055,6 +2055,7 @@ fn handle_ipc(
                     "mail.archive" => "archive",
                     "mail.delete" => "delete",
                     "mail.spam" => "move",
+                    "mail.inbox" => "move",
                     _ => unreachable!("matched mail mutation command"),
                 };
                 if matches!(operation, "move" | "archive") && target_folder.is_none() {
@@ -2068,6 +2069,13 @@ fn handle_ipc(
                     {
                         return Err(anyhow!("spam destination must be the provider spam folder"));
                     }
+                }
+                if message.cmd == "mail.inbox"
+                    && !target_folder
+                        .as_deref()
+                        .is_some_and(|target| target.eq_ignore_ascii_case("INBOX"))
+                {
+                    return Err(anyhow!("inbox destination must be INBOX"));
                 }
                 if operation == "delete" {
                     let profile = profile_for_account(&account)?;
