@@ -3618,6 +3618,7 @@ fn main() -> Result<()> {
         .state
         .minimize_to_tray;
     cache_db::spawn_search_indexer(cache_dir());
+    cache_db::spawn_encryption_migrator(cache_dir());
     sync::spawn_scheduler(shared_state.clone(), cache_dir());
     tray::start(minimize_to_tray);
     tracing::info!("MailGo desktop window ready; background synchronization scheduled");

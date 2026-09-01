@@ -57,14 +57,14 @@ const BODY_SESSION_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
 const CACHE_FILE: &str = "inbox.bin";
 const MUTATION_FILE: &str = "mutations.bin";
 const MOVE_MUTATION_FILE: &str = "moves.bin";
-#[cfg(not(target_os = "windows"))]
-const NON_WINDOWS_CACHE_MAGIC: &[u8] = b"MAILGO-CACHE-1\0";
-#[cfg(not(target_os = "windows"))]
-const NON_WINDOWS_CACHE_KEY_SERVICE: &str = "com.neko233.mailgo.cache";
-#[cfg(not(target_os = "windows"))]
-const NON_WINDOWS_CACHE_KEY_ACCOUNT: &str = "cache-encryption-key";
+const CACHE_ENVELOPE_MAGIC: &[u8] = b"MAILGO-CACHE-1\0";
+const CACHE_ENCRYPTION_KEY_SERVICE: &str = "com.neko233.mailgo.cache";
+const CACHE_ENCRYPTION_KEY_ACCOUNT: &str = "cache-encryption-key";
+const CACHE_ENCRYPTION_KEY_BYTES: usize = 32;
 
 static CACHE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static CACHE_ENCRYPTION_KEY: OnceLock<Mutex<Option<[u8; CACHE_ENCRYPTION_KEY_BYTES]>>> =
+    OnceLock::new();
 type BodySessionSlot = Arc<Mutex<Option<PooledBodySession>>>;
 type BodySessionRegistry = HashMap<String, BodySessionSlot>;
 
@@ -3197,73 +3197,60 @@ fn save_mailbox_unlocked(
     crate::cache_db::save_mailbox(cache_root, account_id, &bounded_mailbox)
 }
 
-#[cfg(target_os = "windows")]
-pub(crate) fn protect_cache(payload: &[u8]) -> Result<Vec<u8>> {
-    use std::mem::zeroed;
-    use std::slice::from_raw_parts;
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
-
-    let input = CRYPT_INTEGER_BLOB {
-        cbData: u32::try_from(payload.len()).context("mail cache is too large")?,
-        pbData: payload.as_ptr() as *mut u8,
-    };
-    let mut output: CRYPT_INTEGER_BLOB = unsafe { zeroed() };
-    let success = unsafe {
-        CryptProtectData(
-            &input,
-            std::ptr::null(),
-            std::ptr::null(),
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-            &mut output,
-        )
-    };
-    if success == 0 || output.pbData.is_null() {
-        return Err(anyhow!(
-            "Windows data protection rejected the mailbox cache"
-        ));
-    }
-    let result = unsafe { from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
-    unsafe { LocalFree(output.pbData as *mut std::ffi::c_void) };
-    Ok(result)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn non_windows_cache_key() -> Result<[u8; 32]> {
+fn cache_encryption_key() -> Result<[u8; CACHE_ENCRYPTION_KEY_BYTES]> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use zeroize::Zeroize;
 
-    let entry = keyring::Entry::new(NON_WINDOWS_CACHE_KEY_SERVICE, NON_WINDOWS_CACHE_KEY_ACCOUNT)
+    let cache = CACHE_ENCRYPTION_KEY.get_or_init(|| Mutex::new(None));
+    let mut cached = cache
+        .lock()
+        .map_err(|_| anyhow!("protected cache key lock poisoned"))?;
+    if let Some(key) = *cached {
+        return Ok(key);
+    }
+
+    let entry = keyring::Entry::new(CACHE_ENCRYPTION_KEY_SERVICE, CACHE_ENCRYPTION_KEY_ACCOUNT)
         .map_err(|error| anyhow!("protected cache keyring unavailable: {error}"))?;
-    match entry.get_password() {
-        Ok(encoded) => {
-            let decoded = STANDARD
-                .decode(encoded)
-                .map_err(|_| anyhow!("protected cache keyring contains an invalid key"))?;
-            decoded
+    let key = match entry.get_password() {
+        Ok(mut encoded) => {
+            let decoded = STANDARD.decode(&encoded);
+            encoded.zeroize();
+            let mut decoded =
+                decoded.map_err(|_| anyhow!("protected cache keyring contains an invalid key"))?;
+            let key = decoded
+                .as_slice()
                 .try_into()
-                .map_err(|_| anyhow!("protected cache keyring contains an invalid key length"))
+                .map_err(|_| anyhow!("protected cache keyring contains an invalid key length"))?;
+            decoded.zeroize();
+            key
         }
         Err(keyring::Error::NoEntry) => {
-            let mut key = [0_u8; 32];
+            let mut key = [0_u8; CACHE_ENCRYPTION_KEY_BYTES];
             let mut rng = rand::thread_rng();
             rand::RngCore::fill_bytes(&mut rng, &mut key);
-            entry
-                .set_password(&STANDARD.encode(key))
-                .map_err(|error| anyhow!("save protected cache key: {error}"))?;
-            Ok(key)
+            let mut encoded = STANDARD.encode(key);
+            let result = entry
+                .set_password(&encoded)
+                .map_err(|error| anyhow!("save protected cache key: {error}"));
+            encoded.zeroize();
+            result?;
+            key
         }
-        Err(error) => Err(anyhow!("load protected cache key: {error}")),
-    }
+        Err(error) => return Err(anyhow!("load protected cache key: {error}")),
+    };
+    *cached = Some(key);
+    Ok(key)
 }
 
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn protect_cache(payload: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn database_cache_uses_current_envelope(payload: &[u8]) -> bool {
+    payload.starts_with(CACHE_ENVELOPE_MAGIC)
+}
+
+fn protect_cache_envelope(payload: &[u8]) -> Result<Vec<u8>> {
     use chacha20poly1305::aead::{Aead, KeyInit};
     use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 
-    let key = non_windows_cache_key()?;
+    let key = cache_encryption_key()?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
     let mut nonce = [0_u8; 24];
     let mut rng = rand::thread_rng();
@@ -3272,12 +3259,12 @@ pub(crate) fn protect_cache(payload: &[u8]) -> Result<Vec<u8>> {
         .encrypt(XNonce::from_slice(&nonce), payload)
         .map_err(|_| anyhow!("encrypt local cache"))?;
     let mut output = Vec::with_capacity(
-        NON_WINDOWS_CACHE_MAGIC
+        CACHE_ENVELOPE_MAGIC
             .len()
             .saturating_add(nonce.len())
             .saturating_add(ciphertext.len()),
     );
-    output.extend_from_slice(NON_WINDOWS_CACHE_MAGIC);
+    output.extend_from_slice(CACHE_ENVELOPE_MAGIC);
     output.extend_from_slice(&nonce);
     output.extend_from_slice(&ciphertext);
     Ok(output)
@@ -3316,28 +3303,82 @@ pub(crate) fn unprotect_cache(payload: &[u8]) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn unprotect_cache(payload: &[u8]) -> Result<Vec<u8>> {
+#[cfg(target_os = "windows")]
+pub(crate) fn protect_cache(payload: &[u8]) -> Result<Vec<u8>> {
+    use std::mem::zeroed;
+    use std::slice::from_raw_parts;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
+
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: u32::try_from(payload.len()).context("mail cache is too large")?,
+        pbData: payload.as_ptr() as *mut u8,
+    };
+    let mut output: CRYPT_INTEGER_BLOB = unsafe { zeroed() };
+    let success = unsafe {
+        CryptProtectData(
+            &input,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            &mut output,
+        )
+    };
+    if success == 0 || output.pbData.is_null() {
+        return Err(anyhow!(
+            "Windows data protection rejected the mailbox cache"
+        ));
+    }
+    let result = unsafe { from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    unsafe { LocalFree(output.pbData as *mut std::ffi::c_void) };
+    Ok(result)
+}
+
+fn unprotect_cache_envelope(payload: &[u8]) -> Result<Vec<u8>> {
     use chacha20poly1305::aead::{Aead, KeyInit};
     use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 
-    let minimum = NON_WINDOWS_CACHE_MAGIC
+    let minimum = CACHE_ENVELOPE_MAGIC
         .len()
         .saturating_add(24)
         .saturating_add(16);
-    if payload.len() < minimum || !payload.starts_with(NON_WINDOWS_CACHE_MAGIC) {
+    if payload.len() < minimum || !database_cache_uses_current_envelope(payload) {
         return Err(anyhow!("protected cache envelope is invalid"));
     }
-    let key = non_windows_cache_key()?;
+    let key = cache_encryption_key()?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
     cipher
         .decrypt(
             XNonce::from_slice(
-                &payload[NON_WINDOWS_CACHE_MAGIC.len()..NON_WINDOWS_CACHE_MAGIC.len() + 24],
+                &payload[CACHE_ENVELOPE_MAGIC.len()..CACHE_ENVELOPE_MAGIC.len() + 24],
             ),
-            &payload[NON_WINDOWS_CACHE_MAGIC.len() + 24..],
+            &payload[CACHE_ENVELOPE_MAGIC.len() + 24..],
         )
         .map_err(|_| anyhow!("protected cache could not be unlocked"))
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn protect_cache(payload: &[u8]) -> Result<Vec<u8>> {
+    protect_cache_envelope(payload)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn unprotect_cache(payload: &[u8]) -> Result<Vec<u8>> {
+    unprotect_cache_envelope(payload)
+}
+
+pub(crate) fn protect_database_cache(payload: &[u8]) -> Result<Vec<u8>> {
+    protect_cache_envelope(payload)
+}
+
+pub(crate) fn unprotect_database_cache(payload: &[u8]) -> Result<Vec<u8>> {
+    if database_cache_uses_current_envelope(payload) {
+        unprotect_cache_envelope(payload)
+    } else {
+        unprotect_cache(payload)
+    }
 }
 
 fn safe_component(value: &str) -> String {
@@ -3639,6 +3680,34 @@ mod tests {
         )
         .expect("write IMAP fixture SELECT response");
         stream.flush().expect("flush IMAP fixture SELECT response");
+    }
+
+    #[test]
+    fn cache_envelope_is_randomized_authenticated_and_round_trips() {
+        let plaintext = b"mailgo protected cache fixture";
+        let first = protect_database_cache(plaintext).unwrap();
+        let second = protect_database_cache(plaintext).unwrap();
+        assert!(database_cache_uses_current_envelope(&first));
+        assert!(database_cache_uses_current_envelope(&second));
+        assert_ne!(first, second);
+        assert!(!first
+            .windows(plaintext.len())
+            .any(|window| window == plaintext));
+        assert_eq!(unprotect_database_cache(&first).unwrap(), plaintext);
+
+        let last = first.len() - 1;
+        let mut tampered = first;
+        tampered[last] ^= 1;
+        assert!(unprotect_database_cache(&tampered).is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn current_reader_accepts_legacy_windows_dpapi_payloads() {
+        let plaintext = b"legacy Windows cache fixture";
+        let encrypted = protect_cache(plaintext).unwrap();
+        assert!(!database_cache_uses_current_envelope(&encrypted));
+        assert_eq!(unprotect_database_cache(&encrypted).unwrap(), plaintext);
     }
 
     #[test]

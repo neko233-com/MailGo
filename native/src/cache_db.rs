@@ -38,6 +38,9 @@ const MAX_SYNC_SUMMARIES: usize = 10_000;
 const MAX_ENCRYPTED_ROW_BYTES: usize = 8 * 1024 * 1024;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const LIST_INDEX_BATCH_SIZE: usize = 48;
+const ENCRYPTION_MIGRATION_BATCH_SIZE: usize = 32;
+const ENCRYPTION_MIGRATION_BATCH_BYTES: usize = 16 * 1024 * 1024;
+const CURRENT_DATABASE_ENCRYPTION_VERSION: i64 = 1;
 
 static INITIALIZED_DATABASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 static DATABASE_ACCESS: OnceLock<RwLock<()>> = OnceLock::new();
@@ -47,6 +50,7 @@ static SEARCH_INDEX_RUNNING: AtomicBool = AtomicBool::new(false);
 static SEARCH_INDEX_REQUESTED: AtomicBool = AtomicBool::new(false);
 static LIST_INDEX_RUNNING: AtomicBool = AtomicBool::new(false);
 static LIST_INDEX_REQUESTED: AtomicBool = AtomicBool::new(false);
+static ENCRYPTION_MIGRATION_RUNNING: AtomicBool = AtomicBool::new(false);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -63,6 +67,14 @@ struct ListIndexerRun;
 impl Drop for ListIndexerRun {
     fn drop(&mut self) {
         LIST_INDEX_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+struct EncryptionMigrationRun;
+
+impl Drop for EncryptionMigrationRun {
+    fn drop(&mut self) {
+        ENCRYPTION_MIGRATION_RUNNING.store(false, Ordering::Release);
     }
 }
 
@@ -726,6 +738,7 @@ fn initialize(connection: &mut Connection) -> Result<()> {
             account_key BLOB NOT NULL,
             folder_key BLOB NOT NULL,
             payload BLOB NOT NULL,
+            encryption_version INTEGER NOT NULL DEFAULT 0,
             revision INTEGER NOT NULL DEFAULT 1,
             message_count INTEGER NOT NULL DEFAULT 0,
             list_count INTEGER NOT NULL DEFAULT 0,
@@ -738,6 +751,7 @@ fn initialize(connection: &mut Connection) -> Result<()> {
             uid INTEGER NOT NULL CHECK (uid > 0 AND uid <= 4294967295),
             payload_hash BLOB NOT NULL,
             payload BLOB NOT NULL,
+            encryption_version INTEGER NOT NULL DEFAULT 0,
             search_version INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL,
             PRIMARY KEY (account_key, folder_key, uid),
@@ -768,6 +782,12 @@ fn initialize(connection: &mut Connection) -> Result<()> {
             [],
         )?;
     }
+    if !message_columns.contains("encryption_version") {
+        connection.execute(
+            "ALTER TABLE messages ADD COLUMN encryption_version INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     let had_message_list: bool = connection.query_row(
         "SELECT EXISTS(
            SELECT 1 FROM sqlite_master
@@ -782,11 +802,27 @@ fn initialize(connection: &mut Connection) -> Result<()> {
             folder_key BLOB NOT NULL,
             uid INTEGER NOT NULL CHECK (uid > 0 AND uid <= 4294967295),
             payload BLOB NOT NULL,
+            encryption_version INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (account_key, folder_key, uid),
             FOREIGN KEY (account_key, folder_key, uid)
                 REFERENCES messages(account_key, folder_key, uid) ON DELETE CASCADE
         ) WITHOUT ROWID;",
     )?;
+    let message_list_columns = {
+        let mut statement = connection.prepare("PRAGMA table_info(message_list)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        let mut found = HashSet::new();
+        for column in columns {
+            found.insert(column?.to_ascii_lowercase());
+        }
+        found
+    };
+    if !message_list_columns.contains("encryption_version") {
+        connection.execute(
+            "ALTER TABLE message_list ADD COLUMN encryption_version INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     let metadata_columns = {
         let mut statement = connection.prepare("PRAGMA table_info(mailbox_meta)")?;
         let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -805,6 +841,12 @@ fn initialize(connection: &mut Connection) -> Result<()> {
     if !metadata_columns.contains("list_count") {
         connection.execute(
             "ALTER TABLE mailbox_meta ADD COLUMN list_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !metadata_columns.contains("encryption_version") {
+        connection.execute(
+            "ALTER TABLE mailbox_meta ADD COLUMN encryption_version INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }
@@ -844,6 +886,84 @@ fn initialize(connection: &mut Connection) -> Result<()> {
             index_version INTEGER NOT NULL
         );",
     )?;
+    connection.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS mailbox_meta_encryption_insert
+           AFTER INSERT ON mailbox_meta
+           WHEN NEW.encryption_version !=
+             CASE WHEN substr(NEW.payload, 1, 15) = X'4D41494C474F2D43414348452D3100'
+                  THEN 1 ELSE 0 END
+           BEGIN
+             UPDATE mailbox_meta SET encryption_version =
+               CASE WHEN substr(NEW.payload, 1, 15) = X'4D41494C474F2D43414348452D3100'
+                    THEN 1 ELSE 0 END
+             WHERE account_key = NEW.account_key AND folder_key = NEW.folder_key;
+           END;
+         CREATE TRIGGER IF NOT EXISTS mailbox_meta_encryption_update
+           AFTER UPDATE OF payload ON mailbox_meta
+           WHEN NEW.encryption_version !=
+             CASE WHEN substr(NEW.payload, 1, 15) = X'4D41494C474F2D43414348452D3100'
+                  THEN 1 ELSE 0 END
+           BEGIN
+             UPDATE mailbox_meta SET encryption_version =
+               CASE WHEN substr(NEW.payload, 1, 15) = X'4D41494C474F2D43414348452D3100'
+                    THEN 1 ELSE 0 END
+             WHERE account_key = NEW.account_key AND folder_key = NEW.folder_key;
+           END;
+         CREATE TRIGGER IF NOT EXISTS messages_encryption_insert
+           AFTER INSERT ON messages
+           WHEN NEW.encryption_version !=
+             CASE WHEN substr(NEW.payload, 1, 15) = X'4D41494C474F2D43414348452D3100'
+                  THEN 1 ELSE 0 END
+           BEGIN
+             UPDATE messages SET encryption_version =
+               CASE WHEN substr(NEW.payload, 1, 15) = X'4D41494C474F2D43414348452D3100'
+                    THEN 1 ELSE 0 END
+             WHERE account_key = NEW.account_key AND folder_key = NEW.folder_key
+               AND uid = NEW.uid;
+           END;
+         CREATE TRIGGER IF NOT EXISTS messages_encryption_update
+           AFTER UPDATE OF payload ON messages
+           WHEN NEW.encryption_version !=
+             CASE WHEN substr(NEW.payload, 1, 15) = X'4D41494C474F2D43414348452D3100'
+                  THEN 1 ELSE 0 END
+           BEGIN
+             UPDATE messages SET encryption_version =
+               CASE WHEN substr(NEW.payload, 1, 15) = X'4D41494C474F2D43414348452D3100'
+                    THEN 1 ELSE 0 END
+             WHERE account_key = NEW.account_key AND folder_key = NEW.folder_key
+               AND uid = NEW.uid;
+           END;
+         CREATE TRIGGER IF NOT EXISTS message_list_encryption_insert
+           AFTER INSERT ON message_list
+           WHEN NEW.encryption_version !=
+             CASE WHEN substr(NEW.payload, 1, 15) = X'4D41494C474F2D43414348452D3100'
+                  THEN 1 ELSE 0 END
+           BEGIN
+             UPDATE message_list SET encryption_version =
+               CASE WHEN substr(NEW.payload, 1, 15) = X'4D41494C474F2D43414348452D3100'
+                    THEN 1 ELSE 0 END
+             WHERE account_key = NEW.account_key AND folder_key = NEW.folder_key
+               AND uid = NEW.uid;
+           END;
+         CREATE TRIGGER IF NOT EXISTS message_list_encryption_update
+           AFTER UPDATE OF payload ON message_list
+           WHEN NEW.encryption_version !=
+             CASE WHEN substr(NEW.payload, 1, 15) = X'4D41494C474F2D43414348452D3100'
+                  THEN 1 ELSE 0 END
+           BEGIN
+             UPDATE message_list SET encryption_version =
+               CASE WHEN substr(NEW.payload, 1, 15) = X'4D41494C474F2D43414348452D3100'
+                    THEN 1 ELSE 0 END
+             WHERE account_key = NEW.account_key AND folder_key = NEW.folder_key
+               AND uid = NEW.uid;
+           END;
+         CREATE INDEX IF NOT EXISTS mailbox_meta_encryption_migration
+           ON mailbox_meta(encryption_version, account_key, folder_key);
+         CREATE INDEX IF NOT EXISTS messages_encryption_migration
+           ON messages(encryption_version, account_key, folder_key, uid);
+         CREATE INDEX IF NOT EXISTS message_list_encryption_migration
+           ON message_list(encryption_version, account_key, folder_key, uid);",
+    )?;
     connection.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
     Ok(())
 }
@@ -854,7 +974,7 @@ fn encrypt_json<T: Serialize>(value: &T) -> Result<(Vec<u8>, [u8; 32])> {
         return Err(anyhow!("indexed mail cache row is too large"));
     }
     let digest = Sha256::digest(&serialized).into();
-    let encrypted = crate::sync::protect_cache(&serialized)?;
+    let encrypted = crate::sync::protect_database_cache(&serialized)?;
     if encrypted.len() > MAX_ENCRYPTED_ROW_BYTES {
         return Err(anyhow!("encrypted indexed mail cache row is too large"));
     }
@@ -865,7 +985,7 @@ fn decrypt_json<T: for<'de> Deserialize<'de>>(encrypted: &[u8], kind: &str) -> R
     if encrypted.len() > MAX_ENCRYPTED_ROW_BYTES {
         return Err(anyhow!("encrypted indexed mail cache {kind} is too large"));
     }
-    let serialized = crate::sync::unprotect_cache(encrypted)
+    let serialized = crate::sync::unprotect_database_cache(encrypted)
         .with_context(|| format!("decrypt indexed mail cache {kind}"))?;
     serde_json::from_slice(&serialized).with_context(|| format!("parse indexed mail cache {kind}"))
 }
@@ -1335,6 +1455,256 @@ fn spawn_list_indexer(cache_root: PathBuf) {
         if LIST_INDEX_REQUESTED.swap(false, Ordering::AcqRel) {
             spawn_list_indexer(retry_root);
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EncryptedPayloadTable {
+    MessageList,
+    MailboxMetadata,
+    Messages,
+}
+
+impl EncryptedPayloadTable {
+    fn name(self) -> &'static str {
+        match self {
+            Self::MessageList => "message_list",
+            Self::MailboxMetadata => "mailbox_meta",
+            Self::Messages => "messages",
+        }
+    }
+
+    fn has_uid(self) -> bool {
+        !matches!(self, Self::MailboxMetadata)
+    }
+}
+
+#[derive(Clone)]
+struct EncryptionMigrationCursor {
+    account_key: Vec<u8>,
+    folder_key: Vec<u8>,
+    uid: i64,
+}
+
+struct EncryptedPayloadRow {
+    cursor: EncryptionMigrationCursor,
+    payload: Vec<u8>,
+}
+
+struct EncryptedPayloadUpdate {
+    row: EncryptedPayloadRow,
+    encrypted: Vec<u8>,
+}
+
+fn read_encrypted_payload_batch(
+    cache_root: &Path,
+    table: EncryptedPayloadTable,
+    cursor: Option<&EncryptionMigrationCursor>,
+) -> Result<Vec<EncryptedPayloadRow>> {
+    with_recovery(cache_root, |connection| {
+        let (uid_expression, ordering) = if table.has_uid() {
+            ("uid", "account_key, folder_key, uid")
+        } else {
+            ("0", "account_key, folder_key")
+        };
+        let sql = format!(
+            "SELECT account_key, folder_key, {uid_expression}, payload
+             FROM {}
+             WHERE encryption_version = 0
+               AND (?1 IS NULL
+                    OR (account_key, folder_key, {uid_expression}) > (?2, ?3, ?4))
+             ORDER BY {ordering}
+             LIMIT ?5",
+            table.name()
+        );
+        let present = cursor.map(|_| 1_i64);
+        let account_key = cursor.map_or(&[][..], |value| value.account_key.as_slice());
+        let folder_key = cursor.map_or(&[][..], |value| value.folder_key.as_slice());
+        let uid = cursor.map_or(0_i64, |value| value.uid);
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            params![
+                present,
+                account_key,
+                folder_key,
+                uid,
+                ENCRYPTION_MIGRATION_BATCH_SIZE as i64
+            ],
+            |row| {
+                Ok(EncryptedPayloadRow {
+                    cursor: EncryptionMigrationCursor {
+                        account_key: row.get(0)?,
+                        folder_key: row.get(1)?,
+                        uid: row.get(2)?,
+                    },
+                    payload: row.get(3)?,
+                })
+            },
+        )?;
+        let mut values = Vec::with_capacity(ENCRYPTION_MIGRATION_BATCH_SIZE);
+        let mut payload_bytes = 0usize;
+        for row in rows {
+            let row = row?;
+            payload_bytes = payload_bytes.saturating_add(row.payload.len());
+            values.push(row);
+            if payload_bytes >= ENCRYPTION_MIGRATION_BATCH_BYTES {
+                break;
+            }
+        }
+        Ok(values)
+    })
+}
+
+fn migrate_encrypted_payload_rows(
+    cache_root: &Path,
+    table: EncryptedPayloadTable,
+    rows: Vec<EncryptedPayloadRow>,
+) -> Result<(usize, usize)> {
+    let mut skipped = 0usize;
+    let mut updates = Vec::new();
+    for row in rows {
+        if crate::sync::database_cache_uses_current_envelope(&row.payload) {
+            updates.push(EncryptedPayloadUpdate {
+                encrypted: row.payload.clone(),
+                row,
+            });
+            continue;
+        }
+        if row.payload.len() > MAX_ENCRYPTED_ROW_BYTES {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
+        let encrypted = crate::sync::unprotect_database_cache(&row.payload)
+            .and_then(|plaintext| crate::sync::protect_database_cache(&plaintext));
+        match encrypted {
+            Ok(encrypted) => updates.push(EncryptedPayloadUpdate { row, encrypted }),
+            Err(error) => {
+                skipped = skipped.saturating_add(1);
+                tracing::warn!(
+                    table = table.name(),
+                    error = %error,
+                    "skipped one unreadable legacy cache row during encryption migration"
+                );
+            }
+        }
+    }
+    if updates.is_empty() {
+        return Ok((0, skipped));
+    }
+
+    let migrated = with_recovery(cache_root, |connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut changed = 0usize;
+        if table.has_uid() {
+            let sql = format!(
+                "UPDATE {} SET payload = ?4, encryption_version = ?6
+                 WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3
+                   AND payload = ?5 AND encryption_version = 0",
+                table.name()
+            );
+            let mut update = transaction.prepare(&sql)?;
+            for value in &updates {
+                changed = changed.saturating_add(update.execute(params![
+                    value.row.cursor.account_key,
+                    value.row.cursor.folder_key,
+                    value.row.cursor.uid,
+                    value.encrypted,
+                    value.row.payload,
+                    CURRENT_DATABASE_ENCRYPTION_VERSION
+                ])?);
+            }
+        } else {
+            let sql = format!(
+                "UPDATE {} SET payload = ?3, encryption_version = ?5
+                 WHERE account_key = ?1 AND folder_key = ?2
+                   AND payload = ?4 AND encryption_version = 0",
+                table.name()
+            );
+            let mut update = transaction.prepare(&sql)?;
+            for value in &updates {
+                changed = changed.saturating_add(update.execute(params![
+                    value.row.cursor.account_key,
+                    value.row.cursor.folder_key,
+                    value.encrypted,
+                    value.row.payload,
+                    CURRENT_DATABASE_ENCRYPTION_VERSION
+                ])?);
+            }
+        }
+        transaction.commit()?;
+        Ok(changed)
+    })?;
+    Ok((migrated, skipped))
+}
+
+fn migrate_encrypted_payload_table(
+    cache_root: &Path,
+    table: EncryptedPayloadTable,
+) -> Result<(usize, usize)> {
+    let mut cursor = None;
+    let mut migrated = 0usize;
+    let mut skipped = 0usize;
+    loop {
+        let rows = read_encrypted_payload_batch(cache_root, table, cursor.as_ref())?;
+        let Some(next_cursor) = rows.last().map(|row| row.cursor.clone()) else {
+            break;
+        };
+        let (batch_migrated, batch_skipped) =
+            migrate_encrypted_payload_rows(cache_root, table, rows)?;
+        migrated = migrated.saturating_add(batch_migrated);
+        skipped = skipped.saturating_add(batch_skipped);
+        cursor = Some(next_cursor);
+        thread::sleep(Duration::from_millis(8));
+    }
+    Ok((migrated, skipped))
+}
+
+/// Re-encrypt legacy Windows DPAPI-per-row payloads through the current AEAD envelope. The worker
+/// waits for the local-first renderer to hydrate, scans each table in primary-key order with a
+/// bounded memory budget, and conditionally updates exact ciphertext so concurrent sync writes win.
+pub fn spawn_encryption_migrator(cache_root: PathBuf) {
+    if ENCRYPTION_MIGRATION_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let spawn = thread::Builder::new()
+        .name("mailgo-cache-encryption-migration".to_string())
+        .spawn(move || {
+            let _run = EncryptionMigrationRun;
+            thread::sleep(Duration::from_secs(1));
+            let mut migrated = 0usize;
+            let mut skipped = 0usize;
+            for table in [
+                EncryptedPayloadTable::MessageList,
+                EncryptedPayloadTable::MailboxMetadata,
+                EncryptedPayloadTable::Messages,
+            ] {
+                match migrate_encrypted_payload_table(&cache_root, table) {
+                    Ok((table_migrated, table_skipped)) => {
+                        migrated = migrated.saturating_add(table_migrated);
+                        skipped = skipped.saturating_add(table_skipped);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            table = table.name(),
+                            error = %error,
+                            "background cache encryption migration paused"
+                        );
+                        return;
+                    }
+                }
+            }
+            tracing::info!(
+                migrated_rows = migrated,
+                skipped_rows = skipped,
+                "background cache encryption migration completed"
+            );
+        });
+    if let Err(error) = spawn {
+        ENCRYPTION_MIGRATION_RUNNING.store(false, Ordering::Release);
+        tracing::warn!(error = %error, "could not start cache encryption migration worker");
     }
 }
 
@@ -2767,6 +3137,143 @@ mod tests {
             .query_map([], |row| row.get::<_, Vec<u8>>(0))
             .unwrap();
         rows.map(Result::unwrap).collect()
+    }
+
+    #[test]
+    fn encryption_migration_queries_use_small_version_indexes() {
+        let root = temporary_root("encryption-plan");
+        let connection = open(&root).unwrap();
+        for (table, ordering, expected_index) in [
+            (
+                "mailbox_meta",
+                "account_key, folder_key",
+                "mailbox_meta_encryption_migration",
+            ),
+            (
+                "message_list",
+                "account_key, folder_key, uid",
+                "message_list_encryption_migration",
+            ),
+            (
+                "messages",
+                "account_key, folder_key, uid",
+                "messages_encryption_migration",
+            ),
+        ] {
+            let detail: String = connection
+                .query_row(
+                    &format!(
+                        "EXPLAIN QUERY PLAN SELECT payload FROM {table}
+                         WHERE encryption_version = 0 ORDER BY {ordering} LIMIT 32"
+                    ),
+                    [],
+                    |row| row.get(3),
+                )
+                .unwrap();
+            assert!(detail.contains(expected_index), "unexpected plan: {detail}");
+        }
+        drop(connection);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn background_encryption_migration_rewrites_legacy_rows_without_changing_mail() {
+        fn stored_payloads(root: &Path) -> Vec<Vec<u8>> {
+            let connection = open(root).unwrap();
+            let mut statement = connection
+                .prepare(
+                    "SELECT payload FROM mailbox_meta
+                     UNION ALL SELECT payload FROM message_list
+                     UNION ALL SELECT payload FROM messages",
+                )
+                .unwrap();
+            let rows = statement
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .unwrap();
+            rows.map(Result::unwrap).collect()
+        }
+
+        fn current_version_count(root: &Path) -> i64 {
+            let connection = open(root).unwrap();
+            connection
+                .query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM mailbox_meta WHERE encryption_version = 1) +
+                       (SELECT COUNT(*) FROM message_list WHERE encryption_version = 1) +
+                       (SELECT COUNT(*) FROM messages WHERE encryption_version = 1)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        }
+
+        let root = temporary_root("encryption-migration");
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = vec![fixture_message(1), fixture_message(2)];
+        mailbox.oldest_uid = Some(1);
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        assert_eq!(current_version_count(&root), 5);
+
+        {
+            let connection = open(&root).unwrap();
+            for table in ["mailbox_meta", "message_list", "messages"] {
+                let rows = {
+                    let mut statement = connection
+                        .prepare(&format!("SELECT payload FROM {table}"))
+                        .unwrap();
+                    let values = statement
+                        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                        .unwrap();
+                    values.map(Result::unwrap).collect::<Vec<_>>()
+                };
+                for payload in rows {
+                    let plaintext = crate::sync::unprotect_database_cache(&payload).unwrap();
+                    let legacy = crate::sync::protect_cache(&plaintext).unwrap();
+                    connection
+                        .execute(
+                            &format!("UPDATE {table} SET payload = ?1 WHERE payload = ?2"),
+                            params![legacy, payload],
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        let legacy_payloads = stored_payloads(&root);
+        assert_eq!(legacy_payloads.len(), 5);
+        assert!(legacy_payloads
+            .iter()
+            .all(|payload| !crate::sync::database_cache_uses_current_envelope(payload)));
+        assert_eq!(current_version_count(&root), 0);
+
+        let mut migrated = 0usize;
+        for table in [
+            EncryptedPayloadTable::MessageList,
+            EncryptedPayloadTable::MailboxMetadata,
+            EncryptedPayloadTable::Messages,
+        ] {
+            let (table_migrated, skipped) = migrate_encrypted_payload_table(&root, table).unwrap();
+            assert_eq!(skipped, 0);
+            migrated += table_migrated;
+        }
+        assert_eq!(migrated, 5);
+        assert!(stored_payloads(&root)
+            .iter()
+            .all(|payload| crate::sync::database_cache_uses_current_envelope(payload)));
+        assert_eq!(current_version_count(&root), 5);
+
+        let page = load_mailbox_page(&root, "fixture-account", "INBOX", None, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.mailbox.messages.len(), 2);
+        assert_eq!(
+            load_message(&root, "fixture-account", "INBOX", 1)
+                .unwrap()
+                .unwrap()
+                .subject,
+            "subject 1"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
