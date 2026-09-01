@@ -119,6 +119,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 110. MIME parsing now enables `mail-parser`'s complete legacy-charset feature set, with executable GB2312 sender/subject coverage and a cache-schema migration that reparses stale derived headers only on a successful remote sync.
 111. Native IMAP Modified UTF-7 decoding now supplies per-account Unicode display labels while preserving every original wire mailbox name for protocol commands; malformed or control-bearing segments fail closed to their original bounded representation.
 112. The packaged Windows Release has passed local tray acceptance for hide-without-exit, same-process single-instance restore, and completion of an in-flight synchronization while no MailGo window is visible; its release subsystem remains GUI-only with no companion console window.
+113. IMAP IDLE now provides per-account real-time Inbox change wakeups without holding the synchronization lease while waiting; listeners use a 30-second lifecycle boundary, preserve the 60-second socket ceiling through IDLE teardown, apply capped reconnect backoff, pause for offline/reauthorization state, emit privacy-safe logs, and retain the existing five-minute scheduler as a non-IDLE fallback.
 
 ## Remaining production acceptance work
 

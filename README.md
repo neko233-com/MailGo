@@ -51,6 +51,7 @@ The current foundation includes:
 - Windows tray lifecycle is implemented with the generated `resources/icons/mailgo.ico`: close-to-tray, restore on click, deliberate quit, and a five-minute background sync scheduler.
 - The packaged Windows Release uses the GUI subsystem and does not open a companion console window. Close-to-tray, same-process single-instance restore, and completion of an in-flight sync while hidden have been accepted on the local Windows build.
 - The background scheduler performs a short delayed first sync after launch, then continues on its five-minute cadence; offline-only mode skips both paths.
+- Accounts whose servers advertise IMAP IDLE also keep a dedicated bounded listener for immediate Inbox change wakeups. Listeners re-check offline/account lifecycle state every 30 seconds, retain the native 60-second socket ceiling even when the upstream IDLE handle resets its timeout, reconnect with capped exponential backoff, and hand actual synchronization to the same per-account lease; the five-minute scheduler remains the compatibility fallback.
 - The tray icon re-registers itself after Windows Explorer/taskbar restarts, so a hidden MailGo window remains recoverable without restarting the app.
 - Custom IMAP/SMTP onboarding accepts host, port, TLS mode, and password/app-password/OAuth2 settings without putting credentials in metadata.
 

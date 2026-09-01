@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,6 +13,7 @@ use base64::{
     engine::general_purpose::{GeneralPurpose, NO_PAD},
     Engine as _,
 };
+use imap::extensions::idle::{self, SetReadTimeout, WaitOutcome};
 use imap::types::{Flag, UnsolicitedResponse};
 use native_tls::{TlsConnector, TlsStream};
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,13 @@ const IMAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const IMAP_IO_TIMEOUT: Duration = Duration::from_secs(60);
 const INITIAL_SYNC_DELAY: Duration = Duration::from_secs(3);
 const BACKGROUND_SYNC_INTERVAL: Duration = Duration::from_secs(300);
+const IDLE_STATE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const IDLE_PAUSED_RECHECK: Duration = Duration::from_secs(5);
+const IDLE_UNSUPPORTED_RECHECK: Duration = Duration::from_secs(30 * 60);
+const IDLE_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(5);
+const IDLE_RETRY_BASE_SECONDS: u64 = 15;
+const IDLE_RETRY_MAX_SECONDS: u64 = 300;
+const IDLE_SYNC_BUSY_RETRIES: usize = 12;
 const CACHE_FILE: &str = "inbox.bin";
 const MUTATION_FILE: &str = "mutations.bin";
 const MOVE_MUTATION_FILE: &str = "moves.bin";
@@ -138,12 +146,46 @@ enum IncrementalMode {
     Qresync,
 }
 
+struct BoundedImapStream<T> {
+    inner: T,
+}
+
+impl<T> BoundedImapStream<T> {
+    fn new(inner: T) -> Self {
+        Self { inner }
+    }
+}
+
+impl<T: Read> Read for BoundedImapStream<T> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buffer)
+    }
+}
+
+impl<T: Write> Write for BoundedImapStream<T> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<T: SetReadTimeout> SetReadTimeout for BoundedImapStream<T> {
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> imap::error::Result<()> {
+        self.inner
+            .set_read_timeout(timeout.or(Some(IMAP_IO_TIMEOUT)))
+    }
+}
+
 fn connect(profile: &ProviderProfile) -> Result<imap::Client<imap::Connection>> {
     let tcp = connect_socket(&profile.imap.host, profile.imap.port)?;
     match profile.imap.security {
         TransportSecurity::Tls => {
             let tls = tls_connect(&profile.imap.host, tcp)?;
-            let mut client = imap::Client::new(Box::new(tls) as imap::Connection);
+            let mut client =
+                imap::Client::new(Box::new(BoundedImapStream::new(tls)) as imap::Connection);
             client
                 .read_greeting()
                 .with_context(|| format!("read IMAP greeting from {}", profile.imap.host))?;
@@ -163,7 +205,9 @@ fn connect(profile: &ProviderProfile) -> Result<imap::Client<imap::Connection>> 
             let tls = tls_connect(&profile.imap.host, tcp)?;
             // The IMAP greeting was already consumed before STARTTLS. LOGIN/AUTHENTICATE is the
             // next legal command after the TLS negotiation, so do not wait for a second greeting.
-            Ok(imap::Client::new(Box::new(tls) as imap::Connection))
+            Ok(imap::Client::new(
+                Box::new(BoundedImapStream::new(tls)) as imap::Connection
+            ))
         }
     }
 }
@@ -373,9 +417,392 @@ fn parse_status_highest_mod_seq(response: &[u8], expected_folder: &str) -> Optio
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleLoopExit {
+    MailboxChanged,
+    Unsupported,
+    Paused,
+    Removed,
+}
+
+enum IdleAccountState {
+    Ready(Box<crate::PersistedAccount>),
+    Paused,
+    Removed,
+}
+
+fn idle_watch_enabled(offline_mode: bool, status: &str) -> bool {
+    !offline_mode && !matches!(status, "needs-auth" | "syncing")
+}
+
+fn idle_account_state(
+    shared: &Arc<Mutex<crate::MailGoState>>,
+    account_id: &str,
+) -> Result<IdleAccountState> {
+    let app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+    let Some(account) = app
+        .state
+        .accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .cloned()
+    else {
+        return Ok(IdleAccountState::Removed);
+    };
+    if idle_watch_enabled(app.state.offline_mode, &account.status) {
+        Ok(IdleAccountState::Ready(Box::new(account)))
+    } else {
+        Ok(IdleAccountState::Paused)
+    }
+}
+
+fn idle_retry_delay(attempt: u32) -> Duration {
+    let multiplier = 1_u64 << attempt.min(5);
+    Duration::from_secs(
+        IDLE_RETRY_BASE_SECONDS
+            .saturating_mul(multiplier)
+            .min(IDLE_RETRY_MAX_SECONDS),
+    )
+}
+
+fn prepare_idle_session<T: Read + Write>(session: &mut imap::Session<T>) -> Result<bool> {
+    let capabilities = session
+        .capabilities()
+        .context("read IMAP capabilities before IDLE")?;
+    if !capabilities.has_str("IDLE") {
+        return Ok(false);
+    }
+    session
+        .select("INBOX")
+        .context("select INBOX before IMAP IDLE")?;
+    Ok(true)
+}
+
+fn wait_for_idle_signal<T>(session: &mut imap::Session<T>, timeout: Duration) -> Result<WaitOutcome>
+where
+    T: Read + Write + SetReadTimeout,
+{
+    let mut handle = session.idle();
+    handle.timeout(timeout).keepalive(false);
+    handle
+        .wait_while(idle::stop_on_any)
+        .context("wait for IMAP IDLE update")
+}
+
+fn wait_for_account_idle_event(
+    shared: &Arc<Mutex<crate::MailGoState>>,
+    account_id: &str,
+    profile: &ProviderProfile,
+    email: &str,
+    credential: &str,
+) -> Result<IdleLoopExit> {
+    let mut session = authenticate(profile, email, credential)?;
+    if !prepare_idle_session(&mut session)? {
+        session.logout().ok();
+        return Ok(IdleLoopExit::Unsupported);
+    }
+    tracing::info!(account_id = %account_id, provider = profile.provider.as_str(), "IMAP IDLE listener ready");
+
+    loop {
+        if wait_for_idle_signal(&mut session, IDLE_STATE_CHECK_INTERVAL)?
+            == WaitOutcome::MailboxChanged
+        {
+            session.logout().ok();
+            return Ok(IdleLoopExit::MailboxChanged);
+        }
+        match idle_account_state(shared, account_id)? {
+            IdleAccountState::Ready(_) => {}
+            IdleAccountState::Paused => {
+                session.logout().ok();
+                return Ok(IdleLoopExit::Paused);
+            }
+            IdleAccountState::Removed => {
+                session.logout().ok();
+                return Ok(IdleLoopExit::Removed);
+            }
+        }
+    }
+}
+
+fn run_background_sync(
+    shared: &Arc<Mutex<crate::MailGoState>>,
+    cache_root: &Path,
+    account: &crate::PersistedAccount,
+    trigger: &'static str,
+) -> bool {
+    match shared.lock() {
+        Ok(app) if app.state.offline_mode => {
+            tracing::debug!(account_id = %account.id, trigger, "background sync skipped because offline-only mode is enabled");
+            return true;
+        }
+        Err(_) => {
+            tracing::warn!(account_id = %account.id, trigger, "background sync state lock poisoned");
+            return true;
+        }
+        Ok(_) => {}
+    }
+    let _sync_lease = match crate::try_begin_account_sync(shared, &account.id) {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::debug!(
+                account_id = %account.id,
+                trigger,
+                "background sync skipped because another operation owns the account: {error}"
+            );
+            return false;
+        }
+    };
+    let profile = match crate::profile_for_account(account) {
+        Ok(profile) => profile,
+        Err(error) => {
+            tracing::warn!(account_id = %account.id, trigger, "background provider profile is invalid: {error}");
+            return true;
+        }
+    };
+    let credential = match crate::load_credential(account) {
+        Ok(credential) => credential,
+        Err(error) => {
+            crate::record_account_sync_failure(shared, &account.id, needs_reauthorization(&error));
+            tracing::warn!(
+                account_id = %account.id,
+                trigger,
+                needs_auth = needs_reauthorization(&error),
+                "background credential load failed"
+            );
+            return true;
+        }
+    };
+    if crate::outbox::flush_due(
+        cache_root,
+        &account.id,
+        profile.clone(),
+        &account.email,
+        &credential,
+    )
+    .is_err()
+    {
+        tracing::warn!(account_id = %account.id, trigger, "background outbox flush failed");
+    }
+    let provider = profile.provider;
+    match sync_account(
+        &account.id,
+        profile,
+        &account.email,
+        &credential,
+        cache_root,
+    ) {
+        Ok(result) => {
+            let notification = if let Ok(mut app) = shared.lock() {
+                let previous_unread = app
+                    .state
+                    .accounts
+                    .iter()
+                    .find(|stored| stored.id == account.id)
+                    .map(|stored| stored.unread as usize)
+                    .unwrap_or(account.unread as usize);
+                let notification = (app.state.notifications_enabled
+                    && result.unread > previous_unread)
+                    .then(|| {
+                        (
+                            account.label.clone(),
+                            result.unread.saturating_sub(previous_unread),
+                        )
+                    });
+                crate::record_account_sync_success(&mut app, &result);
+                if let Some(stored) = app
+                    .state
+                    .accounts
+                    .iter_mut()
+                    .find(|stored| stored.id == account.id)
+                {
+                    stored.last_sync = "后台刚刚同步".into();
+                }
+                if let Err(error) = app.save() {
+                    tracing::warn!(account_id = %account.id, trigger, "background sync state save failed: {error}");
+                }
+                notification
+            } else {
+                tracing::warn!(account_id = %account.id, trigger, "background sync state lock poisoned");
+                None
+            };
+            if let Some((label, count)) = notification {
+                crate::tray::notify_new_mail("MailGo", &format!("{label} 有 {count} 封未读邮件"));
+            }
+            tracing::info!(account_id = %account.id, provider = provider.as_str(), trigger, unread = result.unread, "background sync completed");
+        }
+        Err(error) => {
+            crate::record_account_sync_failure(shared, &account.id, needs_reauthorization(&error));
+            tracing::warn!(
+                account_id = %account.id,
+                trigger,
+                category = error_category(&error, provider),
+                detail = error_detail(&error),
+                "background sync failed"
+            );
+        }
+    }
+    true
+}
+
+fn run_idle_triggered_sync(
+    shared: &Arc<Mutex<crate::MailGoState>>,
+    cache_root: &Path,
+    account_id: &str,
+) {
+    for retry in 0..=IDLE_SYNC_BUSY_RETRIES {
+        let account = match idle_account_state(shared, account_id) {
+            Ok(IdleAccountState::Ready(account)) => account,
+            Ok(IdleAccountState::Paused | IdleAccountState::Removed) | Err(_) => return,
+        };
+        if run_background_sync(shared, cache_root, &account, "idle") {
+            return;
+        }
+        if retry < IDLE_SYNC_BUSY_RETRIES {
+            thread::sleep(IDLE_PAUSED_RECHECK);
+        }
+    }
+    tracing::debug!(account_id = %account_id, "IMAP IDLE update was covered by a longer in-flight sync");
+}
+
+fn run_idle_worker(
+    shared: Arc<Mutex<crate::MailGoState>>,
+    cache_root: PathBuf,
+    account_id: String,
+) {
+    let mut retry_attempt = 0u32;
+    loop {
+        let account = match idle_account_state(&shared, &account_id) {
+            Ok(IdleAccountState::Ready(account)) => account,
+            Ok(IdleAccountState::Paused) => {
+                thread::sleep(IDLE_PAUSED_RECHECK);
+                continue;
+            }
+            Ok(IdleAccountState::Removed) => return,
+            Err(error) => {
+                tracing::warn!(account_id = %account_id, "IMAP IDLE worker stopped: {error}");
+                return;
+            }
+        };
+        let profile = match crate::profile_for_account(&account) {
+            Ok(profile) => profile,
+            Err(error) => {
+                tracing::warn!(account_id = %account_id, "IMAP IDLE profile is invalid: {error}");
+                thread::sleep(IDLE_UNSUPPORTED_RECHECK);
+                continue;
+            }
+        };
+        let credential = match crate::load_credential(&account) {
+            Ok(credential) => credential,
+            Err(error) => {
+                crate::record_account_sync_failure(
+                    &shared,
+                    &account_id,
+                    needs_reauthorization(&error),
+                );
+                tracing::warn!(account_id = %account_id, needs_auth = needs_reauthorization(&error), "IMAP IDLE credential load failed");
+                thread::sleep(IDLE_PAUSED_RECHECK);
+                continue;
+            }
+        };
+        let provider = profile.provider;
+        match wait_for_account_idle_event(
+            &shared,
+            &account_id,
+            &profile,
+            &account.email,
+            &credential,
+        ) {
+            Ok(IdleLoopExit::MailboxChanged) => {
+                retry_attempt = 0;
+                tracing::info!(account_id = %account_id, provider = provider.as_str(), "IMAP IDLE mailbox change received");
+                run_idle_triggered_sync(&shared, &cache_root, &account_id);
+            }
+            Ok(IdleLoopExit::Unsupported) => {
+                retry_attempt = 0;
+                tracing::info!(account_id = %account_id, provider = provider.as_str(), "IMAP IDLE unavailable; periodic sync remains active");
+                thread::sleep(IDLE_UNSUPPORTED_RECHECK);
+            }
+            Ok(IdleLoopExit::Paused) => {
+                retry_attempt = 0;
+                thread::sleep(IDLE_PAUSED_RECHECK);
+            }
+            Ok(IdleLoopExit::Removed) => return,
+            Err(error) => {
+                let delay = idle_retry_delay(retry_attempt);
+                retry_attempt = retry_attempt.saturating_add(1);
+                tracing::warn!(
+                    account_id = %account_id,
+                    provider = provider.as_str(),
+                    category = error_category(&error, provider),
+                    detail = error_detail(&error),
+                    retry_after = delay.as_secs(),
+                    "IMAP IDLE listener interrupted; reconnecting"
+                );
+                thread::sleep(delay);
+            }
+        }
+    }
+}
+
+fn spawn_idle_supervisor(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathBuf) {
+    let result = thread::Builder::new()
+        .name("mailgo-idle-supervisor".into())
+        .spawn(move || {
+            let (finished_sender, finished_receiver) = mpsc::channel::<String>();
+            let mut active_workers = HashSet::new();
+            loop {
+                while let Ok(account_id) = finished_receiver.try_recv() {
+                    active_workers.remove(&account_id);
+                }
+                let account_ids = match shared.lock() {
+                    Ok(app) => app
+                        .state
+                        .accounts
+                        .iter()
+                        .map(|account| account.id.clone())
+                        .collect::<Vec<_>>(),
+                    Err(_) => {
+                        tracing::warn!("IMAP IDLE supervisor state lock poisoned");
+                        thread::sleep(IDLE_SUPERVISOR_INTERVAL);
+                        continue;
+                    }
+                };
+                for account_id in account_ids {
+                    if !active_workers.insert(account_id.clone()) {
+                        continue;
+                    }
+                    let worker_shared = Arc::clone(&shared);
+                    let worker_cache_root = cache_root.clone();
+                    let worker_sender = finished_sender.clone();
+                    let worker_id = account_id.clone();
+                    let thread_suffix = account_id
+                        .chars()
+                        .filter(char::is_ascii_alphanumeric)
+                        .take(12)
+                        .collect::<String>();
+                    if let Err(error) = thread::Builder::new()
+                        .name(format!("mailgo-idle-{thread_suffix}"))
+                        .spawn(move || {
+                            run_idle_worker(worker_shared, worker_cache_root, worker_id.clone());
+                            let _ = worker_sender.send(worker_id);
+                        })
+                    {
+                        active_workers.remove(&account_id);
+                        tracing::warn!(account_id = %account_id, "could not start IMAP IDLE worker: {error}");
+                    }
+                }
+                thread::sleep(IDLE_SUPERVISOR_INTERVAL);
+            }
+        });
+    if let Err(error) = result {
+        tracing::warn!("could not start IMAP IDLE supervisor: {error}");
+    }
+}
+
 /// Keep the local cache fresh while the window is hidden. The scheduler intentionally runs on a
 /// dedicated thread so IMAP handshakes never block rdesktop's WebView event loop.
 pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathBuf) {
+    spawn_idle_supervisor(Arc::clone(&shared), cache_root.clone());
     thread::Builder::new()
         .name("mailgo-sync-scheduler".into())
         .spawn(move || {
@@ -387,12 +814,8 @@ pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathB
                     BACKGROUND_SYNC_INTERVAL
                 });
                 first_run = false;
-                let (accounts, notifications_enabled, offline_mode) = match shared.lock() {
-                    Ok(app) => (
-                        app.state.accounts.clone(),
-                        app.state.notifications_enabled,
-                        app.state.offline_mode,
-                    ),
+                let (accounts, offline_mode) = match shared.lock() {
+                    Ok(app) => (app.state.accounts.clone(), app.state.offline_mode),
                     Err(_) => {
                         tracing::warn!("background sync state lock poisoned");
                         continue;
@@ -403,96 +826,7 @@ pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathB
                     continue;
                 }
                 for account in accounts {
-                    let _sync_lease = match crate::try_begin_account_sync(&shared, &account.id) {
-                        Ok(lease) => lease,
-                        Err(error) => {
-                            tracing::debug!(
-                                account_id = %account.id,
-                                "background sync skipped because another operation owns the account: {error}"
-                            );
-                            continue;
-                        }
-                    };
-                    let profile = match crate::profile_for_account(&account) {
-                        Ok(profile) => profile,
-                        Err(_) => continue,
-                    };
-                    let credential = match crate::load_credential(&account) {
-                        Ok(credential) => credential,
-                        Err(error) => {
-                            crate::record_account_sync_failure(
-                                &shared,
-                                &account.id,
-                                needs_reauthorization(&error),
-                            );
-                            tracing::warn!(
-                                account_id = %account.id,
-                                needs_auth = needs_reauthorization(&error),
-                                "background credential load failed"
-                            );
-                            continue;
-                        }
-                    };
-                    if crate::outbox::flush_due(
-                        &cache_root,
-                        &account.id,
-                        profile.clone(),
-                        &account.email,
-                        &credential,
-                    )
-                    .is_err()
-                    {
-                        tracing::warn!(account_id = %account.id, "background outbox flush failed");
-                    }
-                    let provider = profile.provider;
-                    match sync_account(
-                        &account.id,
-                        profile,
-                        &account.email,
-                        &credential,
-                        &cache_root,
-                    ) {
-                        Ok(result) => {
-                            if notifications_enabled && result.unread > account.unread as usize {
-                                crate::tray::notify_new_mail(
-                                    "MailGo",
-                                    &format!(
-                                        "{} 有 {} 封未读邮件",
-                                        account.label,
-                                        result.unread - account.unread as usize
-                                    ),
-                                );
-                            }
-                            if let Ok(mut app) = shared.lock() {
-                                if let Some(stored) = app
-                                    .state
-                                    .accounts
-                                    .iter_mut()
-                                    .find(|item| item.id == account.id)
-                                {
-                                    stored.unread = result.unread as u32;
-                                    stored.status = "synced".into();
-                                    stored.last_sync = "后台刚刚同步".into();
-                                }
-                                if let Err(error) = app.save() {
-                                    tracing::warn!("background sync state save failed: {error}");
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            crate::record_account_sync_failure(
-                                &shared,
-                                &account.id,
-                                needs_reauthorization(&error),
-                            );
-                            tracing::warn!(
-                                account_id = %account.id,
-                                category = error_category(&error, provider),
-                                detail = error_detail(&error),
-                                "background sync failed"
-                            );
-                        }
-                    }
+                    run_background_sync(&shared, &cache_root, &account, "periodic");
                 }
             }
         })
@@ -2989,6 +3323,18 @@ mod tests {
     }
 
     #[test]
+    fn bounded_imap_stream_never_allows_idle_to_clear_the_io_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind timeout fixture");
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).expect("connect fixture");
+        let mut bounded = BoundedImapStream::new(stream);
+        SetReadTimeout::set_read_timeout(&mut bounded, None).expect("retain timeout");
+        assert_eq!(bounded.inner.read_timeout().unwrap(), Some(IMAP_IO_TIMEOUT));
+        let shorter = Duration::from_secs(2);
+        SetReadTimeout::set_read_timeout(&mut bounded, Some(shorter)).expect("set shorter timeout");
+        assert_eq!(bounded.inner.read_timeout().unwrap(), Some(shorter));
+    }
+
+    #[test]
     fn provider_spam_folder_mapping_is_case_insensitive_and_provider_specific() {
         assert!(is_spam_folder(
             crate::providers::ProviderKind::Google,
@@ -3025,6 +3371,104 @@ mod tests {
             .expect("set fixture read timeout");
         start_tls(&mut tcp).expect("STARTTLS fixture should be accepted");
         server.join().expect("join STARTTLS fixture");
+    }
+
+    #[test]
+    fn idle_fixture_wakes_on_an_exists_response() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind IDLE fixture");
+        let address = listener.local_addr().expect("IDLE fixture address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept IDLE fixture");
+            stream
+                .write_all(b"* OK fixture ready\r\n")
+                .expect("write IMAP greeting");
+            stream.flush().expect("flush IMAP greeting");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone IDLE fixture"));
+
+            let mut command = String::new();
+            reader.read_line(&mut command).expect("read LOGIN command");
+            let login_tag = command.split_ascii_whitespace().next().unwrap();
+            write!(stream, "{login_tag} OK LOGIN completed\r\n").expect("write LOGIN response");
+            stream.flush().expect("flush LOGIN response");
+
+            command.clear();
+            reader
+                .read_line(&mut command)
+                .expect("read CAPABILITY command");
+            let capability_tag = command.split_ascii_whitespace().next().unwrap();
+            write!(
+                stream,
+                "* CAPABILITY IMAP4rev1 IDLE\r\n{capability_tag} OK CAPABILITY completed\r\n"
+            )
+            .expect("write CAPABILITY response");
+            stream.flush().expect("flush CAPABILITY response");
+
+            command.clear();
+            reader.read_line(&mut command).expect("read SELECT command");
+            let select_tag = command.split_ascii_whitespace().next().unwrap();
+            write!(
+                stream,
+                "* FLAGS (\\Seen)\r\n* 0 EXISTS\r\n{select_tag} OK [READ-WRITE] SELECT completed\r\n"
+            )
+            .expect("write SELECT response");
+            stream.flush().expect("flush SELECT response");
+
+            command.clear();
+            reader.read_line(&mut command).expect("read IDLE command");
+            assert!(command.to_ascii_uppercase().contains(" IDLE"));
+            let idle_tag = command.split_ascii_whitespace().next().unwrap().to_string();
+            stream
+                .write_all(b"+ idling\r\n* 1 EXISTS\r\n")
+                .expect("write IDLE update");
+            stream.flush().expect("flush IDLE update");
+
+            command.clear();
+            reader.read_line(&mut command).expect("read IDLE DONE");
+            assert_eq!(command, "DONE\r\n");
+            write!(stream, "{idle_tag} OK IDLE terminated\r\n").expect("write IDLE completion");
+            stream.flush().expect("flush IDLE completion");
+        });
+
+        let stream = TcpStream::connect(address).expect("connect IDLE fixture");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set IDLE fixture read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set IDLE fixture write timeout");
+        let mut client = imap::Client::new(stream);
+        client.read_greeting().expect("read IDLE fixture greeting");
+        let mut session = client
+            .login("fixture@example.invalid", "fixture-password")
+            .map_err(|(error, _)| error)
+            .expect("login to IDLE fixture");
+        assert!(prepare_idle_session(&mut session).expect("prepare IDLE fixture"));
+        assert_eq!(
+            wait_for_idle_signal(&mut session, Duration::from_secs(2))
+                .expect("wait for IDLE fixture update"),
+            WaitOutcome::MailboxChanged
+        );
+        drop(session);
+        server.join().expect("join IDLE fixture");
+    }
+
+    #[test]
+    fn idle_policy_pauses_for_offline_mode_and_transitional_accounts() {
+        assert!(idle_watch_enabled(false, "synced"));
+        assert!(idle_watch_enabled(false, "offline"));
+        assert!(!idle_watch_enabled(true, "synced"));
+        assert!(!idle_watch_enabled(false, "needs-auth"));
+        assert!(!idle_watch_enabled(false, "syncing"));
+        assert!(IDLE_STATE_CHECK_INTERVAL < Duration::from_secs(29 * 60));
+    }
+
+    #[test]
+    fn idle_reconnect_backoff_is_bounded() {
+        assert_eq!(idle_retry_delay(0), Duration::from_secs(15));
+        assert_eq!(idle_retry_delay(1), Duration::from_secs(30));
+        assert_eq!(idle_retry_delay(4), Duration::from_secs(240));
+        assert_eq!(idle_retry_delay(5), Duration::from_secs(300));
+        assert_eq!(idle_retry_delay(50), Duration::from_secs(300));
     }
 
     fn fixture_message(uid: u32, folder: &str) -> CachedMessage {
