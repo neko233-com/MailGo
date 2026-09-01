@@ -2335,29 +2335,20 @@ fn save_search_messages(
     }
     let _write_guard = cache_write_guard();
     let folder = messages[0].folder.as_str();
-    let mut mailbox = load_mailbox_for_folder(cache_root, account_id, folder)?
-        .unwrap_or_else(|| CachedMailbox::empty(account_id, folder));
-    if mailbox.uid_validity.is_some() && mailbox.uid_validity != uid_validity {
-        // A search can discover a folder before the regular sync scheduler does. Never merge
-        // results from a new UID namespace into an old cache.
-        mailbox.messages.clear();
-        mailbox.oldest_uid = None;
-        mailbox.has_more = false;
+    if !crate::cache_db::mailbox_exists(cache_root, account_id, folder)? {
+        // Preserve a not-yet-migrated encrypted snapshot before the first row-level merge creates
+        // indexed metadata that would otherwise hide the legacy recovery source.
+        let _ = load_mailbox_for_folder(cache_root, account_id, folder)?;
     }
-    mailbox.uid_validity = uid_validity;
-    for message in messages {
-        mailbox
-            .messages
-            .retain(|cached| cached.uid != message.uid || cached.folder != message.folder);
-        mailbox.messages.push(message.clone());
-    }
-    mailbox
-        .messages
-        .sort_by_key(|cached| std::cmp::Reverse(cached.uid));
-    mailbox.messages.truncate(MAX_CACHED_MESSAGES_PER_FOLDER);
-    mailbox.oldest_uid = mailbox.messages.iter().map(|cached| cached.uid).min();
-    mailbox.synced_at = now_stamp();
-    save_mailbox_unlocked(cache_root, account_id, &mailbox).map(|_| ())
+    crate::cache_db::merge_messages(
+        cache_root,
+        account_id,
+        folder,
+        uid_validity,
+        &now_stamp(),
+        messages,
+        MAX_CACHED_MESSAGES_PER_FOLDER,
+    )
 }
 
 pub fn update_cached_flags(
@@ -2377,14 +2368,6 @@ pub fn update_cached_flags(
         _ => return Ok(()),
     }
     crate::cache_db::save_message(cache_root, account_id, &message)
-}
-
-fn refresh_mailbox_metadata(mailbox: &mut CachedMailbox) {
-    mailbox
-        .messages
-        .sort_by_key(|message| std::cmp::Reverse(message.uid));
-    mailbox.oldest_uid = mailbox.messages.iter().map(|message| message.uid).min();
-    mailbox.synced_at = now_stamp();
 }
 
 /// Move a cached message between folder caches immediately. The provider operation may still be
@@ -2410,30 +2393,31 @@ fn update_cached_move_unlocked(
     if folder.eq_ignore_ascii_case(target_folder) {
         return Ok(());
     }
-    let Some(mut source) = load_mailbox_for_folder(cache_root, account_id, folder)? else {
+    let moved = crate::cache_db::move_message(
+        cache_root,
+        account_id,
+        folder,
+        uid,
+        target_folder,
+        &now_stamp(),
+        MAX_CACHED_MESSAGES_PER_FOLDER,
+    )?;
+    if moved || crate::cache_db::mailbox_exists(cache_root, account_id, folder)? {
         return Ok(());
-    };
-    let Some(mut message) = source
-        .messages
-        .iter()
-        .find(|message| message.uid == uid && message.folder.eq_ignore_ascii_case(folder))
-        .cloned()
-    else {
-        return Ok(());
-    };
-    source
-        .messages
-        .retain(|item| !(item.uid == uid && item.folder.eq_ignore_ascii_case(folder)));
-    refresh_mailbox_metadata(&mut source);
-
-    let mut target = load_mailbox_for_folder(cache_root, account_id, target_folder)?
-        .unwrap_or_else(|| CachedMailbox::empty(account_id, target_folder));
-    message.folder = target_folder.to_string();
-    target.messages.retain(|item| item.uid != uid);
-    target.messages.push(message);
-    refresh_mailbox_metadata(&mut target);
-    save_mailbox_unlocked(cache_root, account_id, &target)?;
-    save_mailbox_unlocked(cache_root, account_id, &source)?;
+    }
+    // A one-time legacy migration keeps optimistic move behavior compatible with pre-index
+    // installations. Current indexed mailboxes never take this full-snapshot fallback.
+    if load_mailbox_for_folder(cache_root, account_id, folder)?.is_some() {
+        let _ = crate::cache_db::move_message(
+            cache_root,
+            account_id,
+            folder,
+            uid,
+            target_folder,
+            &now_stamp(),
+            MAX_CACHED_MESSAGES_PER_FOLDER,
+        )?;
+    }
     Ok(())
 }
 
@@ -3995,6 +3979,98 @@ mod tests {
                 .unwrap()
                 .uid,
             1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn search_merge_migrates_legacy_snapshot_before_row_upsert() {
+        let root = std::env::temp_dir().join(format!(
+            "mailgo-search-legacy-migration-test-{}",
+            std::process::id()
+        ));
+        let legacy = CachedMailbox {
+            schema_version: 1,
+            account_id: "fixture-account".into(),
+            folder: "INBOX".into(),
+            uid_validity: Some(5),
+            highest_mod_seq: None,
+            synced_at: now_stamp(),
+            messages: vec![fixture_message(1, "INBOX")],
+            oldest_uid: Some(1),
+            has_more: false,
+        };
+        let directory = root.join(safe_component("fixture-account"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(CACHE_FILE),
+            protect_cache(&serde_json::to_vec(&legacy).unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        save_search_messages(
+            &root,
+            "fixture-account",
+            Some(5),
+            &[fixture_message(2, "INBOX")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            crate::cache_db::load_message(&root, "fixture-account", "INBOX", 1)
+                .unwrap()
+                .unwrap()
+                .uid,
+            1
+        );
+        assert_eq!(
+            crate::cache_db::load_message(&root, "fixture-account", "INBOX", 2)
+                .unwrap()
+                .unwrap()
+                .uid,
+            2
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn move_migrates_legacy_snapshot_before_exact_transaction() {
+        let root = std::env::temp_dir().join(format!(
+            "mailgo-move-legacy-migration-test-{}",
+            std::process::id()
+        ));
+        let legacy = CachedMailbox {
+            schema_version: 1,
+            account_id: "fixture-account".into(),
+            folder: "INBOX".into(),
+            uid_validity: Some(5),
+            highest_mod_seq: None,
+            synced_at: now_stamp(),
+            messages: vec![fixture_message(8, "INBOX")],
+            oldest_uid: Some(8),
+            has_more: false,
+        };
+        let directory = root.join(safe_component("fixture-account"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(CACHE_FILE),
+            protect_cache(&serde_json::to_vec(&legacy).unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        update_cached_move(&root, "fixture-account", "INBOX", 8, "Archive").unwrap();
+
+        assert!(
+            crate::cache_db::load_message(&root, "fixture-account", "INBOX", 8)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            crate::cache_db::load_message(&root, "fixture-account", "Archive", 8)
+                .unwrap()
+                .unwrap()
+                .folder,
+            "Archive"
         );
         let _ = fs::remove_dir_all(root);
     }
