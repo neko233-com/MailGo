@@ -81,11 +81,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .mobile-overlay { display: none; }
 .window-controls .close-button:hover { background: rgba(250, 113, 128, 0.18); color: var(--danger); }
 .window-minimize { display: block; width: 11px; height: 1px; border-radius: 2px; background: currentColor; }
-.brand-mark { width: 26px; height: 25px; position: relative; display: inline-block; }
-.brand-wave { position: absolute; width: 8px; height: 25px; top: 0; border-radius: 7px 7px 3px 3px; transform: skew(-24deg); }
-.brand-wave-a { left: 2px; background: linear-gradient(180deg, #59d5e7, #6980ff); }
-.brand-wave-b { left: 9px; height: 23px; top: 1px; background: linear-gradient(180deg, #a17af7, #ff7c9c); transform: skew(24deg); }
-.brand-wave-c { left: 16px; background: linear-gradient(180deg, #6d89ff, #46c4e9); }
+.brand-mark { width: 28px; height: 28px; flex: 0 0 28px; display: inline-grid; place-items: center; }
+.brand-mark img { display: block; width: 100%; height: 100%; object-fit: contain; }
 
 .workspace { height: calc(100% - 64px); min-height: 0; display: grid; grid-template-columns: 242px minmax(430px, 520px) minmax(520px, 1fr); background: var(--bg); transition: grid-template-columns .22s ease; }
 .workspace.is-sidebar-collapsed { grid-template-columns: 76px minmax(430px, 520px) minmax(520px, 1fr); }
@@ -145,8 +142,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .outlook-mark { color: #fff; }
 .storage-bar { margin: auto 8px 0; padding: 15px 0 10px; border-top: 1px solid var(--line); color: var(--muted); font-size: 10px; }
 .storage-meta { font-size: 11px; }
-.storage-track { height: 7px; overflow: hidden; margin: 9px 0 9px; border-radius: 99px; background: var(--surface-strong); }
-.storage-track span { display: block; width: 28%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #4664d1, #6f78ff); }
+.storage-track { position: relative; display: flex; height: 7px; overflow: hidden; margin: 9px 0 9px; border-radius: 99px; background: var(--surface-strong); }
+.storage-track .storage-segment { display: block; height: 100%; min-width: 0; transition: width .24s ease; }
+.storage-mail { background: #5576ed; }
+.storage-attachments { background: #43bdd4; }
+.storage-other { background: #9a79e8; }
+.storage-track.is-loading::after { content: ''; position: absolute; inset: 0; width: 38%; border-radius: inherit; background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent), transparent 45%), transparent); animation: storage-scan 1.1s ease-in-out infinite; }
+@keyframes storage-scan { from { transform: translateX(-115%); } to { transform: translateX(365%); } }
 .storage-foot { gap: 9px; font-size: 10px; }
 .storage-foot span { display: inline-flex; align-items: center; gap: 4px; }
 .storage-foot-actions { display: inline-flex; align-items: center; gap: 8px; }

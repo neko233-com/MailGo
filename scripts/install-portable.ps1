@@ -131,14 +131,14 @@ try {
         $shortcut = $shell.CreateShortcut($startMenu)
         $shortcut.TargetPath = Join-Path $InstallDirectory 'MailGo.exe'
         $shortcut.WorkingDirectory = $InstallDirectory
-        $shortcut.IconLocation = "$(Join-Path $InstallDirectory 'MailGo.exe'),0"
+        $shortcut.IconLocation = "$(Join-Path $InstallDirectory 'resources\icons\mailgo.ico'),0"
         $shortcut.Description = 'MailGo Windows mail workspace'
         $shortcut.Save()
         if ($CreateDesktopShortcut) {
             $desktopShortcut = $shell.CreateShortcut((Join-Path ([Environment]::GetFolderPath('Desktop')) 'MailGo.lnk'))
             $desktopShortcut.TargetPath = Join-Path $InstallDirectory 'MailGo.exe'
             $desktopShortcut.WorkingDirectory = $InstallDirectory
-            $desktopShortcut.IconLocation = "$(Join-Path $InstallDirectory 'MailGo.exe'),0"
+            $desktopShortcut.IconLocation = "$(Join-Path $InstallDirectory 'resources\icons\mailgo.ico'),0"
             $desktopShortcut.Description = 'MailGo Windows mail workspace'
             $desktopShortcut.Save()
         }

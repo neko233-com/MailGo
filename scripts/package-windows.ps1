@@ -13,6 +13,35 @@ $version = [string]$package.version
 $stageRoot = Join-Path $OutputDirectory "MailGo-$version-windows-x64"
 $archivePath = Join-Path $OutputDirectory "MailGo-$version-windows-x64.zip"
 
+function Assert-MailGoIcon([string]$Path) {
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -lt 6 -or [System.BitConverter]::ToUInt16($bytes, 0) -ne 0 -or [System.BitConverter]::ToUInt16($bytes, 2) -ne 1) {
+        throw 'MailGo icon is not a valid Windows ICO file'
+    }
+    $count = [System.BitConverter]::ToUInt16($bytes, 4)
+    if ($count -lt 7 -or 6 + (16 * $count) -gt $bytes.Length) {
+        throw 'MailGo icon does not contain the required multi-size image directory'
+    }
+    $sizes = [System.Collections.Generic.HashSet[int]]::new()
+    for ($index = 0; $index -lt $count; $index++) {
+        $entryOffset = 6 + (16 * $index)
+        $width = if ($bytes[$entryOffset] -eq 0) { 256 } else { [int]$bytes[$entryOffset] }
+        $height = if ($bytes[$entryOffset + 1] -eq 0) { 256 } else { [int]$bytes[$entryOffset + 1] }
+        $bitDepth = [System.BitConverter]::ToUInt16($bytes, $entryOffset + 6)
+        $dataSize = [System.BitConverter]::ToUInt32($bytes, $entryOffset + 8)
+        $dataOffset = [System.BitConverter]::ToUInt32($bytes, $entryOffset + 12)
+        if ($width -ne $height -or $bitDepth -ne 32 -or $dataSize -eq 0 -or [uint64]$dataOffset + [uint64]$dataSize -gt [uint64]$bytes.Length) {
+            throw "MailGo icon contains an invalid ${width}x${height} entry"
+        }
+        [void]$sizes.Add($width)
+    }
+    foreach ($requiredSize in 16, 24, 32, 48, 64, 128, 256) {
+        if (!$sizes.Contains($requiredSize)) { throw "MailGo icon is missing the required ${requiredSize}x${requiredSize} image" }
+    }
+}
+
+Assert-MailGoIcon (Join-Path $projectRoot 'resources\icons\mailgo.ico')
+
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 if (Test-Path -LiteralPath $stageRoot) {
     Remove-Item -LiteralPath $stageRoot -Recurse -Force

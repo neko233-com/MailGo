@@ -126,6 +126,26 @@ export interface NativeOutboxStatus {
   paused: number
 }
 
+export interface NativeCacheStats {
+  totalBytes: number
+  fileCount: number
+  mailBytes: number
+  attachmentBytes: number
+  draftBytes: number
+  outboxBytes: number
+  operationBytes: number
+  otherBytes: number
+  unreadableEntries: number
+  truncated: boolean
+  scannedAt: number
+}
+
+export interface NativeCacheStatsResponse {
+  state: 'loading' | 'ready' | 'error'
+  stats?: NativeCacheStats
+  message?: string
+}
+
 export interface NativeDraft {
   id: string
   accountId: string

@@ -31,6 +31,7 @@ mod oauth;
 mod outbox;
 mod providers;
 mod send;
+mod storage;
 mod sync;
 mod transfer;
 mod tray;
@@ -42,7 +43,7 @@ const LOG_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
 fn app_window_icon() -> Result<WindowIcon> {
     let image = image::load_from_memory_with_format(
-        include_bytes!("../../resources/icons/mailgo-64.png"),
+        include_bytes!("../../resources/icons/mailgo-256.png"),
         image::ImageFormat::Png,
     )?
     .into_rgba8();
@@ -296,6 +297,15 @@ struct MailGoState {
     attachment_downloads: HashMap<String, AttachmentDownloadSession>,
     attachment_uploads: HashMap<String, AttachmentUploadSession>,
     sync_in_flight: HashSet<String>,
+    cache_scan: CacheScanState,
+}
+
+#[derive(Default)]
+struct CacheScanState {
+    generation: u64,
+    running: bool,
+    stats: Option<storage::CacheStats>,
+    error: Option<String>,
 }
 
 struct AttachmentDownloadSession {
@@ -356,6 +366,7 @@ impl MailGoState {
             attachment_downloads: HashMap::new(),
             attachment_uploads: HashMap::new(),
             sync_in_flight: HashSet::new(),
+            cache_scan: CacheScanState::default(),
         })
     }
 
@@ -1052,6 +1063,57 @@ fn generate_ipc_capability() -> String {
         .collect()
 }
 
+fn cache_stats_response(state: &CacheScanState) -> Value {
+    json!({
+        "state": if state.running { "loading" } else if state.error.is_some() { "error" } else { "ready" },
+        "stats": &state.stats,
+        "message": &state.error,
+    })
+}
+
+fn request_cache_stats(shared: &Arc<Mutex<MailGoState>>, refresh: bool) -> Result<Value> {
+    let generation = {
+        let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+        if !app.cache_scan.running && (refresh || app.cache_scan.stats.is_none()) {
+            app.cache_scan.generation = app.cache_scan.generation.saturating_add(1);
+            app.cache_scan.running = true;
+            app.cache_scan.error = None;
+            Some(app.cache_scan.generation)
+        } else {
+            None
+        }
+    };
+
+    if let Some(generation) = generation {
+        let state_for_scan = Arc::clone(shared);
+        let root = cache_dir();
+        if let Err(error) = std::thread::Builder::new()
+            .name("mailgo-cache-stats".to_string())
+            .spawn(move || {
+                let stats = storage::measure(&root);
+                if let Ok(mut app) = state_for_scan.lock() {
+                    if app.cache_scan.generation == generation {
+                        app.cache_scan.stats = Some(stats);
+                        app.cache_scan.running = false;
+                        app.cache_scan.error = None;
+                    }
+                }
+            })
+        {
+            tracing::warn!("cache statistics worker could not start: {error}");
+            if let Ok(mut app) = shared.lock() {
+                if app.cache_scan.generation == generation {
+                    app.cache_scan.running = false;
+                    app.cache_scan.error = Some("缓存统计暂不可用".to_string());
+                }
+            }
+        }
+    }
+
+    let app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+    Ok(cache_stats_response(&app.cache_scan))
+}
+
 fn validate_ipc_capability(message: &IpcMessage, expected: &str) -> Result<()> {
     let received = message
         .payload
@@ -1076,6 +1138,14 @@ fn handle_ipc(
                 .lock()
                 .map_err(|_| anyhow!("state lock poisoned"))?
                 .snapshot()),
+            "app.cache_stats" => request_cache_stats(
+                shared,
+                message
+                    .payload
+                    .get("refresh")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ),
             "app.set_minimize_to_tray" => {
                 let enabled = message
                     .payload
@@ -2891,6 +2961,7 @@ mod tests {
             attachment_downloads: HashMap::new(),
             attachment_uploads: HashMap::new(),
             sync_in_flight: HashSet::new(),
+            cache_scan: CacheScanState::default(),
         };
         assert!(cancel_auth_session(&mut app, "session-1"));
         assert!(app.ready_oauth_credentials.is_empty());
@@ -3146,6 +3217,7 @@ mod tests {
             attachment_downloads: HashMap::new(),
             attachment_uploads: HashMap::new(),
             sync_in_flight: HashSet::new(),
+            cache_scan: CacheScanState::default(),
         }));
         let lease = try_begin_account_sync(&shared, "account-1").expect("first lease");
         assert!(try_begin_account_sync(&shared, "account-1").is_err());

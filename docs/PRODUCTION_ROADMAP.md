@@ -120,6 +120,7 @@ The repository is deliberately split into a real desktop UI foundation and provi
 111. Native IMAP Modified UTF-7 decoding now supplies per-account Unicode display labels while preserving every original wire mailbox name for protocol commands; malformed or control-bearing segments fail closed to their original bounded representation.
 112. The packaged Windows Release has passed local tray acceptance for hide-without-exit, same-process single-instance restore, and completion of an in-flight synchronization while no MailGo window is visible; its release subsystem remains GUI-only with no companion console window.
 113. IMAP IDLE now provides per-account real-time Inbox change wakeups without holding the synchronization lease while waiting; listeners use a 30-second lifecycle boundary, preserve the 60-second socket ceiling through IDLE teardown, apply capped reconnect backoff, pause for offline/reauthorization state, emit privacy-safe logs, and retain the existing five-minute scheduler as a non-IDLE fallback.
+114. The sidebar cache meter now comes from a bounded asynchronous native filesystem scan instead of placeholder quota text, reports only aggregate category totals, and keeps its loading/error state local to the meter. Branding now shares one bundled artwork path across the title bar, WebView favicon, high-DPI native window, executable, tray, and shortcuts, with release-time validation of all seven required 32-bit ICO sizes.
 
 ## Remaining production acceptance work
 

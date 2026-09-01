@@ -1,11 +1,12 @@
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import appIconUrl from '../resources/icons/mailgo-64.png'
 import { Icon, type IconName } from './components/Icon'
 import { sanitizeCustomCss } from './customCss'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
 import { invoke, readNativeState } from './lib/ipc'
-import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeDraft, NativeMailboxResponse, NativeMessageResponse, NativeOutboxStatus, NativeQueueStatus, NativeSearchResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
+import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeDraft, NativeMailboxResponse, NativeMessageResponse, NativeOutboxStatus, NativeQueueStatus, NativeSearchResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 type ToastTone = 'info' | 'success' | 'error'
 type Toast = { id: number; message: string; tone: ToastTone }
@@ -174,6 +175,18 @@ function nativeAttachmentKind(contentType: string): MailAttachment['kind'] {
   if (contentType.includes('spreadsheet') || contentType.includes('excel')) return 'sheet'
   if (contentType.startsWith('image/')) return 'image'
   return 'file'
+}
+
+function formatStorageBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const unitIndex = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  const value = bytes / 1024 ** unitIndex
+  return `${value >= 100 || unitIndex === 0 ? value.toFixed(0) : value >= 10 ? value.toFixed(1) : value.toFixed(2)} ${units[unitIndex]}`
+}
+
+function storageShare(bytes: number, total: number) {
+  return total > 0 ? `${Math.max(0, Math.min(100, (bytes / total) * 100))}%` : '0%'
 }
 
 function nativeMessageToUi(message: NativeCachedMessage, account: MailAccount): MailMessage {
@@ -366,9 +379,7 @@ function ProviderMark({ provider, size = 'md' }: { provider: Provider; size?: 's
 function BrandMark() {
   return (
     <span className="brand-mark" aria-hidden="true">
-      <span className="brand-wave brand-wave-a" />
-      <span className="brand-wave brand-wave-b" />
-      <span className="brand-wave brand-wave-c" />
+      <img src={appIconUrl} alt="" />
     </span>
   )
 }
@@ -446,6 +457,8 @@ function App() {
   const [pendingOperations, setPendingOperations] = useState(0)
   const [outboxTotal, setOutboxTotal] = useState(0)
   const [outboxPaused, setOutboxPaused] = useState(0)
+  const [cacheStats, setCacheStats] = useState<NativeCacheStats | null>(null)
+  const [cacheStatsState, setCacheStatsState] = useState<'loading' | 'ready' | 'error'>(isNativeRuntime ? 'loading' : 'ready')
   const [nativeDrafts, setNativeDrafts] = useState<NativeDraft[]>([])
   const [provider, setProvider] = useState<Provider>('qq')
   const [accountEmail, setAccountEmail] = useState('')
@@ -797,6 +810,40 @@ function App() {
       window.clearInterval(timer)
     }
   }, [isNativeRuntime])
+
+  useEffect(() => {
+    if (!isNativeRuntime || !nativeStateReady) return
+    let cancelled = false
+    let timer: number | undefined
+    let loadingPolls = 0
+
+    const refreshCacheStats = async (refresh: boolean) => {
+      try {
+        const response = await invoke<NativeCacheStatsResponse>('app.cache_stats', { refresh })
+        if (cancelled) return
+        setCacheStatsState(response.state)
+        if (response.stats) setCacheStats(response.stats)
+        if (response.state === 'loading') {
+          loadingPolls += 1
+          timer = window.setTimeout(() => { void refreshCacheStats(false) }, Math.min(1_000, 120 + loadingPolls * 80))
+        } else {
+          loadingPolls = 0
+          timer = window.setTimeout(() => { void refreshCacheStats(true) }, response.state === 'error' ? 30_000 : 60_000)
+        }
+      } catch {
+        if (cancelled) return
+        setCacheStatsState('error')
+        loadingPolls = 0
+        timer = window.setTimeout(() => { void refreshCacheStats(true) }, 30_000)
+      }
+    }
+
+    void refreshCacheStats(true)
+    return () => {
+      cancelled = true
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [isNativeRuntime, nativeStateReady])
 
   const accountScopeKey = accounts.map((account) => `${account.id}:${account.provider}:${account.label}:${account.email}:${account.accent}`).join('|')
   const searchAccountDirectory = useMemo(() => new Map(accounts.map((account) => [account.id, account])), [accountScopeKey])
@@ -2091,6 +2138,19 @@ function App() {
               ? '后台同步待重试'
               : '所有账户已同步'
   const syncStatusTone = nativeStateError || hasAccountNeedingAuth ? 'is-error' : offlineMode || hasOfflineAccount ? 'is-offline' : ''
+  const cacheStatsLabel = !isNativeRuntime
+    ? '浏览器预览'
+    : cacheStats
+      ? `${formatStorageBytes(cacheStats.totalBytes)} · ${cacheStats.fileCount.toLocaleString('zh-CN')} 个文件${cacheStatsState === 'loading' ? ' · 更新中' : cacheStats.truncated || cacheStats.unreadableEntries > 0 ? ' · 部分统计' : ''}`
+      : cacheStatsState === 'error'
+        ? '暂时无法统计'
+        : '正在统计…'
+  const cacheMailBytes = cacheStats?.mailBytes ?? 0
+  const cacheAttachmentBytes = cacheStats?.attachmentBytes ?? 0
+  const cacheOtherBytes = Math.max(0, (cacheStats?.totalBytes ?? 0) - cacheMailBytes - cacheAttachmentBytes)
+  const cacheCompositionLabel = cacheStats
+    ? `邮件 ${formatStorageBytes(cacheMailBytes)}，附件 ${formatStorageBytes(cacheAttachmentBytes)}，草稿、队列与其他数据 ${formatStorageBytes(cacheOtherBytes)}`
+    : '正在异步统计本地缓存组成'
   const toggleNavigation = () => {
     if (isMobileLayout) {
       setMobileSidebarOpen((value) => !value)
@@ -2181,8 +2241,10 @@ function App() {
           </div>
 
           <div className="storage-bar">
-            <div className="storage-meta"><span>本地缓存</span><span>4.2 GB / 15 GB</span></div>
-            <div className="storage-track"><span /></div>
+            <div className="storage-meta"><span>本地缓存</span><span aria-live="polite">{cacheStatsLabel}</span></div>
+            <div className={`storage-track ${cacheStatsState === 'loading' ? 'is-loading' : ''}`} role="img" aria-label={cacheCompositionLabel} title={cacheCompositionLabel}>
+              {cacheStats && cacheStats.totalBytes > 0 ? <><span className="storage-segment storage-mail" style={{ width: storageShare(cacheMailBytes, cacheStats.totalBytes) }} /><span className="storage-segment storage-attachments" style={{ width: storageShare(cacheAttachmentBytes, cacheStats.totalBytes) }} /><span className="storage-segment storage-other" style={{ width: storageShare(cacheOtherBytes, cacheStats.totalBytes) }} /></> : null}
+            </div>
             <div className="storage-foot"><span aria-live="polite"><Icon name={outboxTotal || pendingOperations ? 'rotate' : 'cloud'} size={13} /> {outboxTotal ? `${outboxTotal} 封待发送${outboxPaused ? ` · ${outboxPaused} 封需重试` : ''}` : pendingOperations ? `${pendingOperations} 项操作待同步` : '离线可查看最近邮件'}</span><div className="storage-foot-actions">{outboxPaused > 0 && <button type="button" onClick={() => { void retryPendingOutbox() }}><Icon name="rotate" size={13} />重试待发送</button>}<button type="button" onClick={handleSync}><Icon name="rotate" size={13} /> {isSyncing ? '同步中…' : '立即同步'}</button></div></div>
           </div>
 
@@ -2280,7 +2342,7 @@ function App() {
               {selectedMail.hasHtml && <div className="content-mode-row"><span>此邮件包含富文本内容{(!remoteImagesEnabled || offlineMode) && ` · ${offlineMode ? '仅离线模式，远程图片已屏蔽' : '远程图片已屏蔽'}`}</span><button type="button" className="text-action" onClick={() => setHtmlMode((value) => !value)}>{isHtmlMode ? '查看纯文本' : '渲染 HTML'} <Icon name="grid" size={14} /></button></div>}
               {isHtmlMode && selectedMail.hasHtml ? <div className="html-rendered" onClick={handleRenderedLinkClick} dangerouslySetInnerHTML={{ __html: sanitizeHtml(selectedMail.htmlBody ?? initialHtml, remoteImagesEnabled && !offlineMode) }} /> : selectedMail.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
             </div>
-            {selectedMail.attachments && <div className="attachments"><div className="attachments-heading"><span><Icon name="paperclip" size={20} /> {selectedMail.attachments.length} 个附件</span><div><button type="button" onClick={() => { void Promise.all(selectedMail.attachments?.map(downloadAttachment) ?? []) }}><Icon name="download" size={17} /> 全部下载</button><button type="button" onClick={() => pushToast('正在保存到本地缓存', 'success')}><Icon name="cloud" size={17} /> 保存到云盘</button></div></div><div className="attachment-grid">{selectedMail.attachments.map((attachment) => { const progress = attachmentProgress[attachment.id]; return <button type="button" className="attachment-card" key={attachment.id} onClick={() => { if (progress != null) cancelAttachment(attachment.id); else void downloadAttachment(attachment) }}><span className={`file-glyph file-${attachment.kind}`}>{attachment.kind === 'pdf' ? 'PDF' : attachment.kind === 'sheet' ? 'X' : 'FILE'}</span><span className="attachment-copy"><strong>{attachment.name}</strong><small>{progress != null ? `${progress}% · 点击取消` : attachment.size}</small></span><Icon name={progress != null ? 'close' : 'download'} size={17} /></button> })}</div></div>}
+            {selectedMail.attachments && selectedMail.attachments.length > 0 && <div className="attachments"><div className="attachments-heading"><span><Icon name="paperclip" size={20} /> {selectedMail.attachments.length} 个附件</span><div><button type="button" onClick={() => { void Promise.all(selectedMail.attachments?.map(downloadAttachment) ?? []) }}><Icon name="download" size={17} /> 全部下载</button></div></div><div className="attachment-grid">{selectedMail.attachments.map((attachment) => { const progress = attachmentProgress[attachment.id]; return <button type="button" className="attachment-card" key={attachment.id} onClick={() => { if (progress != null) cancelAttachment(attachment.id); else void downloadAttachment(attachment) }}><span className={`file-glyph file-${attachment.kind}`}>{attachment.kind === 'pdf' ? 'PDF' : attachment.kind === 'sheet' ? 'X' : 'FILE'}</span><span className="attachment-copy"><strong>{attachment.name}</strong><small>{progress != null ? `${progress}% · 点击取消` : attachment.size}</small></span><Icon name={progress != null ? 'close' : 'download'} size={17} /></button> })}</div></div>}
             <div className="reply-composer"><Avatar message={{ ...selectedMail, avatar: 'OC', accent: '#2a5596' }} size="sm" /><div className="reply-input" onClick={() => openCompose(undefined, 'reply', selectedMail)}>点击回复，或按 R 快速回复<div className="reply-tools"><span><Icon name="paperclip" size={19} /></span><span><Icon name="image" size={19} /></span><span className="reply-emoji">☺</span><span className="reply-a">A</span><button type="button" onClick={(event) => { event.stopPropagation(); openCompose(undefined, 'reply', selectedMail) }}>回复 <span>⌄</span></button></div></div></div>
           </div>
         </section>
