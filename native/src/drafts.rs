@@ -39,6 +39,10 @@ pub struct Draft {
     pub body: String,
     #[serde(default)]
     pub html_mode: bool,
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    #[serde(default)]
+    pub references: Vec<String>,
     pub updated_at: u64,
 }
 
@@ -122,6 +126,7 @@ fn validate(draft: &Draft) -> Result<()> {
     validate_text(&draft.bcc, MAX_RECIPIENT_BYTES, "bcc")?;
     validate_text(&draft.subject, MAX_SUBJECT_BYTES, "subject")?;
     validate_text(&draft.body, MAX_BODY_BYTES, "body")?;
+    crate::send::validate_thread_headers(draft.in_reply_to.as_deref(), &draft.references)?;
     Ok(())
 }
 
@@ -245,6 +250,8 @@ mod tests {
             subject: "Draft subject".into(),
             body: "Draft body".into(),
             html_mode: false,
+            in_reply_to: Some("parent@example.com".into()),
+            references: vec!["root@example.com".into(), "parent@example.com".into()],
             updated_at: 1,
         }
     }
@@ -253,7 +260,10 @@ mod tests {
     fn encrypted_drafts_round_trip_and_filter_by_account() {
         let root = std::env::temp_dir().join(format!("mailgo-drafts-test-{}", std::process::id()));
         let saved = save(&root, fixture()).expect("save draft");
-        assert_eq!(list(&root, "account-1").unwrap().len(), 1);
+        let drafts = list(&root, "account-1").unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].in_reply_to.as_deref(), Some("parent@example.com"));
+        assert_eq!(drafts[0].references.len(), 2);
         assert!(list(&root, "account-2").unwrap().is_empty());
         assert!(remove(&root, "account-1", &saved.id).unwrap());
         assert!(list(&root, "account-1").unwrap().is_empty());
@@ -269,6 +279,17 @@ mod tests {
         let mut draft = fixture();
         draft.subject = "unsafe\r\nX-Injected: value".into();
         assert!(save(std::path::Path::new("."), draft).is_err());
+    }
+
+    #[test]
+    fn legacy_drafts_default_without_reply_headers() {
+        let draft: Draft = serde_json::from_str(
+            r#"{"id":"legacy","accountId":"account-1","to":"person@example.com","cc":"","bcc":"","subject":"Legacy","body":"body","htmlMode":false,"updatedAt":1}"#,
+        )
+        .expect("legacy draft");
+        assert!(draft.in_reply_to.is_none());
+        assert!(draft.references.is_empty());
+        validate(&draft).expect("legacy draft remains valid");
     }
 
     #[test]

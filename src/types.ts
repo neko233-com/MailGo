@@ -160,6 +160,8 @@ export interface NativeDraft {
   subject: string
   body: string
   htmlMode: boolean
+  inReplyTo?: string
+  references: string[]
   updatedAt: number
 }
 

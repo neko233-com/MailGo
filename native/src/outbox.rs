@@ -61,6 +61,10 @@ pub struct QueuedMessage {
     #[serde(default)]
     pub html_body: Option<String>,
     #[serde(default)]
+    pub in_reply_to: Option<String>,
+    #[serde(default)]
+    pub references: Vec<String>,
+    #[serde(default)]
     pub attachments: Vec<QueuedAttachment>,
     pub created_at: u64,
     pub updated_at: u64,
@@ -266,6 +270,8 @@ pub fn flush_due(
             subject: &message.subject,
             text_body: &message.text_body,
             html_body: message.html_body.as_deref(),
+            in_reply_to: message.in_reply_to.as_deref(),
+            references: &message.references,
         };
         match crate::send::send_message(profile.clone(), &outgoing, &attachments) {
             Ok(()) => {
@@ -413,6 +419,7 @@ fn validate(message: &QueuedMessage) -> Result<()> {
     if let Some(html) = &message.html_body {
         validate_text(html, MAX_BODY_BYTES, "HTML body", true)?;
     }
+    crate::send::validate_thread_headers(message.in_reply_to.as_deref(), &message.references)?;
     if message.attachments.len() > MAX_ATTACHMENTS {
         return Err(anyhow!("outbox message contains too many attachments"));
     }
@@ -548,6 +555,8 @@ mod tests {
             subject: "Queued message".into(),
             text_body: "body".into(),
             html_body: Some("<p>body</p>".into()),
+            in_reply_to: Some("parent@example.com".into()),
+            references: vec!["root@example.com".into(), "parent@example.com".into()],
             attachments: vec![QueuedAttachment {
                 file_name: "hello.txt".into(),
                 content_type: "text/plain".into(),
@@ -567,6 +576,8 @@ mod tests {
     fn encrypted_outbox_round_trips_and_filters_by_account() {
         let root = std::env::temp_dir().join(format!("mailgo-outbox-test-{}", std::process::id()));
         let saved = enqueue(&root, fixture()).expect("enqueue message");
+        assert_eq!(saved.in_reply_to.as_deref(), Some("parent@example.com"));
+        assert_eq!(saved.references.len(), 2);
         assert_eq!(status(&root, "account-1").unwrap().total, 1);
         assert_eq!(status(&root, "account-2").unwrap().total, 0);
         assert!(remove(&root, "account-1", &saved.id).unwrap());
@@ -583,6 +594,31 @@ mod tests {
         let mut message = fixture();
         message.attachments[0].file_name = "..\\secret.txt".into();
         assert!(enqueue(std::path::Path::new("."), message).is_err());
+    }
+
+    #[test]
+    fn legacy_outbox_messages_default_without_reply_headers() {
+        let message: QueuedMessage = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "accountId": "account-1",
+            "to": "person@example.com",
+            "cc": "",
+            "bcc": "",
+            "subject": "Legacy",
+            "textBody": "body",
+            "htmlBody": null,
+            "attachments": [],
+            "createdAt": 1,
+            "updatedAt": 1,
+            "attempts": 0,
+            "nextAttemptAt": 1,
+            "paused": false,
+            "lastError": null
+        }))
+        .expect("legacy outbox message");
+        assert!(message.in_reply_to.is_none());
+        assert!(message.references.is_empty());
+        validate(&message).expect("legacy outbox message remains valid");
     }
 
     #[test]

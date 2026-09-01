@@ -19,8 +19,8 @@ const MAX_ATTACHMENT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ATTACHMENT_NAME_CHARS: usize = 255;
 const MAX_RECIPIENTS_PER_MESSAGE: usize = 128;
 const MAX_RECIPIENT_CHARS: usize = 320;
-const MAX_MESSAGE_ID_BYTES: usize = 512;
-const MAX_THREAD_REFERENCES: usize = 32;
+pub(crate) const MAX_MESSAGE_ID_BYTES: usize = 512;
+pub(crate) const MAX_THREAD_REFERENCES: usize = 32;
 pub const CACHE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,7 +321,7 @@ fn collect_message_ids(value: &str, ids: &mut Vec<String>) {
     }
 }
 
-fn safe_message_id(value: &str) -> Option<String> {
+pub(crate) fn safe_message_id(value: &str) -> Option<String> {
     let value = value
         .trim()
         .trim_matches(|character| character == '<' || character == '>');

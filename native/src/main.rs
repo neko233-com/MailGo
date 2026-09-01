@@ -778,6 +778,37 @@ fn optional_bounded_string_field(
     Ok(Some(value))
 }
 
+fn thread_header_fields(payload: &Value) -> Result<(Option<String>, Vec<String>)> {
+    let in_reply_to =
+        optional_bounded_string_field(payload, "inReplyTo", mail::MAX_MESSAGE_ID_BYTES)?
+            .map(|value| {
+                mail::safe_message_id(&value).ok_or_else(|| anyhow!("invalid reply message id"))
+            })
+            .transpose()?;
+    let references = match payload.get("references") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(value) => {
+            let values = value
+                .as_array()
+                .ok_or_else(|| anyhow!("references must be an array"))?;
+            if values.len() > mail::MAX_THREAD_REFERENCES {
+                return Err(anyhow!("reply contains too many message references"));
+            }
+            values
+                .iter()
+                .map(|value| {
+                    let value = value
+                        .as_str()
+                        .ok_or_else(|| anyhow!("reply reference must be a string"))?;
+                    mail::safe_message_id(value).ok_or_else(|| anyhow!("invalid reply reference"))
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+    send::validate_thread_headers(in_reply_to.as_deref(), &references)?;
+    Ok((in_reply_to, references))
+}
+
 fn optional_u16_field(payload: &Value, name: &str) -> Option<u16> {
     payload
         .get(name)
@@ -1836,6 +1867,7 @@ fn handle_ipc(
             "drafts.save" => {
                 let account_id = string_field(&message.payload, "accountId")?;
                 account_for(shared, &account_id)?;
+                let (in_reply_to, references) = thread_header_fields(&message.payload)?;
                 let draft = drafts::Draft {
                     id: optional_string_field(&message.payload, "id").unwrap_or_default(),
                     account_id,
@@ -1855,6 +1887,8 @@ fn handle_ipc(
                         .get("htmlMode")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    in_reply_to,
+                    references,
                     updated_at: 0,
                 };
                 Ok(serde_json::to_value(drafts::save(&cache_dir(), draft)?)?)
@@ -2758,6 +2792,7 @@ fn handle_ipc(
             }
             "mail.send" => {
                 let account_id = string_field(&message.payload, "accountId")?;
+                let (in_reply_to, references) = thread_header_fields(&message.payload)?;
                 let to = bounded_string_field(&message.payload, "to", MAX_RECIPIENT_BYTES)?;
                 let cc =
                     optional_bounded_string_field(&message.payload, "cc", MAX_RECIPIENT_BYTES)?;
@@ -2839,6 +2874,8 @@ fn handle_ipc(
                             subject,
                             text_body,
                             html_body,
+                            in_reply_to,
+                            references,
                             attachments: attachments
                                 .into_iter()
                                 .map(|attachment| outbox::QueuedAttachment {
@@ -2874,6 +2911,8 @@ fn handle_ipc(
                     subject: &subject,
                     text_body: &text_body,
                     html_body: html_body.as_deref(),
+                    in_reply_to: in_reply_to.as_deref(),
+                    references: &references,
                 };
                 let send_result = send::send_message(profile, &outgoing, &attachments);
                 if let Ok(mut app) = shared.lock() {
@@ -2895,6 +2934,8 @@ fn handle_ipc(
                                 subject,
                                 text_body,
                                 html_body,
+                                in_reply_to,
+                                references,
                                 attachments: attachments
                                     .into_iter()
                                     .map(|attachment| outbox::QueuedAttachment {

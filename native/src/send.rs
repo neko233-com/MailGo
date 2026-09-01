@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use lettre::message::{header::ContentType, Attachment, Mailbox, MultiPart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{Message, SmtpTransport, Transport};
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::providers::{Authentication, ProviderProfile, TransportSecurity};
@@ -143,6 +144,8 @@ pub struct OutgoingMessage<'a> {
     pub subject: &'a str,
     pub text_body: &'a str,
     pub html_body: Option<&'a str>,
+    pub in_reply_to: Option<&'a str>,
+    pub references: &'a [String],
 }
 
 /// Send one user-confirmed message through the selected provider. The credential is borrowed for
@@ -187,6 +190,7 @@ fn build_message(
     message: &OutgoingMessage<'_>,
     attachments: &[OutgoingAttachment],
 ) -> Result<Message> {
+    validate_thread_headers(message.in_reply_to, message.references)?;
     let from_mailbox: Mailbox = message.from.parse().context("invalid sender address")?;
     let to_mailboxes = parse_recipients(message.to, "recipient")?;
     let cc_mailboxes = parse_optional_recipients(message.cc, "CC recipient")?;
@@ -208,6 +212,23 @@ fn build_message(
         .into_iter()
         .fold(builder, |builder, mailbox| builder.bcc(mailbox))
         .subject(message.subject);
+    let builder = if let Some(message_id) = message.in_reply_to {
+        builder.in_reply_to(format!("<{message_id}>"))
+    } else {
+        builder
+    };
+    let builder = if message.references.is_empty() {
+        builder
+    } else {
+        builder.references(
+            message
+                .references
+                .iter()
+                .map(|message_id| format!("<{message_id}>"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    };
     let html_body = message.html_body.filter(|body| !body.trim().is_empty());
     for attachment in attachments {
         if let Some(content_id) = attachment.content_id.as_deref() {
@@ -282,6 +303,26 @@ fn build_message(
     };
 
     Ok(built_message)
+}
+
+pub fn validate_thread_headers(in_reply_to: Option<&str>, references: &[String]) -> Result<()> {
+    if references.len() > crate::mail::MAX_THREAD_REFERENCES {
+        return Err(anyhow!("reply contains too many message references"));
+    }
+    if let Some(message_id) = in_reply_to {
+        if crate::mail::safe_message_id(message_id).as_deref() != Some(message_id) {
+            return Err(anyhow!("reply message id is unsafe"));
+        }
+    }
+    let mut seen = HashSet::with_capacity(references.len());
+    for message_id in references {
+        if crate::mail::safe_message_id(message_id).as_deref() != Some(message_id.as_str())
+            || !seen.insert(message_id.as_str())
+        {
+            return Err(anyhow!("reply reference is unsafe or duplicated"));
+        }
+    }
+    Ok(())
 }
 
 fn content_type_or_octet_stream(value: &str) -> ContentType {
@@ -387,6 +428,8 @@ mod tests {
             subject: "Inline image",
             text_body: "body",
             html_body: Some("<p><img src=\"cid:mailgo-inline-1\"></p>"),
+            in_reply_to: None,
+            references: &[],
         };
         let attachments = vec![
             OutgoingAttachment {
@@ -423,6 +466,8 @@ mod tests {
             subject: "Inline image",
             text_body: "body",
             html_body: Some("<p>body</p>"),
+            in_reply_to: None,
+            references: &[],
         };
         let attachment = OutgoingAttachment {
             file_name: "pixel.png".into(),
@@ -431,6 +476,48 @@ mod tests {
             bytes: vec![0, 1, 2],
         };
         assert!(build_message(&message, &[attachment]).is_err());
+    }
+
+    #[test]
+    fn builds_bounded_rfc_reply_headers() {
+        let references = vec!["root@example.com".into(), "parent@example.com".into()];
+        let message = OutgoingMessage {
+            from: "person@example.com",
+            credential: "unused-in-unit-test",
+            to: "recipient@example.com",
+            cc: None,
+            bcc: None,
+            subject: "Re: Project",
+            text_body: "body",
+            html_body: None,
+            in_reply_to: Some("parent@example.com"),
+            references: &references,
+        };
+        let formatted = String::from_utf8_lossy(&build_message(&message, &[]).unwrap().formatted())
+            .into_owned();
+        assert!(formatted.contains("In-Reply-To: <parent@example.com>"));
+        assert!(formatted.contains("References: <root@example.com> <parent@example.com>"));
+    }
+
+    #[test]
+    fn rejects_injected_or_unbounded_reply_headers() {
+        assert!(validate_thread_headers(
+            Some("parent@example.com\r\nBcc: hidden@example.com"),
+            &[]
+        )
+        .is_err());
+        let too_many = (0..=crate::mail::MAX_THREAD_REFERENCES)
+            .map(|index| format!("message-{index}@example.com"))
+            .collect::<Vec<_>>();
+        assert!(validate_thread_headers(None, &too_many).is_err());
+        assert!(validate_thread_headers(
+            None,
+            &[
+                "duplicate@example.com".into(),
+                "duplicate@example.com".into()
+            ]
+        )
+        .is_err());
     }
 
     #[test]

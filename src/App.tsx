@@ -3,6 +3,7 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import appIconUrl from '../resources/icons/mailgo-64.png'
 import { Icon, type IconName } from './components/Icon'
+import { buildComposeThreadHeaders, type ComposeMode } from './compose-thread'
 import { sanitizeCustomCss } from './customCss'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
 import { invoke, readNativeState } from './lib/ipc'
@@ -259,7 +260,6 @@ function draftToUi(draft: NativeDraft, account: MailAccount): MailMessage {
   }
 }
 
-type ComposeMode = 'new' | 'reply' | 'reply-all' | 'forward'
 type ComposeInlineImage = { file: File; contentId: string; previewUrl: string }
 
 function composeSubject(mode: ComposeMode, subject: string) {
@@ -2443,6 +2443,8 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
   const [subject, setSubject] = useState('')
   const [body, setBody] = useState('')
   const [htmlMode, setHtmlMode] = useState(false)
+  const [inReplyTo, setInReplyTo] = useState<string | undefined>()
+  const [references, setReferences] = useState<string[]>([])
   const [draftId, setDraftId] = useState<string | undefined>()
   const [draftStatus, setDraftStatus] = useState('')
   const [draftReady, setDraftReady] = useState(false)
@@ -2475,6 +2477,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
   useEffect(() => {
     let cancelled = false
     const seed = composeSeed(mode, source, senderEmail)
+    const threadHeaders = buildComposeThreadHeaders(mode, source)
     setDraftReady(false)
     setDraftStatus('')
     setDraftId(openDraftId)
@@ -2485,6 +2488,8 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
     setSubject(seed.subject)
     setBody(seed.body)
     setHtmlMode(false)
+    setInReplyTo(threadHeaders.inReplyTo)
+    setReferences(threadHeaders.references)
     clearInlineImages()
     if (!isNativeRuntime || !accountId || (!openDraftId && mode !== 'new')) {
       setDraftReady(true)
@@ -2501,6 +2506,8 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
       setSubject(draft.subject)
       setBody(draft.body)
       setHtmlMode(draft.htmlMode)
+      setInReplyTo(draft.inReplyTo)
+      setReferences(draft.references)
       setDraftStatus(openDraftId ? '已恢复草稿' : '已恢复最近草稿')
       onDraftChanged?.(draft)
     }).catch(() => undefined).finally(() => {
@@ -2522,6 +2529,8 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
         subject,
         body,
         htmlMode,
+        ...(inReplyTo ? { inReplyTo } : {}),
+        ...(references.length ? { references } : {}),
       }, 30_000).then((draft) => {
         setDraftId(draft.id)
         setDraftStatus('草稿已自动保存')
@@ -2529,7 +2538,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
       }).catch(() => setDraftStatus('草稿保存失败，将在下次输入时重试'))
     }, 700)
     return () => window.clearTimeout(timer)
-  }, [accountId, bcc, body, cc, draftId, draftReady, htmlMode, isNativeRuntime, isSending, onDraftChanged, subject, to])
+  }, [accountId, bcc, body, cc, draftId, draftReady, htmlMode, inReplyTo, isNativeRuntime, isSending, onDraftChanged, references, subject, to])
 
   const addFiles = (event: React.ChangeEvent<HTMLInputElement>) => {
     const incoming = Array.from(event.target.files ?? [])
@@ -2670,6 +2679,8 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
           ...(bcc.trim() ? { bcc: bcc.trim() } : {}),
           subject: subject.trim() || '(无主题)',
           textBody: body,
+          ...(inReplyTo ? { inReplyTo } : {}),
+          ...(references.length ? { references } : {}),
           ...(effectiveHtml && (body.trim() || inlineImages.length) ? { htmlBody: composeHtmlBody(body, inlineImages) } : {}),
           ...(uploadIds.length ? { attachmentIds: uploadIds } : {}),
         })
