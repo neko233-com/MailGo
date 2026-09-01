@@ -32,10 +32,11 @@ const MAX_SEARCH_WORD_CHARACTERS: usize = 256;
 const MAX_SEARCH_TERMS_PER_MESSAGE: usize = 512;
 const MAX_SEARCH_QUERY_TERMS: usize = 32;
 const MAX_LOCAL_SEARCH_CANDIDATES: usize = 2000;
-const DATABASE_SCHEMA_VERSION: i64 = 2;
+const DATABASE_SCHEMA_VERSION: i64 = 3;
 const MAX_PAGE_SIZE: usize = 500;
 const MAX_ENCRYPTED_ROW_BYTES: usize = 8 * 1024 * 1024;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const LIST_INDEX_BATCH_SIZE: usize = 48;
 
 static INITIALIZED_DATABASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 static DATABASE_ACCESS: OnceLock<RwLock<()>> = OnceLock::new();
@@ -43,6 +44,8 @@ static BACKUP_ACCESS: OnceLock<Mutex<()>> = OnceLock::new();
 static SEARCH_KEYS: OnceLock<Mutex<HashMap<PathBuf, [u8; SEARCH_KEY_BYTES]>>> = OnceLock::new();
 static SEARCH_INDEX_RUNNING: AtomicBool = AtomicBool::new(false);
 static SEARCH_INDEX_REQUESTED: AtomicBool = AtomicBool::new(false);
+static LIST_INDEX_RUNNING: AtomicBool = AtomicBool::new(false);
+static LIST_INDEX_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -51,6 +54,14 @@ struct SearchIndexerRun;
 impl Drop for SearchIndexerRun {
     fn drop(&mut self) {
         SEARCH_INDEX_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+struct ListIndexerRun;
+
+impl Drop for ListIndexerRun {
+    fn drop(&mut self) {
+        LIST_INDEX_RUNNING.store(false, Ordering::Release);
     }
 }
 
@@ -480,11 +491,11 @@ fn validate_database_file(path: &Path) -> Result<bool> {
     }
     let required_tables: i64 = connection.query_row(
         "SELECT COUNT(*) FROM sqlite_master
-         WHERE type = 'table' AND name IN ('mailbox_meta', 'messages')",
+         WHERE type = 'table' AND name IN ('mailbox_meta', 'messages', 'message_list')",
         [],
         |row| row.get(0),
     )?;
-    Ok(required_tables == 2)
+    Ok(required_tables == if schema_version >= 3 { 3 } else { 2 })
 }
 
 fn remove_initialized_path(path: &Path) -> Result<()> {
@@ -715,6 +726,8 @@ fn initialize(connection: &mut Connection) -> Result<()> {
             folder_key BLOB NOT NULL,
             payload BLOB NOT NULL,
             revision INTEGER NOT NULL DEFAULT 1,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            list_count INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL,
             PRIMARY KEY (account_key, folder_key)
         ) WITHOUT ROWID;
@@ -739,23 +752,78 @@ fn initialize(connection: &mut Connection) -> Result<()> {
             "indexed mail cache was created by a newer MailGo version"
         ));
     }
-    let has_search_version = {
+    let message_columns = {
         let mut statement = connection.prepare("PRAGMA table_info(messages)")?;
         let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
-        let mut found = false;
+        let mut found = HashSet::new();
         for column in columns {
-            if column?.eq_ignore_ascii_case("search_version") {
-                found = true;
-                break;
-            }
+            found.insert(column?.to_ascii_lowercase());
         }
         found
     };
-    if !has_search_version {
+    if !message_columns.contains("search_version") {
         connection.execute(
             "ALTER TABLE messages ADD COLUMN search_version INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
+    }
+    let had_message_list: bool = connection.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM sqlite_master
+           WHERE type = 'table' AND name = 'message_list'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS message_list (
+            account_key BLOB NOT NULL,
+            folder_key BLOB NOT NULL,
+            uid INTEGER NOT NULL CHECK (uid > 0 AND uid <= 4294967295),
+            payload BLOB NOT NULL,
+            PRIMARY KEY (account_key, folder_key, uid),
+            FOREIGN KEY (account_key, folder_key, uid)
+                REFERENCES messages(account_key, folder_key, uid) ON DELETE CASCADE
+        ) WITHOUT ROWID;",
+    )?;
+    let metadata_columns = {
+        let mut statement = connection.prepare("PRAGMA table_info(mailbox_meta)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        let mut found = HashSet::new();
+        for column in columns {
+            found.insert(column?.to_ascii_lowercase());
+        }
+        found
+    };
+    if !metadata_columns.contains("message_count") {
+        connection.execute(
+            "ALTER TABLE mailbox_meta ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !metadata_columns.contains("list_count") {
+        connection.execute(
+            "ALTER TABLE mailbox_meta ADD COLUMN list_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if current < 3 {
+        connection.execute(
+            "UPDATE mailbox_meta
+             SET message_count = (
+               SELECT COUNT(*) FROM messages
+               WHERE messages.account_key = mailbox_meta.account_key
+                 AND messages.folder_key = mailbox_meta.folder_key
+             ),
+             list_count = (
+               SELECT COUNT(*) FROM message_list
+               WHERE message_list.account_key = mailbox_meta.account_key
+                 AND message_list.folder_key = mailbox_meta.folder_key
+             )",
+            [],
+        )?;
+    } else if !had_message_list {
+        connection.execute("UPDATE mailbox_meta SET list_count = 0", [])?;
     }
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS message_search_terms (
@@ -821,6 +889,38 @@ fn read_metadata(
     Ok(Some((metadata, revision.max(0) as u64)))
 }
 
+fn read_metadata_for_page(
+    connection: &Connection,
+    account_key: &[u8],
+    folder_key: &[u8],
+) -> Result<Option<(MailboxMetadata, u64, usize, bool)>> {
+    let row = connection
+        .query_row(
+            "SELECT payload, revision, message_count, list_count FROM mailbox_meta
+             WHERE account_key = ?1 AND folder_key = ?2",
+            params![account_key, folder_key],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((payload, revision, message_count, list_count)) = row else {
+        return Ok(None);
+    };
+    let metadata = decrypt_json(&payload, "mailbox metadata")?;
+    Ok(Some((
+        metadata,
+        revision.max(0) as u64,
+        message_count.max(0) as usize,
+        list_count >= message_count && message_count >= 0,
+    )))
+}
+
 fn validate_identity(metadata: &MailboxMetadata, account_id: &str, folder: &str) -> Result<()> {
     if metadata.account_id != account_id || !metadata.folder.eq_ignore_ascii_case(folder) {
         return Err(anyhow!("indexed mail cache identity mismatch"));
@@ -843,6 +943,44 @@ fn decrypt_message(
     }
     crate::mail::bound_cached_message(&mut message);
     Ok(message)
+}
+
+fn message_for_list(message: &CachedMessage) -> CachedMessage {
+    let mut summary = message.clone();
+    summary.text_body.clear();
+    summary.html_body = None;
+    summary.raw_path = None;
+    for attachment in &mut summary.attachments {
+        attachment.cache_path = None;
+    }
+    summary
+}
+
+fn encrypt_message_payloads(message: &CachedMessage) -> Result<(Vec<u8>, [u8; 32], Vec<u8>)> {
+    let (payload, digest) = encrypt_json(message)?;
+    let list_payload = if message.text_body.is_empty()
+        && message.html_body.is_none()
+        && message.raw_path.is_none()
+        && message
+            .attachments
+            .iter()
+            .all(|attachment| attachment.cache_path.is_none())
+    {
+        payload.clone()
+    } else {
+        encrypt_json(&message_for_list(message))?.0
+    };
+    Ok((payload, digest, list_payload))
+}
+
+fn decrypt_list_message(
+    payload: &[u8],
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+) -> Result<CachedMessage> {
+    let message = decrypt_message(payload, account_id, folder, uid)?;
+    Ok(message_for_list(&message))
 }
 
 fn search_key_fingerprint(key: &[u8; SEARCH_KEY_BYTES]) -> [u8; 32] {
@@ -1037,6 +1175,164 @@ pub fn spawn_search_indexer(cache_root: PathBuf) {
         tracing::warn!(error = %error, "could not start local search index worker");
         if SEARCH_INDEX_REQUESTED.swap(false, Ordering::AcqRel) {
             spawn_search_indexer(retry_root);
+        }
+    }
+}
+
+fn rebuild_list_index_batch(cache_root: &Path, batch_size: usize) -> Result<SearchIndexProgress> {
+    with_recovery(cache_root, |connection| {
+        let encrypted_rows = {
+            let mut statement = connection.prepare(
+                "SELECT messages.account_key, messages.folder_key, messages.uid, messages.payload
+                 FROM messages
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM message_list
+                   WHERE message_list.account_key = messages.account_key
+                     AND message_list.folder_key = messages.folder_key
+                     AND message_list.uid = messages.uid
+                 )
+                 ORDER BY messages.updated_at DESC
+                 LIMIT ?1",
+            )?;
+            let rows = statement.query_map(
+                params![batch_size.clamp(1, LIST_INDEX_BATCH_SIZE) as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )?;
+            let mut values = Vec::new();
+            for row in rows {
+                values.push(row?);
+            }
+            values
+        };
+        if encrypted_rows.is_empty() {
+            return Ok(SearchIndexProgress {
+                indexed: 0,
+                has_more: false,
+            });
+        }
+
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut insert = transaction.prepare(
+            "INSERT OR IGNORE INTO message_list(account_key, folder_key, uid, payload)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        let mut inserted_by_mailbox = HashMap::<(Vec<u8>, Vec<u8>), i64>::new();
+        for (account_key, folder_key, uid, payload) in &encrypted_rows {
+            let list_payload =
+                decrypt_json::<CachedMessage>(payload, "message").and_then(|mut message| {
+                    crate::mail::bound_cached_message(&mut message);
+                    if identity_key(&message.account_id).as_slice() != account_key
+                        || folder_identity_key(&message.account_id, &message.folder).as_slice()
+                            != folder_key
+                        || i64::from(message.uid) != *uid
+                    {
+                        return Err(anyhow!("indexed message cache identity mismatch"));
+                    }
+                    encrypt_json(&message_for_list(&message)).map(|(encrypted, _)| encrypted)
+                });
+            match list_payload {
+                Ok(list_payload) => {
+                    let inserted =
+                        insert.execute(params![account_key, folder_key, uid, list_payload])?;
+                    if inserted > 0 {
+                        *inserted_by_mailbox
+                            .entry((account_key.clone(), folder_key.clone()))
+                            .or_default() += inserted as i64;
+                    }
+                }
+                Err(error) => {
+                    // A corrupt primary row is handled by the exact-read path. Mark it visited so
+                    // one damaged message cannot keep the low-priority migration worker spinning.
+                    tracing::warn!(error = %error, "skipped one unreadable message while building list summaries");
+                    let inserted =
+                        insert.execute(params![account_key, folder_key, uid, payload])?;
+                    if inserted > 0 {
+                        *inserted_by_mailbox
+                            .entry((account_key.clone(), folder_key.clone()))
+                            .or_default() += inserted as i64;
+                    }
+                }
+            }
+        }
+        drop(insert);
+        for ((account_key, folder_key), inserted) in inserted_by_mailbox {
+            transaction.execute(
+                "UPDATE mailbox_meta
+                 SET list_count = MIN(message_count, list_count + ?3)
+                 WHERE account_key = ?1 AND folder_key = ?2",
+                params![account_key, folder_key, inserted],
+            )?;
+        }
+        let has_more: bool = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM messages
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM message_list
+                 WHERE message_list.account_key = messages.account_key
+                   AND message_list.folder_key = messages.folder_key
+                   AND message_list.uid = messages.uid
+               )
+               LIMIT 1
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        Ok(SearchIndexProgress {
+            indexed: encrypted_rows.len(),
+            has_more,
+        })
+    })
+}
+
+fn spawn_list_indexer(cache_root: PathBuf) {
+    if LIST_INDEX_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        LIST_INDEX_REQUESTED.store(true, Ordering::Release);
+        return;
+    }
+    let restart_root = cache_root.clone();
+    let retry_root = cache_root.clone();
+    let spawn = thread::Builder::new()
+        .name("mailgo-list-summary-index".to_string())
+        .spawn(move || {
+            {
+                let _run = ListIndexerRun;
+                loop {
+                    match rebuild_list_index_batch(&cache_root, LIST_INDEX_BATCH_SIZE) {
+                        Ok(progress) if progress.has_more && progress.indexed > 0 => {
+                            thread::sleep(Duration::from_millis(12));
+                        }
+                        Ok(progress) if progress.has_more => {
+                            tracing::warn!("mail list summary index made no progress");
+                            break;
+                        }
+                        Ok(_) => break,
+                        Err(error) => {
+                            tracing::warn!(error = %error, "mail list summary index update paused");
+                            break;
+                        }
+                    }
+                }
+            }
+            if LIST_INDEX_REQUESTED.swap(false, Ordering::AcqRel) {
+                spawn_list_indexer(restart_root);
+            }
+        });
+    if let Err(error) = spawn {
+        LIST_INDEX_RUNNING.store(false, Ordering::Release);
+        tracing::warn!(error = %error, "could not start mail list summary worker");
+        if LIST_INDEX_REQUESTED.swap(false, Ordering::AcqRel) {
+            spawn_list_indexer(retry_root);
         }
     }
 }
@@ -1268,55 +1564,129 @@ pub fn load_mailbox_page(
     before_uid: Option<u32>,
     limit: usize,
 ) -> Result<Option<MailboxPage>> {
-    with_recovery(cache_root, |connection| {
+    let (page, needs_list_index) = with_recovery(cache_root, |connection| {
         let account_key = identity_key(account_id);
         let folder_key = folder_identity_key(account_id, folder);
-        let Some((metadata, revision)) = read_metadata(connection, &account_key, &folder_key)?
+        let Some((metadata, revision, total_cached, summaries_complete)) =
+            read_metadata_for_page(connection, &account_key, &folder_key)?
         else {
-            return Ok(None);
+            return Ok((None, false));
         };
         validate_identity(&metadata, account_id, folder)?;
         let page_size = limit.clamp(1, MAX_PAGE_SIZE);
-        let before = before_uid.map(i64::from);
-        let mut statement = connection.prepare(
-            "SELECT uid, payload FROM messages
-             WHERE account_key = ?1 AND folder_key = ?2
-               AND (?3 IS NULL OR uid < ?3)
-             ORDER BY uid DESC
-             LIMIT ?4",
-        )?;
-        let rows = statement.query_map(
-            params![account_key, folder_key, before, (page_size + 1) as i64],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )?;
-        let mut encrypted_rows = Vec::with_capacity(page_size + 1);
-        for row in rows {
-            encrypted_rows.push(row?);
-        }
+        let encrypted_rows = match (summaries_complete, before_uid) {
+            (true, Some(before_uid)) => {
+                let mut statement = connection.prepare(
+                    "SELECT uid, payload FROM message_list
+                     WHERE account_key = ?1 AND folder_key = ?2 AND uid < ?3
+                     ORDER BY uid DESC LIMIT ?4",
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        account_key,
+                        folder_key,
+                        i64::from(before_uid),
+                        (page_size + 1) as i64
+                    ],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )?;
+                let mut values = Vec::with_capacity(page_size + 1);
+                for row in rows {
+                    values.push(row?);
+                }
+                values
+            }
+            (true, None) => {
+                let mut statement = connection.prepare(
+                    "SELECT uid, payload FROM message_list
+                     WHERE account_key = ?1 AND folder_key = ?2
+                     ORDER BY uid DESC LIMIT ?3",
+                )?;
+                let rows = statement.query_map(
+                    params![account_key, folder_key, (page_size + 1) as i64],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )?;
+                let mut values = Vec::with_capacity(page_size + 1);
+                for row in rows {
+                    values.push(row?);
+                }
+                values
+            }
+            (false, Some(before_uid)) => {
+                let mut statement = connection.prepare(
+                    "SELECT messages.uid, COALESCE(message_list.payload, messages.payload)
+                     FROM messages LEFT JOIN message_list
+                       ON message_list.account_key = messages.account_key
+                      AND message_list.folder_key = messages.folder_key
+                      AND message_list.uid = messages.uid
+                     WHERE messages.account_key = ?1 AND messages.folder_key = ?2
+                       AND messages.uid < ?3
+                     ORDER BY messages.uid DESC LIMIT ?4",
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        account_key,
+                        folder_key,
+                        i64::from(before_uid),
+                        (page_size + 1) as i64
+                    ],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )?;
+                let mut values = Vec::with_capacity(page_size + 1);
+                for row in rows {
+                    values.push(row?);
+                }
+                values
+            }
+            (false, None) => {
+                let mut statement = connection.prepare(
+                    "SELECT messages.uid, COALESCE(message_list.payload, messages.payload)
+                     FROM messages LEFT JOIN message_list
+                       ON message_list.account_key = messages.account_key
+                      AND message_list.folder_key = messages.folder_key
+                      AND message_list.uid = messages.uid
+                     WHERE messages.account_key = ?1 AND messages.folder_key = ?2
+                     ORDER BY messages.uid DESC LIMIT ?3",
+                )?;
+                let rows = statement.query_map(
+                    params![account_key, folder_key, (page_size + 1) as i64],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )?;
+                let mut values = Vec::with_capacity(page_size + 1);
+                for row in rows {
+                    values.push(row?);
+                }
+                values
+            }
+        };
+        let mut encrypted_rows = encrypted_rows;
         let local_has_more = encrypted_rows.len() > page_size;
         encrypted_rows.truncate(page_size);
         let mut messages = Vec::with_capacity(encrypted_rows.len());
         for (uid, payload) in encrypted_rows {
             let uid = u32::try_from(uid).context("indexed message UID is out of range")?;
-            messages.push(decrypt_message(&payload, account_id, folder, uid)?);
+            messages.push(decrypt_list_message(&payload, account_id, folder, uid)?);
         }
-        let total_cached: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM messages WHERE account_key = ?1 AND folder_key = ?2",
-            params![account_key, folder_key],
-            |row| row.get(0),
-        )?;
         let remote_has_more = metadata.has_more;
+        let needs_list_index = !summaries_complete;
         let mut mailbox = metadata.into_mailbox(messages);
         mailbox.oldest_uid = mailbox.messages.iter().map(|message| message.uid).min();
         mailbox.has_more = local_has_more || remote_has_more;
-        Ok(Some(MailboxPage {
-            mailbox,
-            local_has_more,
-            remote_has_more,
-            total_cached: total_cached.max(0) as usize,
-            revision,
-        }))
-    })
+        Ok((
+            Some(MailboxPage {
+                mailbox,
+                local_has_more,
+                remote_has_more,
+                total_cached,
+                revision,
+            }),
+            needs_list_index,
+        ))
+    })?;
+    if needs_list_index {
+        spawn_list_indexer(cache_root.to_path_buf());
+    }
+    Ok(page)
 }
 
 pub fn load_message(
@@ -1354,16 +1724,29 @@ pub fn save_mailbox(
         let account_key = identity_key(account_id);
         let folder_key = folder_identity_key(account_id, &mailbox.folder);
         let now = now_epoch_millis();
+        let current_uids = mailbox
+            .messages
+            .iter()
+            .map(|message| i64::from(message.uid))
+            .collect::<HashSet<_>>();
         let (metadata_payload, _) = encrypt_json(&MailboxMetadata::from(mailbox))?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
-            "INSERT INTO mailbox_meta(account_key, folder_key, payload, revision, updated_at)
-             VALUES (?1, ?2, ?3, 1, ?4)
+            "INSERT INTO mailbox_meta(account_key, folder_key, payload, revision, message_count, list_count, updated_at)
+             VALUES (?1, ?2, ?3, 1, ?4, ?4, ?5)
              ON CONFLICT(account_key, folder_key) DO UPDATE SET
                payload = excluded.payload,
                revision = mailbox_meta.revision + 1,
+               message_count = excluded.message_count,
+               list_count = excluded.list_count,
                updated_at = excluded.updated_at",
-            params![account_key, folder_key, metadata_payload, now],
+            params![
+                account_key,
+                folder_key,
+                metadata_payload,
+                current_uids.len() as i64,
+                now
+            ],
         )?;
 
         let existing = {
@@ -1381,11 +1764,6 @@ pub fn save_mailbox(
             }
             result
         };
-        let current_uids = mailbox
-            .messages
-            .iter()
-            .map(|message| i64::from(message.uid))
-            .collect::<HashSet<_>>();
         {
             let mut delete = transaction.prepare(
                 "DELETE FROM messages WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3",
@@ -1395,7 +1773,7 @@ pub fn save_mailbox(
             }
         }
         {
-            let mut upsert = transaction.prepare(
+            let mut upsert_message = transaction.prepare(
                 "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, search_version, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
                  ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
@@ -1404,26 +1782,34 @@ pub fn save_mailbox(
                    search_version = 0,
                    updated_at = excluded.updated_at",
             )?;
+            let mut upsert_list = transaction.prepare(
+                "INSERT INTO message_list(account_key, folder_key, uid, payload)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
+                   payload = excluded.payload",
+            )?;
             for message in &mailbox.messages {
                 if message.account_id != account_id
                     || !message.folder.eq_ignore_ascii_case(&mailbox.folder)
                 {
                     return Err(anyhow!("indexed message cache identity mismatch"));
                 }
-                let serialized = serde_json::to_vec(message)?;
-                if serialized.len() > MAX_ENCRYPTED_ROW_BYTES {
-                    return Err(anyhow!("indexed message cache row is too large"));
-                }
-                let digest = Sha256::digest(&serialized).to_vec();
+                let (payload, digest, list_payload) = encrypt_message_payloads(message)?;
                 let uid = i64::from(message.uid);
-                if existing.get(&uid).is_some_and(|stored| stored == &digest) {
-                    continue;
+                if !existing
+                    .get(&uid)
+                    .is_some_and(|stored| stored.as_slice() == &digest[..])
+                {
+                    upsert_message.execute(params![
+                        account_key,
+                        folder_key,
+                        uid,
+                        digest,
+                        payload,
+                        now
+                    ])?;
                 }
-                let payload = crate::sync::protect_cache(&serialized)?;
-                if payload.len() > MAX_ENCRYPTED_ROW_BYTES {
-                    return Err(anyhow!("encrypted indexed message cache row is too large"));
-                }
-                upsert.execute(params![account_key, folder_key, uid, digest, payload, now])?;
+                upsert_list.execute(params![account_key, folder_key, uid, list_payload])?;
             }
         }
         transaction.commit()?;
@@ -1441,6 +1827,15 @@ pub fn save_message(cache_root: &Path, account_id: &str, message: &CachedMessage
         let folder_key = folder_identity_key(account_id, &message.folder);
         let now = now_epoch_millis();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (message_existed, list_existed): (bool, bool) = transaction.query_row(
+            "SELECT
+               EXISTS(SELECT 1 FROM messages
+                      WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3),
+               EXISTS(SELECT 1 FROM message_list
+                      WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3)",
+            params![account_key, folder_key, i64::from(message.uid)],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
         let existing_metadata = read_metadata(&transaction, &account_key, &folder_key)?;
         let mut metadata = existing_metadata
             .as_ref()
@@ -1472,7 +1867,7 @@ pub fn save_message(cache_root: &Path, account_id: &str, message: &CachedMessage
                updated_at = excluded.updated_at",
             params![account_key, folder_key, metadata_payload, now],
         )?;
-        let (payload, digest) = encrypt_json(message)?;
+        let (payload, digest, list_payload) = encrypt_message_payloads(message)?;
         transaction.execute(
             "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, search_version, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
@@ -1488,6 +1883,30 @@ pub fn save_message(cache_root: &Path, account_id: &str, message: &CachedMessage
                 digest,
                 payload,
                 now
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO message_list(account_key, folder_key, uid, payload)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
+               payload = excluded.payload",
+            params![
+                account_key,
+                folder_key,
+                i64::from(message.uid),
+                list_payload
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE mailbox_meta SET
+               message_count = message_count + ?3,
+               list_count = list_count + ?4
+             WHERE account_key = ?1 AND folder_key = ?2",
+            params![
+                account_key,
+                folder_key,
+                i64::from(!message_existed),
+                i64::from(!list_existed)
             ],
         )?;
         transaction.commit()?;
@@ -1556,7 +1975,7 @@ pub fn merge_messages(
             )?;
         }
         {
-            let mut upsert = transaction.prepare(
+            let mut upsert_message = transaction.prepare(
                 "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, search_version, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
                  ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
@@ -1566,15 +1985,27 @@ pub fn merge_messages(
                    updated_at = excluded.updated_at
                  WHERE messages.payload_hash != excluded.payload_hash",
             )?;
+            let mut upsert_list = transaction.prepare(
+                "INSERT INTO message_list(account_key, folder_key, uid, payload)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
+                   payload = excluded.payload",
+            )?;
             for message in messages {
-                let (payload, digest) = encrypt_json(message)?;
-                upsert.execute(params![
+                let (payload, digest, list_payload) = encrypt_message_payloads(message)?;
+                upsert_message.execute(params![
                     account_key,
                     folder_key,
                     i64::from(message.uid),
                     digest,
                     payload,
                     now
+                ])?;
+                upsert_list.execute(params![
+                    account_key,
+                    folder_key,
+                    i64::from(message.uid),
+                    list_payload
                 ])?;
             }
         }
@@ -1587,19 +2018,31 @@ pub fn merge_messages(
              )",
             params![account_key, folder_key, max_messages],
         )?;
-        let oldest: Option<i64> = transaction.query_row(
-            "SELECT MIN(uid) FROM messages WHERE account_key = ?1 AND folder_key = ?2",
+        let (oldest, message_count, list_count): (Option<i64>, i64, i64) = transaction.query_row(
+            "SELECT MIN(uid), COUNT(*), (
+               SELECT COUNT(*) FROM message_list
+               WHERE account_key = ?1 AND folder_key = ?2
+             ) FROM messages
+             WHERE account_key = ?1 AND folder_key = ?2",
             params![account_key, folder_key],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         metadata.oldest_uid = oldest
             .map(|value| u32::try_from(value).context("indexed message UID is out of range"))
             .transpose()?;
         let (metadata_payload, _) = encrypt_json(&metadata)?;
         transaction.execute(
-            "UPDATE mailbox_meta SET payload = ?3, revision = revision + 1, updated_at = ?4
+            "UPDATE mailbox_meta SET payload = ?3, revision = revision + 1,
+               message_count = ?4, list_count = ?5, updated_at = ?6
              WHERE account_key = ?1 AND folder_key = ?2",
-            params![account_key, folder_key, metadata_payload, now],
+            params![
+                account_key,
+                folder_key,
+                metadata_payload,
+                message_count.max(0),
+                list_count.max(0),
+                now
+            ],
         )?;
         transaction.commit()?;
         Ok(())
@@ -1669,7 +2112,7 @@ pub fn move_message(
         }
 
         message.folder = target_folder.to_string();
-        let (message_payload, message_digest) = encrypt_json(&message)?;
+        let (message_payload, message_digest, list_payload) = encrypt_message_payloads(&message)?;
         transaction.execute(
             "DELETE FROM messages
              WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3",
@@ -1693,6 +2136,13 @@ pub fn move_message(
             ],
         )?;
         transaction.execute(
+            "INSERT INTO message_list(account_key, folder_key, uid, payload)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
+               payload = excluded.payload",
+            params![account_key, target_folder_key, i64::from(uid), list_payload],
+        )?;
+        transaction.execute(
             "DELETE FROM messages
              WHERE account_key = ?1 AND folder_key = ?2 AND uid IN (
                SELECT uid FROM messages
@@ -1702,36 +2152,62 @@ pub fn move_message(
             params![account_key, target_folder_key, max_messages],
         )?;
 
-        let source_oldest: Option<i64> = transaction.query_row(
-            "SELECT MIN(uid) FROM messages WHERE account_key = ?1 AND folder_key = ?2",
-            params![account_key, source_folder_key],
-            |row| row.get(0),
-        )?;
+        let (source_oldest, source_count, source_list_count): (Option<i64>, i64, i64) = transaction
+            .query_row(
+                "SELECT MIN(uid), COUNT(*), (
+               SELECT COUNT(*) FROM message_list
+               WHERE account_key = ?1 AND folder_key = ?2
+             ) FROM messages
+             WHERE account_key = ?1 AND folder_key = ?2",
+                params![account_key, source_folder_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
         source_metadata.oldest_uid = source_oldest
             .map(|value| u32::try_from(value).context("indexed message UID is out of range"))
             .transpose()?;
         source_metadata.synced_at = synced_at.to_string();
         let (source_metadata_payload, _) = encrypt_json(&source_metadata)?;
         transaction.execute(
-            "UPDATE mailbox_meta SET payload = ?3, revision = revision + 1, updated_at = ?4
+            "UPDATE mailbox_meta SET payload = ?3, revision = revision + 1,
+               message_count = ?4, list_count = ?5, updated_at = ?6
              WHERE account_key = ?1 AND folder_key = ?2",
-            params![account_key, source_folder_key, source_metadata_payload, now],
+            params![
+                account_key,
+                source_folder_key,
+                source_metadata_payload,
+                source_count.max(0),
+                source_list_count.max(0),
+                now
+            ],
         )?;
 
-        let target_oldest: Option<i64> = transaction.query_row(
-            "SELECT MIN(uid) FROM messages WHERE account_key = ?1 AND folder_key = ?2",
-            params![account_key, target_folder_key],
-            |row| row.get(0),
-        )?;
+        let (target_oldest, target_count, target_list_count): (Option<i64>, i64, i64) = transaction
+            .query_row(
+                "SELECT MIN(uid), COUNT(*), (
+               SELECT COUNT(*) FROM message_list
+               WHERE account_key = ?1 AND folder_key = ?2
+             ) FROM messages
+             WHERE account_key = ?1 AND folder_key = ?2",
+                params![account_key, target_folder_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
         target_metadata.oldest_uid = target_oldest
             .map(|value| u32::try_from(value).context("indexed message UID is out of range"))
             .transpose()?;
         target_metadata.synced_at = synced_at.to_string();
         let (target_metadata_payload, _) = encrypt_json(&target_metadata)?;
         transaction.execute(
-            "UPDATE mailbox_meta SET payload = ?3, revision = revision + 1, updated_at = ?4
+            "UPDATE mailbox_meta SET payload = ?3, revision = revision + 1,
+               message_count = ?4, list_count = ?5, updated_at = ?6
              WHERE account_key = ?1 AND folder_key = ?2",
-            params![account_key, target_folder_key, target_metadata_payload, now],
+            params![
+                account_key,
+                target_folder_key,
+                target_metadata_payload,
+                target_count.max(0),
+                target_list_count.max(0),
+                now
+            ],
         )?;
         transaction.commit()?;
         Ok(true)
@@ -1757,10 +2233,14 @@ pub fn remove_message(cache_root: &Path, account_id: &str, folder: &str, uid: u3
             transaction.commit()?;
             return Ok(());
         }
-        let oldest: Option<i64> = transaction.query_row(
-            "SELECT MIN(uid) FROM messages WHERE account_key = ?1 AND folder_key = ?2",
+        let (oldest, message_count, list_count): (Option<i64>, i64, i64) = transaction.query_row(
+            "SELECT MIN(uid), COUNT(*), (
+               SELECT COUNT(*) FROM message_list
+               WHERE account_key = ?1 AND folder_key = ?2
+             ) FROM messages
+             WHERE account_key = ?1 AND folder_key = ?2",
             params![account_key, folder_key],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         metadata.oldest_uid = oldest
             .map(|value| u32::try_from(value).context("indexed message UID is out of range"))
@@ -1768,12 +2248,15 @@ pub fn remove_message(cache_root: &Path, account_id: &str, folder: &str, uid: u3
         metadata.synced_at = format!("unix:{}", now_epoch_millis() / 1000);
         let (metadata_payload, _) = encrypt_json(&metadata)?;
         transaction.execute(
-            "UPDATE mailbox_meta SET payload = ?3, revision = revision + 1, updated_at = ?4
+            "UPDATE mailbox_meta SET payload = ?3, revision = revision + 1,
+               message_count = ?4, list_count = ?5, updated_at = ?6
              WHERE account_key = ?1 AND folder_key = ?2",
             params![
                 account_key,
                 folder_key,
                 metadata_payload,
+                message_count.max(0),
+                list_count.max(0),
                 now_epoch_millis()
             ],
         )?;
@@ -1957,6 +2440,35 @@ mod tests {
                  PRAGMA user_version = 1;",
             )
             .unwrap();
+        let mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        let (metadata_payload, _) = encrypt_json(&MailboxMetadata::from(&mailbox)).unwrap();
+        let message = fixture_message(1);
+        let (message_payload, digest) = encrypt_json(&message).unwrap();
+        connection
+            .execute(
+                "INSERT INTO mailbox_meta(account_key, folder_key, payload, revision, updated_at)
+                 VALUES (?1, ?2, ?3, 1, ?4)",
+                params![
+                    identity_key("fixture-account"),
+                    folder_identity_key("fixture-account", "INBOX"),
+                    metadata_payload,
+                    now_epoch_millis()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, updated_at)
+                 VALUES (?1, ?2, 1, ?3, ?4, ?5)",
+                params![
+                    identity_key("fixture-account"),
+                    folder_identity_key("fixture-account", "INBOX"),
+                    digest,
+                    message_payload,
+                    now_epoch_millis()
+                ],
+            )
+            .unwrap();
         drop(connection);
 
         let connection = open(&root).unwrap();
@@ -1970,6 +2482,38 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        let list_table: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'message_list'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let count_column: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('mailbox_meta') WHERE name = 'message_count'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let list_count_column: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('mailbox_meta') WHERE name = 'list_count'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (migrated_count, migrated_list_count): (i64, i64) = connection
+            .query_row(
+                "SELECT message_count, list_count FROM mailbox_meta",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let legacy_summaries: i64 = connection
+            .query_row("SELECT COUNT(*) FROM message_list", [], |row| row.get(0))
+            .unwrap();
         let search_tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -1980,6 +2524,12 @@ mod tests {
             .unwrap();
         assert_eq!(schema_version, DATABASE_SCHEMA_VERSION);
         assert_eq!(search_column, 1);
+        assert_eq!(list_table, 1);
+        assert_eq!(count_column, 1);
+        assert_eq!(list_count_column, 1);
+        assert_eq!(migrated_count, 1);
+        assert_eq!(migrated_list_count, 0);
+        assert_eq!(legacy_summaries, 0);
         assert_eq!(search_tables, 2);
         let _ = fs::remove_dir_all(root);
     }
@@ -2223,6 +2773,137 @@ mod tests {
     }
 
     #[test]
+    fn list_pages_use_small_summaries_while_exact_reads_keep_the_full_body() {
+        let root = temporary_root("list-summary");
+        let mut message = fixture_message(7);
+        message.preview = "bounded preview".into();
+        message.text_body = "x".repeat(2 * 1024 * 1024);
+        message.html_body = Some(format!("<p>{}</p>", "y".repeat(512 * 1024)));
+        message.attachments.push(crate::mail::CachedAttachment {
+            index: 0,
+            file_name: "report.pdf".into(),
+            content_type: "application/pdf".into(),
+            content_id: None,
+            size: 128,
+            cache_path: Some("private-cache-path".into()),
+        });
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = vec![message];
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+
+        let connection = open(&root).unwrap();
+        let (payload_bytes, list_bytes, message_count, list_payload): (i64, i64, i64, Vec<u8>) =
+            connection
+                .query_row(
+                    "SELECT LENGTH(messages.payload), LENGTH(message_list.payload),
+                        mailbox_meta.message_count, message_list.payload
+                 FROM messages
+                 JOIN message_list USING(account_key, folder_key, uid)
+                 JOIN mailbox_meta USING(account_key, folder_key)
+                 WHERE messages.account_key = ?1 AND messages.folder_key = ?2 AND uid = 7",
+                    params![
+                        identity_key("fixture-account"),
+                        folder_identity_key("fixture-account", "INBOX")
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+        drop(connection);
+        assert_eq!(message_count, 1);
+        assert!(list_bytes * 100 < payload_bytes);
+        assert!(!list_payload
+            .windows(b"bounded preview".len())
+            .any(|window| window == b"bounded preview"));
+        assert!(!list_payload
+            .windows(b"report.pdf".len())
+            .any(|window| window == b"report.pdf"));
+
+        let page = load_mailbox_page(&root, "fixture-account", "INBOX", None, 20)
+            .unwrap()
+            .unwrap();
+        let summary = &page.mailbox.messages[0];
+        assert!(summary.text_body.is_empty());
+        assert!(summary.html_body.is_none());
+        assert_eq!(summary.preview, "bounded preview");
+        assert_eq!(summary.attachments.len(), 1);
+        assert!(summary.attachments[0].cache_path.is_none());
+
+        let exact = load_message(&root, "fixture-account", "INBOX", 7)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact.text_body.len(), 2 * 1024 * 1024);
+        assert!(exact.html_body.is_some());
+        assert_eq!(
+            exact.attachments[0].cache_path.as_deref(),
+            Some("private-cache-path")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_rows_gain_list_summaries_in_bounded_background_batches() {
+        let root = temporary_root("list-backfill");
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = (1..=90).rev().map(fixture_message).collect();
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        let connection = open(&root).unwrap();
+        connection.execute("DELETE FROM message_list", []).unwrap();
+        connection
+            .execute("UPDATE mailbox_meta SET list_count = 0", [])
+            .unwrap();
+        drop(connection);
+
+        let first = rebuild_list_index_batch(&root, LIST_INDEX_BATCH_SIZE).unwrap();
+        assert_eq!(first.indexed, LIST_INDEX_BATCH_SIZE);
+        assert!(first.has_more);
+        let second = rebuild_list_index_batch(&root, LIST_INDEX_BATCH_SIZE).unwrap();
+        assert_eq!(second.indexed, 90 - LIST_INDEX_BATCH_SIZE);
+        assert!(!second.has_more);
+
+        let connection = open(&root).unwrap();
+        let (summaries, list_count): (i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM message_list), list_count FROM mailbox_meta",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(summaries, 90);
+        assert_eq!(list_count, 90);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn paginated_query_uses_the_uid_range_from_the_primary_key() {
+        let root = temporary_root("page-plan");
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = (1..=10).rev().map(fixture_message).collect();
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        let connection = open(&root).unwrap();
+        let detail: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT uid, payload FROM message_list
+                 WHERE account_key = ?1 AND folder_key = ?2 AND uid < ?3
+                 ORDER BY uid DESC LIMIT ?4",
+                params![
+                    identity_key("fixture-account"),
+                    folder_identity_key("fixture-account", "INBOX"),
+                    9i64,
+                    5i64
+                ],
+                |row| row.get(3),
+            )
+            .unwrap();
+        let normalized = detail.to_ascii_lowercase().replace(' ', "");
+        assert!(
+            normalized.contains("uid<?"),
+            "unexpected query plan: {detail}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn page_reads_do_not_touch_encrypted_rows_outside_the_requested_window() {
         let root = temporary_root("bounded-decryption");
         let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
@@ -2315,6 +2996,86 @@ mod tests {
         assert_eq!(mailbox.messages.len(), 12);
         assert_eq!(mailbox.messages.first().unwrap().uid, 12);
         assert_eq!(mailbox.messages.last().unwrap().uid, 1);
+        assert_eq!(
+            load_mailbox_page(&root, "fixture-account", "INBOX", None, 5)
+                .unwrap()
+                .unwrap()
+                .total_cached,
+            12
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cached_message_counts_follow_insert_trim_move_and_remove_transactions() {
+        let root = temporary_root("transactional-counts");
+        save_mailbox(
+            &root,
+            "fixture-account",
+            &CachedMailbox::empty("fixture-account", "INBOX"),
+        )
+        .unwrap();
+        save_message(&root, "fixture-account", &fixture_message(1)).unwrap();
+        save_message(&root, "fixture-account", &fixture_message(1)).unwrap();
+        assert_eq!(
+            load_mailbox_page(&root, "fixture-account", "INBOX", None, 10)
+                .unwrap()
+                .unwrap()
+                .total_cached,
+            1
+        );
+
+        merge_messages(
+            &root,
+            "fixture-account",
+            "INBOX",
+            None,
+            "fixture-merge",
+            &[fixture_message(2), fixture_message(3)],
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            load_mailbox_page(&root, "fixture-account", "INBOX", None, 10)
+                .unwrap()
+                .unwrap()
+                .total_cached,
+            2
+        );
+
+        assert!(move_message(
+            &root,
+            "fixture-account",
+            "INBOX",
+            3,
+            "Archive",
+            "fixture-move",
+            100,
+        )
+        .unwrap());
+        assert_eq!(
+            load_mailbox_page(&root, "fixture-account", "INBOX", None, 10)
+                .unwrap()
+                .unwrap()
+                .total_cached,
+            1
+        );
+        assert_eq!(
+            load_mailbox_page(&root, "fixture-account", "Archive", None, 10)
+                .unwrap()
+                .unwrap()
+                .total_cached,
+            1
+        );
+
+        remove_message(&root, "fixture-account", "INBOX", 2).unwrap();
+        assert_eq!(
+            load_mailbox_page(&root, "fixture-account", "INBOX", None, 10)
+                .unwrap()
+                .unwrap()
+                .total_cached,
+            0
+        );
         let _ = fs::remove_dir_all(root);
     }
 

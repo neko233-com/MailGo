@@ -2405,7 +2405,7 @@ fn handle_ipc(
                     .get("limit")
                     .and_then(Value::as_u64)
                     .and_then(|value| usize::try_from(value).ok())
-                    .unwrap_or(120)
+                    .unwrap_or(48)
                     .clamp(1, 500);
                 let page =
                     sync::load_mailbox_page(&cache_dir(), &account_id, &folder, before_uid, limit)?;

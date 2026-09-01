@@ -21,7 +21,7 @@ type VirtualMailItem =
   | { type: 'group'; key: string; label: string }
   | { type: 'thread'; key: string; thread: MailThread }
 const MAX_CUSTOM_CSS_LENGTH = 64 * 1024
-const INITIAL_MAILBOX_PAGE_SIZE = 120
+const INITIAL_MAILBOX_PAGE_SIZE = 48
 const EARLIER_MAILBOX_PAGE_SIZE = 50
 
 type MailboxPagingMeta = {
@@ -1300,17 +1300,19 @@ function App() {
       return
     }
     if (mail.unread) mapMailSources((item) => item.id === mail.id ? { ...item, unread: false } : item)
-    if (isNativeRuntime && !offlineMode && mail.nativeUid) {
-      void invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: false })
-        .then(() => refreshPendingOperations())
-        .catch((error) => {
-          markAccountNeedsReauth(mail.accountId, error)
-          mapMailSources((item) => item.id === mail.id ? { ...item, unread: true } : item)
-          setAccounts((current) => current.map((account) => account.id === mail.accountId
-            ? { ...account, unread: account.unread + 1 }
-            : account))
-          pushToast('邮件仍未标记为已读，请重新授权或稍后重试', 'error')
-        })
+    if (isNativeRuntime && mail.nativeUid) {
+      if (!offlineMode) {
+        void invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: false })
+          .then(() => refreshPendingOperations())
+          .catch((error) => {
+            markAccountNeedsReauth(mail.accountId, error)
+            mapMailSources((item) => item.id === mail.id ? { ...item, unread: true } : item)
+            setAccounts((current) => current.map((account) => account.id === mail.accountId
+              ? { ...account, unread: account.unread + 1 }
+              : account))
+            pushToast('邮件仍未标记为已读，请重新授权或稍后重试', 'error')
+          })
+      }
       setLoadingMessageId(mail.id)
       try {
         const result = await requestNativeMessage(mail)
@@ -1320,7 +1322,7 @@ function App() {
           mapMailSources((item) => item.id === mail.id ? converted : item)
         }
       } catch {
-        pushToast('邮件正文加载失败，仍可查看本地摘要', 'info')
+        pushToast(offlineMode ? '这封邮件的正文尚未缓存，关闭仅离线模式后可下载' : '邮件正文加载失败，仍可查看本地摘要', 'info')
       } finally {
         setLoadingMessageId((current) => current === mail.id ? null : current)
       }
@@ -1328,7 +1330,7 @@ function App() {
   }
 
   useEffect(() => {
-    if (!isNativeRuntime || offlineMode || selectedMail.nativeUid == null || selectedMail.id === 'empty-mail') return
+    if (!isNativeRuntime || selectedMail.nativeUid == null || selectedMail.id === 'empty-mail') return
     if (!(selectedMail.body.length === 1 && selectedMail.body[0] === '正在加载邮件正文…')) return
     const timer = window.setTimeout(() => {
       void requestNativeMessage(selectedMail).then((result) => {
