@@ -1136,6 +1136,7 @@ fn search_account_once(
         )?;
         messages.extend(folder_messages);
     }
+    crate::cache_db::spawn_search_indexer(cache_root.to_path_buf());
     session.logout().ok();
     messages.sort_by(|left, right| right.received_at.cmp(&left.received_at));
     Ok(SearchResult {
@@ -1223,6 +1224,7 @@ fn sync_account_once(
     }
 
     let folder_labels = folder_display_labels(&synced_folders);
+    crate::cache_db::spawn_search_indexer(cache_root.to_path_buf());
     if let Err(error) = crate::cache_db::refresh_backup(cache_root) {
         tracing::warn!(
             error = %error,
@@ -1791,6 +1793,7 @@ fn sync_folder_page_once(
     cached.oldest_uid = cached.messages.iter().map(|message| message.uid).min();
     cached.has_more = has_more;
     let path = save_mailbox(cache_root, account_id, &cached)?;
+    crate::cache_db::spawn_search_indexer(cache_root.to_path_buf());
     let unread = if folder.eq_ignore_ascii_case("INBOX") {
         cached
             .messages
@@ -2321,7 +2324,9 @@ pub fn save_cached_message(
     account_id: &str,
     message: &CachedMessage,
 ) -> Result<()> {
-    crate::cache_db::save_message(cache_root, account_id, message)
+    crate::cache_db::save_message(cache_root, account_id, message)?;
+    crate::cache_db::spawn_search_indexer(cache_root.to_path_buf());
+    Ok(())
 }
 
 fn save_search_messages(
@@ -2402,13 +2407,17 @@ fn update_cached_move_unlocked(
         &now_stamp(),
         MAX_CACHED_MESSAGES_PER_FOLDER,
     )?;
-    if moved || crate::cache_db::mailbox_exists(cache_root, account_id, folder)? {
+    if moved {
+        crate::cache_db::spawn_search_indexer(cache_root.to_path_buf());
+        return Ok(());
+    }
+    if crate::cache_db::mailbox_exists(cache_root, account_id, folder)? {
         return Ok(());
     }
     // A one-time legacy migration keeps optimistic move behavior compatible with pre-index
     // installations. Current indexed mailboxes never take this full-snapshot fallback.
     if load_mailbox_for_folder(cache_root, account_id, folder)?.is_some() {
-        let _ = crate::cache_db::move_message(
+        let moved = crate::cache_db::move_message(
             cache_root,
             account_id,
             folder,
@@ -2417,6 +2426,9 @@ fn update_cached_move_unlocked(
             &now_stamp(),
             MAX_CACHED_MESSAGES_PER_FOLDER,
         )?;
+        if moved {
+            crate::cache_db::spawn_search_indexer(cache_root.to_path_buf());
+        }
     }
     Ok(())
 }

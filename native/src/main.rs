@@ -2149,6 +2149,36 @@ fn handle_ipc(
                     "failed": failed,
                 }))
             }
+            "mail.search.local" => {
+                let query =
+                    bounded_string_field(&message.payload, "query", MAX_SEARCH_QUERY_BYTES)?;
+                let requested_account_id = optional_string_field(&message.payload, "accountId");
+                let limit = message
+                    .payload
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(MAX_SEARCH_RESULTS)
+                    .clamp(1, MAX_SEARCH_RESULTS);
+                let account_ids = if let Some(account_id) = requested_account_id {
+                    vec![account_for(shared, &account_id)?.id]
+                } else {
+                    shared
+                        .lock()
+                        .map_err(|_| anyhow!("state lock poisoned"))?
+                        .state
+                        .accounts
+                        .iter()
+                        .map(|account| account.id.clone())
+                        .collect::<Vec<_>>()
+                };
+                let result = cache_db::search_messages(&cache_dir(), &account_ids, &query, limit)?;
+                Ok(json!({
+                    "messages": result.messages,
+                    "truncated": result.truncated,
+                    "indexing": result.indexing,
+                }))
+            }
             "sync.all" => {
                 ensure_network_allowed(shared)?;
                 let accounts = shared
@@ -3425,6 +3455,7 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow!("state lock poisoned"))?
         .state
         .minimize_to_tray;
+    cache_db::spawn_search_indexer(cache_dir());
     sync::spawn_scheduler(shared_state.clone(), cache_dir());
     tray::start(minimize_to_tray);
     tracing::info!("MailGo desktop window ready; background synchronization scheduled");

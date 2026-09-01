@@ -1,11 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use hmac::{Hmac, KeyInit, Mac};
+use rand::RngCore;
 use rusqlite::ffi::ErrorCode;
+use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior, MAIN_DB};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,7 +21,18 @@ const DATABASE_FILE: &str = "mail-index-v1.sqlite3";
 const DATABASE_BACKUP_FILE: &str = "mail-index-v1.sqlite3.backup";
 const DATABASE_BACKUP_PREVIOUS_FILE: &str = "mail-index-v1.sqlite3.backup.previous";
 const DATABASE_BACKUP_PENDING_FILE: &str = "mail-index-v1.sqlite3.backup.pending";
-const DATABASE_SCHEMA_VERSION: i64 = 1;
+const SEARCH_KEY_FILE: &str = "search-index-key-v1.bin";
+const SEARCH_KEY_BYTES: usize = 32;
+const SEARCH_KEY_MAX_FILE_BYTES: usize = 4096;
+const SEARCH_INDEX_VERSION: i64 = 1;
+const SEARCH_INDEX_BATCH_SIZE: usize = 96;
+const SEARCH_INDEX_FOREGROUND_BATCH_SIZE: usize = 24;
+const MAX_SEARCH_INDEX_CHARACTERS: usize = 16 * 1024;
+const MAX_SEARCH_WORD_CHARACTERS: usize = 256;
+const MAX_SEARCH_TERMS_PER_MESSAGE: usize = 512;
+const MAX_SEARCH_QUERY_TERMS: usize = 32;
+const MAX_LOCAL_SEARCH_CANDIDATES: usize = 2000;
+const DATABASE_SCHEMA_VERSION: i64 = 2;
 const MAX_PAGE_SIZE: usize = 500;
 const MAX_ENCRYPTED_ROW_BYTES: usize = 8 * 1024 * 1024;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -24,6 +40,19 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 static INITIALIZED_DATABASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 static DATABASE_ACCESS: OnceLock<RwLock<()>> = OnceLock::new();
 static BACKUP_ACCESS: OnceLock<Mutex<()>> = OnceLock::new();
+static SEARCH_KEYS: OnceLock<Mutex<HashMap<PathBuf, [u8; SEARCH_KEY_BYTES]>>> = OnceLock::new();
+static SEARCH_INDEX_RUNNING: AtomicBool = AtomicBool::new(false);
+static SEARCH_INDEX_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+type HmacSha256 = Hmac<Sha256>;
+
+struct SearchIndexerRun;
+
+impl Drop for SearchIndexerRun {
+    fn drop(&mut self) {
+        SEARCH_INDEX_RUNNING.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,12 +107,29 @@ pub struct MailboxPage {
     pub revision: u64,
 }
 
+#[derive(Debug)]
+pub struct LocalSearchResult {
+    pub messages: Vec<CachedMessage>,
+    pub truncated: bool,
+    pub indexing: bool,
+}
+
+#[derive(Debug)]
+pub struct SearchIndexProgress {
+    pub indexed: usize,
+    pub has_more: bool,
+}
+
 pub fn database_path(cache_root: &Path) -> PathBuf {
     cache_root.join(DATABASE_FILE)
 }
 
 fn backup_path(cache_root: &Path) -> PathBuf {
     cache_root.join(DATABASE_BACKUP_FILE)
+}
+
+fn search_key_path(cache_root: &Path) -> PathBuf {
+    cache_root.join(SEARCH_KEY_FILE)
 }
 
 fn identity_key(value: &str) -> [u8; 32] {
@@ -107,6 +153,203 @@ fn now_epoch_millis() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+fn write_protected_search_key(path: &Path, key: &[u8; SEARCH_KEY_BYTES]) -> Result<()> {
+    let encrypted = crate::sync::protect_cache(key).context("protect local search index key")?;
+    if encrypted.len() > SEARCH_KEY_MAX_FILE_BYTES {
+        return Err(anyhow!("protected local search index key is too large"));
+    }
+    let pending = path.with_extension("bin.pending");
+    remove_file_if_exists(&pending)?;
+    fs::write(&pending, encrypted)
+        .with_context(|| format!("write local search index key {}", pending.display()))?;
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&pending)
+        .with_context(|| format!("open local search index key {}", pending.display()))?
+        .sync_all()
+        .with_context(|| format!("flush local search index key {}", pending.display()))?;
+    fs::rename(&pending, path)
+        .with_context(|| format!("commit local search index key {}", path.display()))?;
+    Ok(())
+}
+
+fn generate_search_key(path: &Path) -> Result<[u8; SEARCH_KEY_BYTES]> {
+    let mut generated = [0u8; SEARCH_KEY_BYTES];
+    rand::thread_rng().fill_bytes(&mut generated);
+    write_protected_search_key(path, &generated)?;
+    Ok(generated)
+}
+
+fn quarantine_invalid_search_key(path: &Path) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("local search index key has no parent directory"))?;
+    let stamp = format!("{}-{}", now_epoch_millis(), std::process::id());
+    let mut target = parent.join(format!("{SEARCH_KEY_FILE}.invalid-{stamp}"));
+    for sequence in 1..=100u8 {
+        if !target.exists() {
+            break;
+        }
+        target = parent.join(format!("{SEARCH_KEY_FILE}.invalid-{stamp}-{sequence}"));
+    }
+    if target.exists() {
+        return Err(anyhow!("too many invalid local search index key files"));
+    }
+    fs::rename(path, &target).context("quarantine invalid local search index key")?;
+    Ok(target)
+}
+
+fn load_search_key(cache_root: &Path) -> Result<[u8; SEARCH_KEY_BYTES]> {
+    fs::create_dir_all(cache_root)
+        .with_context(|| format!("create mail cache directory {}", cache_root.display()))?;
+    let path = search_key_path(cache_root);
+    let keys = SEARCH_KEYS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut keys = keys
+        .lock()
+        .map_err(|_| anyhow!("local search index key lock poisoned"))?;
+    if let Some(key) = keys.get(&path) {
+        return Ok(*key);
+    }
+    let key = match fs::read(&path) {
+        Ok(encrypted) => match (|| -> Result<[u8; SEARCH_KEY_BYTES]> {
+            if encrypted.len() > SEARCH_KEY_MAX_FILE_BYTES {
+                return Err(anyhow!("protected local search index key is too large"));
+            }
+            let decoded = crate::sync::unprotect_cache(&encrypted)
+                .context("unprotect local search index key")?;
+            decoded
+                .try_into()
+                .map_err(|_| anyhow!("local search index key has an invalid length"))
+        })() {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                quarantine_invalid_search_key(&path)?;
+                tracing::warn!(error = %error, "replaced an unreadable local search index key");
+                generate_search_key(&path)?
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => generate_search_key(&path)?,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read local search index key {}", path.display()))
+        }
+    };
+    keys.insert(path, key);
+    Ok(key)
+}
+
+fn normalize_search_words<'a>(fields: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut characters = 0usize;
+    for field in fields {
+        for character in field.chars() {
+            if characters >= MAX_SEARCH_INDEX_CHARACTERS {
+                break;
+            }
+            characters += 1;
+            if character.is_alphanumeric() || matches!(character, '@' | '.' | '_' | '+' | '-') {
+                if current.chars().count() < MAX_SEARCH_WORD_CHARACTERS {
+                    current.extend(character.to_lowercase());
+                }
+            } else if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        if characters >= MAX_SEARCH_INDEX_CHARACTERS {
+            break;
+        }
+    }
+    words
+}
+
+fn message_search_words(message: &CachedMessage) -> Vec<String> {
+    normalize_search_words(
+        [
+            message.subject.as_str(),
+            message.sender_name.as_str(),
+            message.sender_email.as_str(),
+        ]
+        .into_iter()
+        .chain(message.to.iter().map(String::as_str))
+        .chain(message.cc.iter().map(String::as_str))
+        .chain([message.preview.as_str(), message.text_body.as_str()]),
+    )
+}
+
+fn query_search_words(query: &str) -> Vec<String> {
+    normalize_search_words([query])
+}
+
+fn search_grams(words: &[String], query: bool, limit: usize) -> Vec<String> {
+    let mut grams = Vec::new();
+    let mut seen = HashSet::new();
+    for word in words {
+        let characters = word
+            .chars()
+            .take(MAX_SEARCH_WORD_CHARACTERS)
+            .collect::<Vec<_>>();
+        let widths: &[usize] = if query {
+            if characters.len() >= 3 {
+                &[3]
+            } else if characters.len() == 2 {
+                &[2]
+            } else {
+                &[]
+            }
+        } else {
+            &[2, 3]
+        };
+        for width in widths {
+            if characters.len() < *width {
+                continue;
+            }
+            for window in characters.windows(*width) {
+                let gram = format!("{width}:{}", window.iter().collect::<String>());
+                if seen.insert(gram.clone()) {
+                    grams.push(gram);
+                    if grams.len() >= limit {
+                        return grams;
+                    }
+                }
+            }
+        }
+    }
+    grams
+}
+
+fn blind_search_term(key: &[u8; SEARCH_KEY_BYTES], gram: &str) -> Result<[u8; 32]> {
+    let mut mac = HmacSha256::new_from_slice(key).context("initialize local search HMAC")?;
+    mac.update(b"mailgo-search-v1\0");
+    mac.update(gram.as_bytes());
+    Ok(mac.finalize().into_bytes().into())
+}
+
+fn message_search_terms(
+    key: &[u8; SEARCH_KEY_BYTES],
+    message: &CachedMessage,
+) -> Result<Vec<[u8; 32]>> {
+    search_grams(
+        &message_search_words(message),
+        false,
+        MAX_SEARCH_TERMS_PER_MESSAGE,
+    )
+    .iter()
+    .map(|gram| blind_search_term(key, gram))
+    .collect()
+}
+
+fn query_search_terms(key: &[u8; SEARCH_KEY_BYTES], words: &[String]) -> Result<Vec<[u8; 32]>> {
+    search_grams(words, true, MAX_SEARCH_QUERY_TERMS)
+        .iter()
+        .map(|gram| blind_search_term(key, gram))
+        .collect()
 }
 
 fn open(cache_root: &Path) -> Result<Connection> {
@@ -481,6 +724,7 @@ fn initialize(connection: &mut Connection) -> Result<()> {
             uid INTEGER NOT NULL CHECK (uid > 0 AND uid <= 4294967295),
             payload_hash BLOB NOT NULL,
             payload BLOB NOT NULL,
+            search_version INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL,
             PRIMARY KEY (account_key, folder_key, uid),
             FOREIGN KEY (account_key, folder_key)
@@ -495,6 +739,42 @@ fn initialize(connection: &mut Connection) -> Result<()> {
             "indexed mail cache was created by a newer MailGo version"
         ));
     }
+    let has_search_version = {
+        let mut statement = connection.prepare("PRAGMA table_info(messages)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        let mut found = false;
+        for column in columns {
+            if column?.eq_ignore_ascii_case("search_version") {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !has_search_version {
+        connection.execute(
+            "ALTER TABLE messages ADD COLUMN search_version INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS message_search_terms (
+            term BLOB NOT NULL,
+            account_key BLOB NOT NULL,
+            folder_key BLOB NOT NULL,
+            uid INTEGER NOT NULL,
+            PRIMARY KEY (term, account_key, folder_key, uid),
+            FOREIGN KEY (account_key, folder_key, uid)
+                REFERENCES messages(account_key, folder_key, uid) ON DELETE CASCADE
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS message_search_terms_owner
+            ON message_search_terms(account_key, folder_key, uid);
+        CREATE TABLE IF NOT EXISTS search_index_meta (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            key_fingerprint BLOB NOT NULL,
+            index_version INTEGER NOT NULL
+        );",
+    )?;
     connection.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
     Ok(())
 }
@@ -563,6 +843,380 @@ fn decrypt_message(
     }
     crate::mail::bound_cached_message(&mut message);
     Ok(message)
+}
+
+fn search_key_fingerprint(key: &[u8; SEARCH_KEY_BYTES]) -> [u8; 32] {
+    Sha256::digest(key).into()
+}
+
+fn ensure_search_key_state(
+    connection: &mut Connection,
+    key: &[u8; SEARCH_KEY_BYTES],
+) -> Result<()> {
+    let fingerprint = search_key_fingerprint(key);
+    let stored = connection
+        .query_row(
+            "SELECT key_fingerprint, index_version FROM search_index_meta WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    if stored
+        .as_ref()
+        .is_some_and(|(stored_fingerprint, version)| {
+            stored_fingerprint.as_slice() == fingerprint && *version == SEARCH_INDEX_VERSION
+        })
+    {
+        return Ok(());
+    }
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute("DELETE FROM message_search_terms", [])?;
+    transaction.execute(
+        "UPDATE messages SET search_version = 0 WHERE search_version != 0",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT INTO search_index_meta(id, key_fingerprint, index_version)
+         VALUES (1, ?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET
+           key_fingerprint = excluded.key_fingerprint,
+           index_version = excluded.index_version",
+        params![fingerprint, SEARCH_INDEX_VERSION],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn replace_message_search_terms(
+    connection: &Connection,
+    account_key: &[u8],
+    folder_key: &[u8],
+    uid: i64,
+    terms: &[[u8; 32]],
+) -> Result<()> {
+    connection.execute(
+        "DELETE FROM message_search_terms
+         WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3",
+        params![account_key, folder_key, uid],
+    )?;
+    {
+        let mut insert = connection.prepare(
+            "INSERT OR IGNORE INTO message_search_terms(term, account_key, folder_key, uid)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for term in terms {
+            insert.execute(params![term, account_key, folder_key, uid])?;
+        }
+    }
+    connection.execute(
+        "UPDATE messages SET search_version = ?4
+         WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3",
+        params![account_key, folder_key, uid, SEARCH_INDEX_VERSION],
+    )?;
+    Ok(())
+}
+
+pub fn rebuild_search_index_batch(
+    cache_root: &Path,
+    batch_size: usize,
+) -> Result<SearchIndexProgress> {
+    let key = load_search_key(cache_root)?;
+    with_recovery(cache_root, |connection| {
+        ensure_search_key_state(connection, &key)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let encrypted_rows = {
+            let mut statement = transaction.prepare(
+                "SELECT account_key, folder_key, uid, payload
+                 FROM messages
+                 WHERE search_version != ?1
+                 ORDER BY updated_at DESC
+                 LIMIT ?2",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    SEARCH_INDEX_VERSION,
+                    batch_size.clamp(1, SEARCH_INDEX_BATCH_SIZE) as i64
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )?;
+            let mut values = Vec::new();
+            for row in rows {
+                values.push(row?);
+            }
+            values
+        };
+
+        for (account_key, folder_key, uid, payload) in &encrypted_rows {
+            let terms =
+                decrypt_json::<CachedMessage>(payload, "message").and_then(|mut message| {
+                    crate::mail::bound_cached_message(&mut message);
+                    if identity_key(&message.account_id).as_slice() != account_key
+                        || folder_identity_key(&message.account_id, &message.folder).as_slice()
+                            != folder_key
+                        || i64::from(message.uid) != *uid
+                    {
+                        return Err(anyhow!("indexed message cache identity mismatch"));
+                    }
+                    message_search_terms(&key, &message)
+                });
+            match terms {
+                Ok(terms) => replace_message_search_terms(
+                    &transaction,
+                    account_key,
+                    folder_key,
+                    *uid,
+                    &terms,
+                )?,
+                Err(error) => {
+                    // Search is a secondary index. Mark one unreadable row complete with no terms
+                    // so it cannot stall every later batch or prevent healthy mail from being found.
+                    tracing::warn!(error = %error, "skipped one unreadable message while rebuilding local search");
+                    replace_message_search_terms(&transaction, account_key, folder_key, *uid, &[])?;
+                }
+            }
+        }
+        let has_more: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE search_version != ?1 LIMIT 1)",
+            params![SEARCH_INDEX_VERSION],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        Ok(SearchIndexProgress {
+            indexed: encrypted_rows.len(),
+            has_more,
+        })
+    })
+}
+
+pub fn spawn_search_indexer(cache_root: PathBuf) {
+    if SEARCH_INDEX_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        SEARCH_INDEX_REQUESTED.store(true, Ordering::Release);
+        return;
+    }
+    let restart_root = cache_root.clone();
+    let retry_root = cache_root.clone();
+    let spawn = thread::Builder::new()
+        .name("mailgo-local-search-index".to_string())
+        .spawn(move || {
+            {
+                let _run = SearchIndexerRun;
+                loop {
+                    match rebuild_search_index_batch(&cache_root, SEARCH_INDEX_BATCH_SIZE) {
+                        Ok(progress) if progress.has_more && progress.indexed > 0 => {
+                            thread::yield_now()
+                        }
+                        Ok(progress) if progress.has_more => {
+                            tracing::warn!("local search index made no progress");
+                            break;
+                        }
+                        Ok(_) => break,
+                        Err(error) => {
+                            tracing::warn!(error = %error, "local search index update paused");
+                            break;
+                        }
+                    }
+                }
+            }
+            if SEARCH_INDEX_REQUESTED.swap(false, Ordering::AcqRel) {
+                spawn_search_indexer(restart_root);
+            }
+        });
+    if let Err(error) = spawn {
+        SEARCH_INDEX_RUNNING.store(false, Ordering::Release);
+        tracing::warn!(error = %error, "could not start local search index worker");
+        if SEARCH_INDEX_REQUESTED.swap(false, Ordering::AcqRel) {
+            spawn_search_indexer(retry_root);
+        }
+    }
+}
+
+fn search_match_score(message: &CachedMessage, query_words: &[String]) -> Option<u16> {
+    let all_match = |fields: &[&str]| {
+        let words = normalize_search_words(fields.iter().copied());
+        query_words
+            .iter()
+            .all(|query| words.iter().any(|word| word.contains(query)))
+    };
+    let mut score = 0u16;
+    if all_match(&[&message.subject]) {
+        score += 100;
+    }
+    if all_match(&[&message.sender_name, &message.sender_email]) {
+        score += 60;
+    }
+    let recipients = message
+        .to
+        .iter()
+        .chain(message.cc.iter())
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if !recipients.is_empty() && all_match(&recipients) {
+        score += 30;
+    }
+    if all_match(&[&message.preview]) {
+        score += 20;
+    }
+    if all_match(&[&message.text_body]) {
+        score += 10;
+    }
+    let every_field = message_search_words(message);
+    if !query_words
+        .iter()
+        .all(|query| every_field.iter().any(|word| word.contains(query)))
+    {
+        return None;
+    }
+    Some(score.max(1))
+}
+
+pub fn search_messages(
+    cache_root: &Path,
+    account_ids: &[String],
+    query: &str,
+    limit: usize,
+) -> Result<LocalSearchResult> {
+    let query_words = query_search_words(query);
+    if account_ids.is_empty() || query_words.is_empty() {
+        return Ok(LocalSearchResult {
+            messages: Vec::new(),
+            truncated: false,
+            indexing: false,
+        });
+    }
+    let key = load_search_key(cache_root)?;
+    let progress = if SEARCH_INDEX_RUNNING.load(Ordering::Acquire) {
+        SearchIndexProgress {
+            indexed: 0,
+            has_more: true,
+        }
+    } else {
+        rebuild_search_index_batch(cache_root, SEARCH_INDEX_FOREGROUND_BATCH_SIZE)?
+    };
+    let query_terms = query_search_terms(&key, &query_words)?;
+    if query_terms.is_empty() {
+        return Ok(LocalSearchResult {
+            messages: Vec::new(),
+            truncated: false,
+            indexing: progress.has_more,
+        });
+    }
+
+    let account_directory = account_ids
+        .iter()
+        .map(|account_id| (identity_key(account_id), account_id.as_str()))
+        .collect::<HashMap<_, _>>();
+    let bounded_limit = limit.clamp(1, MAX_PAGE_SIZE);
+    let mut result = with_recovery(cache_root, |connection| {
+        ensure_search_key_state(connection, &key)?;
+        let term_placeholders = (1..=query_terms.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let account_offset = query_terms.len();
+        let account_placeholders = (1..=account_directory.len())
+            .map(|index| format!("?{}", account_offset + index))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let count_parameter = account_offset + account_directory.len() + 1;
+        let limit_parameter = count_parameter + 1;
+        let sql = format!(
+            "SELECT messages.account_key, messages.folder_key, messages.uid, messages.payload
+             FROM messages
+             INNER JOIN (
+               SELECT account_key, folder_key, uid
+               FROM message_search_terms
+               WHERE term IN ({term_placeholders})
+                 AND account_key IN ({account_placeholders})
+               GROUP BY account_key, folder_key, uid
+               HAVING COUNT(DISTINCT term) = ?{count_parameter}
+               LIMIT ?{limit_parameter}
+             ) AS candidates
+             ON candidates.account_key = messages.account_key
+               AND candidates.folder_key = messages.folder_key
+               AND candidates.uid = messages.uid
+             ORDER BY messages.updated_at DESC"
+        );
+        let mut parameters = query_terms
+            .iter()
+            .map(|term| SqlValue::Blob(term.to_vec()))
+            .collect::<Vec<_>>();
+        parameters.extend(
+            account_directory
+                .keys()
+                .map(|account_key| SqlValue::Blob(account_key.to_vec())),
+        );
+        parameters.push(SqlValue::Integer(query_terms.len() as i64));
+        parameters.push(SqlValue::Integer((MAX_LOCAL_SEARCH_CANDIDATES + 1) as i64));
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?;
+        let mut ranked = Vec::new();
+        let mut candidate_count = 0usize;
+        for row in rows {
+            candidate_count += 1;
+            if candidate_count > MAX_LOCAL_SEARCH_CANDIDATES {
+                break;
+            }
+            let (stored_account_key, stored_folder_key, uid, payload) = row?;
+            let Ok(account_key) = <[u8; 32]>::try_from(stored_account_key.as_slice()) else {
+                continue;
+            };
+            let Some(account_id) = account_directory.get(&account_key) else {
+                continue;
+            };
+            let Ok(mut message) = decrypt_json::<CachedMessage>(&payload, "search candidate")
+            else {
+                continue;
+            };
+            crate::mail::bound_cached_message(&mut message);
+            if message.account_id != **account_id
+                || folder_identity_key(&message.account_id, &message.folder).as_slice()
+                    != stored_folder_key
+                || i64::from(message.uid) != uid
+            {
+                continue;
+            }
+            if let Some(score) = search_match_score(&message, &query_words) {
+                ranked.push((score, message));
+            }
+        }
+        ranked.sort_by(|(left_score, left), (right_score, right)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| right.received_at.cmp(&left.received_at))
+                .then_with(|| right.uid.cmp(&left.uid))
+        });
+        let truncated =
+            candidate_count > MAX_LOCAL_SEARCH_CANDIDATES || ranked.len() > bounded_limit;
+        ranked.truncate(bounded_limit);
+        Ok(LocalSearchResult {
+            messages: ranked.into_iter().map(|(_, message)| message).collect(),
+            truncated,
+            indexing: progress.has_more,
+        })
+    })?;
+    if result.indexing {
+        spawn_search_indexer(cache_root.to_path_buf());
+    }
+    result.indexing |= SEARCH_INDEX_RUNNING.load(Ordering::Acquire);
+    Ok(result)
 }
 
 pub fn load_mailbox(
@@ -742,11 +1396,12 @@ pub fn save_mailbox(
         }
         {
             let mut upsert = transaction.prepare(
-                "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, search_version, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
                  ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
                    payload_hash = excluded.payload_hash,
                    payload = excluded.payload,
+                   search_version = 0,
                    updated_at = excluded.updated_at",
             )?;
             for message in &mailbox.messages {
@@ -819,11 +1474,12 @@ pub fn save_message(cache_root: &Path, account_id: &str, message: &CachedMessage
         )?;
         let (payload, digest) = encrypt_json(message)?;
         transaction.execute(
-            "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, search_version, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
              ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
                payload_hash = excluded.payload_hash,
                payload = excluded.payload,
+               search_version = 0,
                updated_at = excluded.updated_at",
             params![
                 account_key,
@@ -901,11 +1557,12 @@ pub fn merge_messages(
         }
         {
             let mut upsert = transaction.prepare(
-                "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, search_version, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
                  ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
                    payload_hash = excluded.payload_hash,
                    payload = excluded.payload,
+                   search_version = 0,
                    updated_at = excluded.updated_at
                  WHERE messages.payload_hash != excluded.payload_hash",
             )?;
@@ -1019,11 +1676,12 @@ pub fn move_message(
             params![account_key, source_folder_key, i64::from(uid)],
         )?;
         transaction.execute(
-            "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, search_version, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
              ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
                payload_hash = excluded.payload_hash,
                payload = excluded.payload,
+               search_version = 0,
                updated_at = excluded.updated_at",
             params![
                 account_key,
@@ -1247,6 +1905,295 @@ mod tests {
             )
             .unwrap();
         count as usize
+    }
+
+    fn index_every_message(root: &Path) {
+        loop {
+            let progress = rebuild_search_index_batch(root, SEARCH_INDEX_BATCH_SIZE).unwrap();
+            if !progress.has_more {
+                break;
+            }
+            assert!(progress.indexed > 0);
+        }
+    }
+
+    fn stored_search_terms(root: &Path) -> Vec<Vec<u8>> {
+        let connection = open(root).unwrap();
+        let mut statement = connection
+            .prepare("SELECT term FROM message_search_terms ORDER BY term")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    #[test]
+    fn migrates_schema_one_to_the_blind_search_schema() {
+        let root = temporary_root("search-migration");
+        fs::create_dir_all(&root).unwrap();
+        let connection = Connection::open(database_path(&root)).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE mailbox_meta (
+                    account_key BLOB NOT NULL,
+                    folder_key BLOB NOT NULL,
+                    payload BLOB NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (account_key, folder_key)
+                 ) WITHOUT ROWID;
+                 CREATE TABLE messages (
+                    account_key BLOB NOT NULL,
+                    folder_key BLOB NOT NULL,
+                    uid INTEGER NOT NULL,
+                    payload_hash BLOB NOT NULL,
+                    payload BLOB NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (account_key, folder_key, uid),
+                    FOREIGN KEY (account_key, folder_key)
+                        REFERENCES mailbox_meta(account_key, folder_key) ON DELETE CASCADE
+                 ) WITHOUT ROWID;
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let connection = open(&root).unwrap();
+        let schema_version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let search_column: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'search_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let search_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('message_search_terms', 'search_index_meta')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, DATABASE_SCHEMA_VERSION);
+        assert_eq!(search_column, 1);
+        assert_eq!(search_tables, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn blind_terms_are_bounded_deterministic_and_keyed() {
+        let mut message = fixture_message(1);
+        let varied = (0..2_000)
+            .filter_map(|offset| char::from_u32(0x4e00 + offset))
+            .collect::<String>();
+        message.subject = varied.clone();
+        let first_key = [7u8; SEARCH_KEY_BYTES];
+        let second_key = [9u8; SEARCH_KEY_BYTES];
+        let first = message_search_terms(&first_key, &message).unwrap();
+        let repeated = message_search_terms(&first_key, &message).unwrap();
+        let rotated = message_search_terms(&second_key, &message).unwrap();
+        let query = query_search_terms(&first_key, &query_search_words(&varied)).unwrap();
+        assert_eq!(first, repeated);
+        assert_ne!(first, rotated);
+        assert_eq!(first.len(), MAX_SEARCH_TERMS_PER_MESSAGE);
+        assert_eq!(query.len(), MAX_SEARCH_QUERY_TERMS);
+    }
+
+    #[test]
+    fn full_cache_search_finds_rows_outside_the_first_renderer_page() {
+        let root = temporary_root("full-cache-search");
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = (1..=80).map(fixture_message).collect();
+        mailbox.messages[0].subject = "archivedneedletoken planning".into();
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        let first_page = load_mailbox_page(&root, "fixture-account", "INBOX", None, 10)
+            .unwrap()
+            .unwrap();
+        assert!(!first_page
+            .mailbox
+            .messages
+            .iter()
+            .any(|message| message.uid == 1));
+        index_every_message(&root);
+
+        let result = search_messages(
+            &root,
+            &["fixture-account".into()],
+            "archivedneedletoken",
+            10,
+        )
+        .unwrap();
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].uid, 1);
+        assert!(!result.indexing);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_search_is_account_scoped_and_can_match_cached_body_text() {
+        let root = temporary_root("search-scope-body");
+        let mut first = fixture_message(1);
+        first.text_body = "bodyonlyneedletoken".into();
+        let mut first_mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        first_mailbox.messages = vec![first];
+        save_mailbox(&root, "fixture-account", &first_mailbox).unwrap();
+
+        let mut second = fixture_message(2);
+        second.id = "second:2".into();
+        second.account_id = "second-account".into();
+        second.text_body = "bodyonlyneedletoken".into();
+        let mut second_mailbox = CachedMailbox::empty("second-account", "INBOX");
+        second_mailbox.messages = vec![second];
+        save_mailbox(&root, "second-account", &second_mailbox).unwrap();
+        index_every_message(&root);
+
+        let result =
+            search_messages(&root, &["second-account".into()], "bodyonlyneedletoken", 10).unwrap();
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].account_id, "second-account");
+        assert_eq!(result.messages[0].uid, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn blind_index_and_protected_key_never_store_search_plaintext() {
+        let root = temporary_root("search-privacy");
+        let plaintext = "mailgoprivacycanarytoken";
+        let mut message = fixture_message(5);
+        message.subject = plaintext.into();
+        message.text_body = format!("cached body {plaintext}");
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = vec![message];
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        index_every_message(&root);
+        let connection = open(&root).unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        drop(connection);
+
+        for entry in fs::read_dir(&root).unwrap().flatten() {
+            if !entry.file_type().unwrap().is_file() {
+                continue;
+            }
+            let bytes = fs::read(entry.path()).unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains(plaintext));
+        }
+        let result = search_messages(&root, &["fixture-account".into()], plaintext, 10).unwrap();
+        assert_eq!(result.messages.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn one_corrupt_message_does_not_stall_search_index_rebuild() {
+        let root = temporary_root("search-corrupt-row");
+        let mut healthy = fixture_message(500);
+        healthy.subject = "healthysearchneedle".into();
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = vec![healthy];
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        insert_corrupt_rows(&root, "INBOX", 1, 1);
+        index_every_message(&root);
+
+        let connection = open(&root).unwrap();
+        let incomplete: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE search_version != ?1",
+                params![SEARCH_INDEX_VERSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(incomplete, 0);
+        drop(connection);
+        let result = search_messages(
+            &root,
+            &["fixture-account".into()],
+            "healthysearchneedle",
+            10,
+        )
+        .unwrap();
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].uid, 500);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rotating_the_protected_search_key_rebuilds_every_blind_term() {
+        let root = temporary_root("search-key-rotation");
+        let mut message = fixture_message(7);
+        message.subject = "rotationsearchneedle".into();
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = vec![message];
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        index_every_message(&root);
+        let original_terms = stored_search_terms(&root);
+        assert!(!original_terms.is_empty());
+
+        let key_path = search_key_path(&root);
+        fs::remove_file(&key_path).unwrap();
+        write_protected_search_key(&key_path, &[29u8; SEARCH_KEY_BYTES]).unwrap();
+        SEARCH_KEYS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .remove(&key_path);
+        index_every_message(&root);
+        let rotated_terms = stored_search_terms(&root);
+        assert_ne!(original_terms, rotated_terms);
+        let result = search_messages(
+            &root,
+            &["fixture-account".into()],
+            "rotationsearchneedle",
+            10,
+        )
+        .unwrap();
+        assert_eq!(result.messages.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unreadable_search_key_is_quarantined_and_rebuilt_without_losing_mail() {
+        let root = temporary_root("invalid-search-key");
+        let mut message = fixture_message(8);
+        message.subject = "recoveredsearchneedle".into();
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = vec![message];
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        index_every_message(&root);
+
+        let key_path = search_key_path(&root);
+        fs::write(&key_path, b"not a protected search key").unwrap();
+        SEARCH_KEYS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .remove(&key_path);
+        index_every_message(&root);
+
+        assert!(fs::read_dir(&root).unwrap().flatten().any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("search-index-key-v1.bin.invalid-")));
+        let result = search_messages(
+            &root,
+            &["fixture-account".into()],
+            "recoveredsearchneedle",
+            10,
+        )
+        .unwrap();
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(
+            load_message(&root, "fixture-account", "INBOX", 8)
+                .unwrap()
+                .unwrap()
+                .uid,
+            8
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

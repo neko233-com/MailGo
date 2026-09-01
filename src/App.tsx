@@ -1,6 +1,6 @@
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import appIconUrl from '../resources/icons/mailgo-64.png'
 import { Icon, type IconName } from './components/Icon'
 import { buildComposeThreadHeaders, type ComposeMode } from './compose-thread'
@@ -8,7 +8,7 @@ import { sanitizeCustomCss } from './customCss'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
 import { invoke, readNativeState } from './lib/ipc'
 import { buildMailThreads, type MailThread } from './threading'
-import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeDraft, NativeMailboxResponse, NativeMessageResponse, NativeOutboxStatus, NativeQueueStatus, NativeSearchResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
+import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeDraft, NativeLocalSearchResponse, NativeMailboxResponse, NativeMessageResponse, NativeOutboxStatus, NativeQueueStatus, NativeSearchResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 type ToastTone = 'info' | 'success' | 'error'
 type Toast = { id: number; message: string; tone: ToastTone }
@@ -486,6 +486,9 @@ function App() {
   const [theme, setTheme] = useState<ThemeMode>(loadTheme)
   const [accounts, setAccounts] = useState<MailAccount[]>(() => isNativeRuntime ? [] : sampleAccounts)
   const [mails, setMails] = useState<MailMessage[]>(() => isNativeRuntime ? [] : sampleMails.map((mail) => ({ ...mail, body: [...mail.body], attachments: mail.attachments?.map((attachment) => ({ ...attachment })) })))
+  const [localSearchMails, setLocalSearchMails] = useState<MailMessage[]>([])
+  const [localSearchState, setLocalSearchState] = useState<'idle' | 'searching' | 'indexing' | 'ready' | 'error'>('idle')
+  const [localSearchTruncated, setLocalSearchTruncated] = useState(false)
   const [serverSearchMails, setServerSearchMails] = useState<MailMessage[]>([])
   const [serverSearchState, setServerSearchState] = useState<'idle' | 'searching' | 'ready' | 'error'>('idle')
   const [serverSearchTruncated, setServerSearchTruncated] = useState(false)
@@ -500,6 +503,7 @@ function App() {
   const [isSidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [isMobileAuthOpen, setMobileAuthOpen] = useState(false)
   const [query, setQuery] = useState('')
+  const deferredQuery = useDeferredValue(query)
   const [filterUnread, setFilterUnread] = useState(false)
   const [isComposeOpen, setComposeOpen] = useState(false)
   const [composeDraftId, setComposeDraftId] = useState<string | undefined>()
@@ -946,7 +950,63 @@ function App() {
   const searchAccountDirectory = useMemo(() => new Map(accounts.map((account) => [account.id, account])), [accountScopeKey])
 
   useEffect(() => {
-    const trimmedQuery = query.trim()
+    const trimmedQuery = deferredQuery.trim()
+    if (!isNativeRuntime || trimmedQuery.length < 2) {
+      setLocalSearchMails([])
+      setLocalSearchState('idle')
+      setLocalSearchTruncated(false)
+      return
+    }
+    if (!accountScopeKey) {
+      setLocalSearchMails([])
+      setLocalSearchState('ready')
+      setLocalSearchTruncated(false)
+      return
+    }
+    let cancelled = false
+    let timer: number | undefined
+    setLocalSearchMails([])
+    setLocalSearchState('searching')
+    setLocalSearchTruncated(false)
+
+    const searchLocalCache = () => {
+      void invoke<NativeLocalSearchResponse>('mail.search.local', {
+        query: trimmedQuery,
+        ...(selectedAccountId ? { accountId: selectedAccountId } : {}),
+        limit: 240,
+      }, 15_000).then((result) => {
+        if (cancelled) return
+        const nextMails = (result.messages ?? []).flatMap((message) => {
+          const account = searchAccountDirectory.get(message.accountId)
+          return account ? [nativeMessageToUi(message, account)] : []
+        })
+        startTransition(() => {
+          setLocalSearchMails(nextMails)
+          setLocalSearchTruncated(Boolean(result.truncated))
+          setLocalSearchState(result.indexing ? 'indexing' : 'ready')
+        })
+        if (result.indexing) {
+          timer = window.setTimeout(searchLocalCache, 260)
+        }
+      }).catch(() => {
+        if (cancelled) return
+        startTransition(() => {
+          setLocalSearchMails([])
+          setLocalSearchTruncated(false)
+          setLocalSearchState('error')
+        })
+      })
+    }
+
+    timer = window.setTimeout(searchLocalCache, 80)
+    return () => {
+      cancelled = true
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [accountScopeKey, deferredQuery, isNativeRuntime, searchAccountDirectory, selectedAccountId])
+
+  useEffect(() => {
+    const trimmedQuery = deferredQuery.trim()
     if (!isNativeRuntime || offlineMode || trimmedQuery.length < 2) {
       setServerSearchMails([])
       setServerSearchState(offlineMode && trimmedQuery.length >= 2 ? 'ready' : 'idle')
@@ -968,24 +1028,29 @@ function App() {
         limit: 240,
       }, 60_000).then((result) => {
         if (cancelled) return
-        setServerSearchMails((result.messages ?? []).flatMap((message) => {
+        const nextMails = (result.messages ?? []).flatMap((message) => {
           const account = searchAccountDirectory.get(message.accountId)
           return account ? [nativeMessageToUi(message, account)] : []
-        }))
-        setServerSearchTruncated(Boolean(result.truncated))
-        setServerSearchState(result.failed?.length && !result.messages?.length ? 'error' : 'ready')
+        })
+        startTransition(() => {
+          setServerSearchMails(nextMails)
+          setServerSearchTruncated(Boolean(result.truncated))
+          setServerSearchState(result.failed?.length && !result.messages?.length ? 'error' : 'ready')
+        })
       }).catch(() => {
         if (cancelled) return
-        setServerSearchMails([])
-        setServerSearchTruncated(false)
-        setServerSearchState('error')
+        startTransition(() => {
+          setServerSearchMails([])
+          setServerSearchTruncated(false)
+          setServerSearchState('error')
+        })
       })
     }, 420)
     return () => {
       cancelled = true
       window.clearTimeout(timer)
     }
-  }, [accountScopeKey, isNativeRuntime, offlineMode, query, searchAccountDirectory, selectedAccountId])
+  }, [accountScopeKey, deferredQuery, isNativeRuntime, offlineMode, searchAccountDirectory, selectedAccountId])
 
   useEffect(() => {
     const styleId = 'mailgo-user-theme'
@@ -1072,11 +1137,16 @@ function App() {
   }), [accounts, nativeDrafts])
   const allMails = useMemo(() => {
     const merged = new Map<string, MailMessage>()
+    for (const mail of localSearchMails) merged.set(mail.id, mail)
     for (const mail of serverSearchMails) merged.set(mail.id, mail)
     for (const mail of mails) merged.set(mail.id, mail)
     for (const mail of localDraftMails) merged.set(mail.id, mail)
     return [...merged.values()]
-  }, [localDraftMails, mails, serverSearchMails])
+  }, [localDraftMails, localSearchMails, mails, serverSearchMails])
+  const nativeSearchResultIds = useMemo(
+    () => new Set([...localSearchMails, ...serverSearchMails].map((mail) => mail.id)),
+    [localSearchMails, serverSearchMails],
+  )
   const displayedFolderLabels = useMemo(() => {
     if (!isNativeRuntime) return folderLabels
     const matchesFixedFolder = (mail: MailMessage, folder: FolderId) => {
@@ -1094,7 +1164,7 @@ function App() {
     }))
   }, [accounts, allMails, isNativeRuntime, nativeDrafts.length])
   const visibleMails = useMemo(() => {
-    const lowerQuery = query.trim().toLowerCase()
+    const lowerQuery = deferredQuery.trim().toLowerCase()
     return allMails.filter((mail) => {
       const nativeFolder = mail.nativeFolder
       const folderMatch = selectedNativeFolder
@@ -1113,10 +1183,12 @@ function App() {
         : mail.category === selectedCategory)
       const adMatch = !hideAds || !mail.isAd || Boolean(selectedCategory)
       const unreadMatch = !filterUnread || mail.unread
-      const queryMatch = !lowerQuery || `${mail.senderName} ${mail.subject} ${mail.preview}`.toLowerCase().includes(lowerQuery)
+      const queryMatch = !lowerQuery
+        || nativeSearchResultIds.has(mail.id)
+        || `${mail.senderName} ${mail.subject} ${mail.preview}`.toLowerCase().includes(lowerQuery)
       return folderMatch && accountMatch && categoryMatch && adMatch && unreadMatch && queryMatch
     })
-  }, [accounts, allMails, filterUnread, hideAds, query, selectedAccountId, selectedCategory, selectedFolder, selectedNativeFolder])
+  }, [accounts, allMails, deferredQuery, filterUnread, hideAds, nativeSearchResultIds, selectedAccountId, selectedCategory, selectedFolder, selectedNativeFolder])
 
   const visibleThreads = useMemo(() => buildMailThreads(visibleMails), [visibleMails])
 
@@ -2319,6 +2391,27 @@ function App() {
     setSidebarCollapsed((value) => !value)
   }
 
+  const searchIsBusy = query !== deferredQuery
+    || localSearchState === 'searching'
+    || localSearchState === 'indexing'
+    || (!offlineMode && serverSearchState === 'searching')
+  const searchStatusTone = localSearchState === 'error' && (offlineMode || serverSearchState === 'error')
+    ? 'error'
+    : searchIsBusy ? 'searching' : 'ready'
+  const searchStatusLabel = query !== deferredQuery || localSearchState === 'searching'
+    ? '本地搜索中…'
+    : localSearchState === 'indexing'
+      ? '本地索引加载中…'
+      : !offlineMode && serverSearchState === 'searching'
+        ? '本地已显示 · 云端加载中…'
+        : localSearchState === 'error' && (offlineMode || serverSearchState === 'error')
+          ? '搜索失败'
+          : serverSearchState === 'error'
+            ? '云端失败 · 本地结果'
+            : localSearchTruncated || serverSearchTruncated
+              ? '已显示部分结果'
+              : offlineMode ? '本地结果' : '本地 + 云端'
+
   return (
     <div className="app-shell">
       <style>{`.reicon { width: 1em; height: 1em; }`}</style>
@@ -2328,7 +2421,7 @@ function App() {
           <BrandMark /><span>MailGo</span>
         </div>
         <div className="titlebar-search" data-no-drag="true" onDoubleClick={(event) => event.stopPropagation()}>
-          <div className="search-wrap"><Icon name="search" size={19} /><input id="mail-search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索邮件" aria-label="搜索邮件" /><kbd>Ctrl K</kbd>{query.trim().length >= 2 && isNativeRuntime && <span className={`search-status search-${serverSearchState}`} aria-live="polite">{serverSearchState === 'searching' && <span className="loading-spinner loading-spinner-small" aria-hidden="true" />}{serverSearchState === 'searching' ? '服务端搜索中…' : serverSearchState === 'error' ? '服务端搜索失败，显示本地结果' : serverSearchTruncated ? '已显示部分结果' : '本地 + 服务端'}</span>}</div>
+          <div className="search-wrap"><Icon name="search" size={19} /><input id="mail-search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索邮件" aria-label="搜索邮件" /><kbd>Ctrl K</kbd>{query.trim().length >= 2 && isNativeRuntime && <span className={`search-status search-${searchStatusTone}`} aria-live="polite">{searchIsBusy && <span className="loading-spinner loading-spinner-small" aria-hidden="true" />}{searchStatusLabel}</span>}</div>
         </div>
         <div className="titlebar-utilities" data-no-drag="true">
           <button type="button" className={`sync-summary ${syncStatusTone}`} onClick={handleSync} aria-label={`${syncStatusLabel}，点击立即同步`}><span className="sync-summary-dot" />{syncStatusLabel}</button>
