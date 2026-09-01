@@ -39,6 +39,16 @@ mod windows_tray {
     static MINIMIZE_TO_TRAY: AtomicBool = AtomicBool::new(true);
     static ALLOW_CLOSE: AtomicBool = AtomicBool::new(false);
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TrayAction {
+        RestoreIcon,
+        ShowWindow,
+        ShowMenu,
+        Quit,
+        Ignore,
+        Default,
+    }
+
     pub fn start(minimize_to_tray: bool) {
         MINIMIZE_TO_TRAY.store(minimize_to_tray, Ordering::Relaxed);
         thread::Builder::new()
@@ -285,37 +295,60 @@ mod windows_tray {
         lparam: LPARAM,
     ) -> LRESULT {
         let taskbar_created = TASKBAR_CREATED.load(Ordering::Acquire);
-        if taskbar_created != 0 && message == taskbar_created {
-            let notification = tray_notification(hwnd);
-            if Shell_NotifyIconW(NIM_ADD, &notification) == 0 {
-                tracing::warn!("MailGo tray icon could not be restored after taskbar restart");
+        match tray_action(message, wparam, lparam, taskbar_created) {
+            TrayAction::RestoreIcon => {
+                let notification = tray_notification(hwnd);
+                if Shell_NotifyIconW(NIM_ADD, &notification) == 0 {
+                    tracing::warn!("MailGo tray icon could not be restored after taskbar restart");
+                }
+                0
             }
-            return 0;
+            TrayAction::ShowWindow => {
+                show_main_window();
+                0
+            }
+            TrayAction::ShowMenu => {
+                show_menu(hwnd);
+                0
+            }
+            TrayAction::Quit => {
+                ALLOW_CLOSE.store(true, Ordering::Relaxed);
+                let target = TARGET_WINDOW.load(Ordering::Relaxed) as HWND;
+                if target != 0 {
+                    PostMessageW(target, WM_CLOSE, 0, 0);
+                }
+                PostQuitMessage(0);
+                0
+            }
+            TrayAction::Ignore => 0,
+            TrayAction::Default => DefWindowProcW(hwnd, message, wparam, lparam),
+        }
+    }
+
+    fn tray_action(
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        taskbar_created: u32,
+    ) -> TrayAction {
+        if taskbar_created != 0 && message == taskbar_created {
+            return TrayAction::RestoreIcon;
         }
         if message == TRAY_CALLBACK {
-            match lparam as u32 {
-                WM_LBUTTONUP | WM_LBUTTONDBLCLK => show_main_window(),
-                WM_RBUTTONUP => show_menu(hwnd),
-                _ => {}
-            }
-            return 0;
+            return match lparam as u32 {
+                WM_LBUTTONUP | WM_LBUTTONDBLCLK => TrayAction::ShowWindow,
+                WM_RBUTTONUP => TrayAction::ShowMenu,
+                _ => TrayAction::Ignore,
+            };
         }
         if message == WM_COMMAND {
-            match wparam & 0xffff {
-                SHOW_COMMAND => show_main_window(),
-                QUIT_COMMAND => {
-                    ALLOW_CLOSE.store(true, Ordering::Relaxed);
-                    let target = TARGET_WINDOW.load(Ordering::Relaxed) as HWND;
-                    if target != 0 {
-                        PostMessageW(target, WM_CLOSE, 0, 0);
-                    }
-                    PostQuitMessage(0);
-                }
-                _ => {}
-            }
-            return 0;
+            return match wparam & 0xffff {
+                SHOW_COMMAND => TrayAction::ShowWindow,
+                QUIT_COMMAND => TrayAction::Quit,
+                _ => TrayAction::Ignore,
+            };
         }
-        DefWindowProcW(hwnd, message, wparam, lparam)
+        TrayAction::Default
     }
 
     unsafe fn show_main_window() {
@@ -351,6 +384,130 @@ mod windows_tray {
         SetForegroundWindow(hwnd);
         TrackPopupMenu(menu, TPM_RIGHTALIGN, point.x, point.y, 0, hwnd, null());
         DestroyMenu(menu);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::{Mutex, OnceLock};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            IsWindow, IsWindowVisible, WS_OVERLAPPEDWINDOW,
+        };
+
+        static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        const STATIC_CLASS: &[u16] = &[83, 84, 65, 84, 73, 67, 0];
+        const TEST_TITLE: &[u16] = &[
+            77, 97, 105, 108, 71, 111, 32, 84, 114, 97, 121, 32, 84, 101, 115, 116, 0,
+        ];
+
+        unsafe fn create_test_window() -> HWND {
+            CreateWindowExW(
+                0,
+                STATIC_CLASS.as_ptr(),
+                TEST_TITLE.as_ptr(),
+                WS_OVERLAPPEDWINDOW,
+                -32_000,
+                -32_000,
+                320,
+                240,
+                0,
+                0,
+                GetModuleHandleW(null()),
+                null(),
+            )
+        }
+
+        #[test]
+        fn tray_message_router_covers_restore_show_menu_and_quit() {
+            let taskbar_created = WM_APP + 400;
+            assert_eq!(
+                tray_action(taskbar_created, 0, 0, taskbar_created),
+                TrayAction::RestoreIcon
+            );
+            assert_eq!(
+                tray_action(TRAY_CALLBACK, 0, WM_LBUTTONUP as LPARAM, 0),
+                TrayAction::ShowWindow
+            );
+            assert_eq!(
+                tray_action(TRAY_CALLBACK, 0, WM_LBUTTONDBLCLK as LPARAM, 0),
+                TrayAction::ShowWindow
+            );
+            assert_eq!(
+                tray_action(TRAY_CALLBACK, 0, WM_RBUTTONUP as LPARAM, 0),
+                TrayAction::ShowMenu
+            );
+            assert_eq!(
+                tray_action(WM_COMMAND, SHOW_COMMAND, 0, 0),
+                TrayAction::ShowWindow
+            );
+            assert_eq!(
+                tray_action(WM_COMMAND, QUIT_COMMAND, 0, 0),
+                TrayAction::Quit
+            );
+            assert_eq!(tray_action(WM_COMMAND, 65_535, 0, 0), TrayAction::Ignore);
+        }
+
+        #[test]
+        fn close_hides_without_destroying_then_restore_and_quit_work() {
+            let _guard = TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("lock tray fixture");
+            unsafe {
+                let hwnd = create_test_window();
+                assert_ne!(hwnd, 0);
+                TARGET_WINDOW.store(hwnd, Ordering::SeqCst);
+                PREVIOUS_WNDPROC.store(0, Ordering::SeqCst);
+                MINIMIZE_TO_TRAY.store(true, Ordering::SeqCst);
+                ALLOW_CLOSE.store(false, Ordering::SeqCst);
+                ShowWindow(hwnd, SW_SHOW);
+                assert_ne!(IsWindowVisible(hwnd), 0);
+
+                assert_eq!(main_window_proc(hwnd, WM_CLOSE, 0, 0), 0);
+                assert_ne!(IsWindow(hwnd), 0, "close-to-tray destroyed the window");
+                assert_eq!(IsWindowVisible(hwnd), 0, "close-to-tray left it visible");
+
+                show_main_window();
+                assert_ne!(
+                    IsWindowVisible(hwnd),
+                    0,
+                    "tray restore did not show the window"
+                );
+
+                ALLOW_CLOSE.store(true, Ordering::SeqCst);
+                assert_eq!(main_window_proc(hwnd, WM_CLOSE, 0, 0), 0);
+                assert_eq!(
+                    IsWindow(hwnd),
+                    0,
+                    "explicit tray quit did not destroy the window"
+                );
+                TARGET_WINDOW.store(0, Ordering::SeqCst);
+                PREVIOUS_WNDPROC.store(0, Ordering::SeqCst);
+                ALLOW_CLOSE.store(false, Ordering::SeqCst);
+            }
+        }
+
+        #[test]
+        fn disabling_close_to_tray_allows_the_normal_close_path() {
+            let _guard = TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("lock tray fixture");
+            unsafe {
+                let hwnd = create_test_window();
+                assert_ne!(hwnd, 0);
+                TARGET_WINDOW.store(hwnd, Ordering::SeqCst);
+                PREVIOUS_WNDPROC.store(0, Ordering::SeqCst);
+                MINIMIZE_TO_TRAY.store(false, Ordering::SeqCst);
+                ALLOW_CLOSE.store(false, Ordering::SeqCst);
+                ShowWindow(hwnd, SW_SHOW);
+
+                assert_eq!(main_window_proc(hwnd, WM_CLOSE, 0, 0), 0);
+                assert_eq!(IsWindow(hwnd), 0);
+                TARGET_WINDOW.store(0, Ordering::SeqCst);
+                MINIMIZE_TO_TRAY.store(true, Ordering::SeqCst);
+            }
+        }
     }
 }
 
