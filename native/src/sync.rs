@@ -16,8 +16,12 @@ use sha2::{Digest, Sha256};
 use crate::mail::{parse_full, parse_header, CachedMailbox, CachedMessage};
 use crate::providers::{Authentication, ProviderKind, ProviderProfile, TransportSecurity};
 
-const HEADER_FETCH_QUERY: &str = "UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]";
-const FULL_FETCH_QUERY: &str = "UID FLAGS RFC822";
+// RFC 3501 requires a parenthesized data-item list when FETCH requests more than one item.
+// Some servers accept the unparenthesized form, while stricter providers such as QQ return BAD.
+const HEADER_FETCH_QUERY: &str = "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER])";
+const FLAGS_FETCH_QUERY: &str = "(UID FLAGS)";
+const SIZE_FETCH_QUERY: &str = "(UID RFC822.SIZE)";
+const FULL_FETCH_QUERY: &str = "(UID FLAGS RFC822)";
 const MAX_HEADER_MESSAGES: usize = 100;
 const MAX_DISCOVERED_FOLDERS: usize = 64;
 const MAX_UIDS_PER_QUERY: usize = 100_000;
@@ -417,23 +421,24 @@ pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathB
                             );
                             tracing::warn!(
                                 account_id = %account.id,
-                                "background credential load failed: {error}"
+                                needs_auth = needs_reauthorization(&error),
+                                "background credential load failed"
                             );
                             continue;
                         }
                     };
-                    if let Err(error) = crate::outbox::flush_due(
+                    if crate::outbox::flush_due(
                         &cache_root,
                         &account.id,
                         profile.clone(),
                         &account.email,
                         &credential,
-                    ) {
-                        tracing::warn!(
-                            account_id = %account.id,
-                            "background outbox flush failed: {error}"
-                        );
+                    )
+                    .is_err()
+                    {
+                        tracing::warn!(account_id = %account.id, "background outbox flush failed");
                     }
+                    let provider = profile.provider;
                     match sync_account(
                         &account.id,
                         profile,
@@ -476,7 +481,9 @@ pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathB
                             );
                             tracing::warn!(
                                 account_id = %account.id,
-                                "background sync failed: {error}"
+                                category = error_category(&error, provider),
+                                detail = error_detail(&error),
+                                "background sync failed"
                             );
                         }
                     }
@@ -865,7 +872,7 @@ fn sync_folder_latest(
         .join(",");
     if !refresh_uid_set.is_empty() {
         let fetched = session
-            .uid_fetch(refresh_uid_set, "UID FLAGS")
+            .uid_fetch(refresh_uid_set, FLAGS_FETCH_QUERY)
             .with_context(|| format!("refresh {folder} message flags"))?;
         for item in fetched.iter() {
             let Some(uid) = item.uid else { continue };
@@ -1346,6 +1353,41 @@ pub fn error_category(error: &anyhow::Error, provider: ProviderKind) -> &'static
     }
 }
 
+/// Produce a stable, privacy-safe transport fingerprint for local diagnostics. This deliberately
+/// records only the Rust/IMAP error variant, never server response text or message contents.
+pub fn error_detail(error: &anyhow::Error) -> &'static str {
+    for cause in error.chain() {
+        if let Some(imap_error) = cause.downcast_ref::<imap::Error>() {
+            return match imap_error {
+                imap::Error::Io(io_error) => match io_error.kind() {
+                    std::io::ErrorKind::TimedOut => "io-timeout",
+                    std::io::ErrorKind::ConnectionReset => "io-connection-reset",
+                    std::io::ErrorKind::ConnectionRefused => "io-connection-refused",
+                    std::io::ErrorKind::ConnectionAborted => "io-connection-aborted",
+                    std::io::ErrorKind::UnexpectedEof => "io-unexpected-eof",
+                    _ => "io-other",
+                },
+                imap::Error::TlsHandshake(_) => "tls-handshake",
+                imap::Error::Tls(_) => "tls",
+                imap::Error::Bad(_) => "imap-bad",
+                imap::Error::No(_) => "imap-no",
+                imap::Error::Bye(_) => "imap-bye",
+                imap::Error::ConnectionLost => "imap-connection-lost",
+                imap::Error::Parse(_) => "imap-parse",
+                imap::Error::Validate(_) => "imap-validate",
+                imap::Error::Append => "imap-append",
+                imap::Error::Unexpected(_) => "imap-unexpected",
+                imap::Error::MissingStatusResponse => "imap-missing-status",
+                imap::Error::TagMismatch(_) => "imap-tag-mismatch",
+                imap::Error::StartTlsNotAvailable => "imap-starttls-unavailable",
+                imap::Error::TlsNotConfigured => "imap-tls-not-configured",
+                _ => "imap-other",
+            };
+        }
+    }
+    "other"
+}
+
 /// Only transient provider failures may enter the encrypted offline mutation queue. Permanent
 /// command failures and authentication errors must reach the renderer immediately instead of
 /// being replayed forever with stale credentials or an invalid destination.
@@ -1549,7 +1591,7 @@ fn fetch_message_once(
     validate_mailbox_name(folder)?;
     let mut session = authenticate(&profile, email, credential)?;
     session.select(folder)?;
-    let size_probe = session.uid_fetch(uid.to_string(), "UID RFC822.SIZE")?;
+    let size_probe = session.uid_fetch(uid.to_string(), SIZE_FETCH_QUERY)?;
     let advertised_size = size_probe
         .iter()
         .next()
@@ -3044,6 +3086,10 @@ mod tests {
             error_category(&anyhow!("connection reset by peer"), ProviderKind::Qq),
             "network"
         );
+        assert_eq!(
+            error_detail(&anyhow::Error::new(imap::Error::ConnectionLost).context("sync")),
+            "imap-connection-lost"
+        );
         assert!(needs_reauthorization(&anyhow!(
             "OAuth access token expired; reauthorization is required"
         )));
@@ -3115,6 +3161,23 @@ mod tests {
             delta_fetch_query(IncrementalMode::Qresync, 42),
             "(UID FLAGS MODSEQ) (CHANGEDSINCE 42 VANISHED)"
         );
+    }
+
+    #[test]
+    fn multi_item_fetch_queries_are_parenthesized_for_strict_imap_servers() {
+        for query in [
+            HEADER_FETCH_QUERY,
+            FLAGS_FETCH_QUERY,
+            SIZE_FETCH_QUERY,
+            FULL_FETCH_QUERY,
+        ] {
+            assert!(
+                query.starts_with('('),
+                "missing opening parenthesis: {query}"
+            );
+            assert!(query.ends_with(')'), "missing closing parenthesis: {query}");
+            assert!(query.split_ascii_whitespace().count() >= 2);
+        }
     }
 
     #[test]

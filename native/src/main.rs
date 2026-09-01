@@ -2123,6 +2123,7 @@ fn handle_ipc(
                         }
                         Err(error) => {
                             let category = sync::error_category(&error, provider);
+                            let detail = sync::error_detail(&error);
                             record_account_sync_failure(
                                 shared,
                                 &account.id,
@@ -2135,6 +2136,7 @@ fn handle_ipc(
                             tracing::warn!(
                                 provider = provider.as_str(),
                                 category,
+                                detail,
                                 "account sync failed"
                             );
                         }

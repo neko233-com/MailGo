@@ -112,6 +112,8 @@ The repository is deliberately split into a real desktop UI foundation and provi
 103. Account onboarding now commits the local account immediately and closes the dialog before the first remote sync; the initial IMAP fetch, mailbox hydration, and queue telemetry continue asynchronously while the new account remains visible as `syncing`.
 104. New account creation and both configuration-import paths now reject duplicate mailbox identities under different account IDs, and imports can no longer repurpose an existing ID for another mailbox; reauthorization and multiple distinct QQ mailboxes remain supported, with the renderer checking duplicates before optimistic state changes.
 105. Read-only IMAP retries now recognize bounded Gmail and Outlook throttling responses while preserving generic QQ/custom transport handling and explicit retry hints; SMTP outbox classification uses lettre's typed status plus RFC 5321 reply severity, retrying 4xx failures and pausing 5xx/authentication failures instead of replaying permanent 503/554 responses.
+106. Header, flag, size-probe, and full-message IMAP `FETCH` data-item lists now use the RFC-required parenthesized form, with executable regression coverage and a successful live QQ cold-cache synchronization on the packaged Windows Release build.
+107. Background and manual IMAP synchronization logs now emit stable privacy-safe error categories and transport fingerprints without persisting provider response text; rolling logs remain useful for distinguishing protocol, TLS, network, authentication, and provider failures.
 
 ## Remaining production acceptance work
 
