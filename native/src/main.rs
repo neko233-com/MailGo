@@ -2687,6 +2687,7 @@ fn handle_ipc(
                     .unwrap_or_else(|| "INBOX".to_string());
                 let target_folder = optional_string_field(&message.payload, "targetFolder");
                 let account = account_for(shared, &account_id)?;
+                let provider = profile_for_account(&account)?.provider;
                 let operation = match message.cmd.as_str() {
                     "mail.move" => "move",
                     "mail.archive" => "archive",
@@ -2698,14 +2699,12 @@ fn handle_ipc(
                 if matches!(operation, "move" | "archive") && target_folder.is_none() {
                     return Err(anyhow!("{operation} destination is required"));
                 }
-                if message.cmd == "mail.spam" {
-                    let profile = profile_for_account(&account)?;
-                    if !target_folder
+                if message.cmd == "mail.spam"
+                    && !target_folder
                         .as_deref()
-                        .is_some_and(|target| sync::is_spam_folder(profile.provider, target))
-                    {
-                        return Err(anyhow!("spam destination must be the provider spam folder"));
-                    }
+                        .is_some_and(|target| sync::is_spam_folder(provider, target))
+                {
+                    return Err(anyhow!("spam destination must be the provider spam folder"));
                 }
                 if message.cmd == "mail.inbox"
                     && !target_folder
@@ -2715,11 +2714,10 @@ fn handle_ipc(
                     return Err(anyhow!("inbox destination must be INBOX"));
                 }
                 if operation == "delete" {
-                    let profile = profile_for_account(&account)?;
                     let permanent = target_folder
                         .as_deref()
                         .is_none_or(|target| target.eq_ignore_ascii_case(&folder));
-                    if permanent && !sync::is_trash_folder(profile.provider, &folder) {
+                    if permanent && !sync::is_trash_folder(provider, &folder) {
                         return Err(anyhow!(
                             "permanent delete is only allowed from the provider trash folder"
                         ));
@@ -2737,11 +2735,10 @@ fn handle_ipc(
                             .ok_or_else(|| anyhow!("archive destination is required"))
                             .and_then(|_| Err(anyhow!("offline-only mode"))),
                         "delete" => {
-                            let profile = profile_for_account(&account)?;
                             let permanent = target_folder
                                 .as_deref()
                                 .is_none_or(|target| target.eq_ignore_ascii_case(&folder));
-                            if permanent && !sync::is_trash_folder(profile.provider, &folder) {
+                            if permanent && !sync::is_trash_folder(provider, &folder) {
                                 Err(anyhow!(
                                     "permanent delete is only allowed from the provider trash folder"
                                 ))
@@ -2814,7 +2811,7 @@ fn handle_ipc(
                     )?;
                     true
                 } else if let Err(error) = result {
-                    if !sync::is_retryable_error(&error) {
+                    if !sync::is_retryable_error(&error, provider) {
                         return Err(error);
                     }
                     sync::queue_move_mutation(
@@ -2883,6 +2880,7 @@ fn handle_ipc(
                     true
                 } else {
                     let profile = profile_for_account(&account)?;
+                    let provider = profile.provider;
                     let credential = load_credential(&account)?;
                     match sync::set_flag(
                         profile,
@@ -2903,7 +2901,7 @@ fn handle_ipc(
                             )?;
                             false
                         }
-                        Err(error) if sync::is_retryable_error(&error) => {
+                        Err(error) if sync::is_retryable_error(&error, provider) => {
                             sync::queue_flag_mutation(
                                 &cache_dir(),
                                 &account_id,

@@ -1885,9 +1885,9 @@ pub fn error_detail(error: &anyhow::Error) -> &'static str {
 /// Only transient provider failures may enter the encrypted offline mutation queue. Permanent
 /// command failures and authentication errors must reach the renderer immediately instead of
 /// being replayed forever with stale credentials or an invalid destination.
-pub fn is_retryable_error(error: &anyhow::Error) -> bool {
+pub fn is_retryable_error(error: &anyhow::Error, provider: ProviderKind) -> bool {
     matches!(
-        classify_sync_error(error),
+        classify_sync_error_for_provider(error, provider),
         SyncErrorClass::RateLimited | SyncErrorClass::Transport
     )
 }
@@ -1955,6 +1955,7 @@ fn classify_sync_error_for_provider(
             "user-rate limit exceeded",
             "bandwidth limit exceeded",
             "maximum number of connections",
+            "too many simultaneous connections",
         ],
         ProviderKind::Outlook => &[
             "mailbox is throttled",
@@ -1991,10 +1992,24 @@ fn retry_imap_operation<T, F>(
     account_id: &str,
     operation: &str,
     provider: ProviderKind,
-    mut operation_fn: F,
+    operation_fn: F,
 ) -> Result<T>
 where
     F: FnMut() -> Result<T>,
+{
+    retry_imap_operation_with_sleeper(account_id, operation, provider, operation_fn, thread::sleep)
+}
+
+fn retry_imap_operation_with_sleeper<T, F, S>(
+    account_id: &str,
+    operation: &str,
+    provider: ProviderKind,
+    mut operation_fn: F,
+    mut sleep_fn: S,
+) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+    S: FnMut(Duration),
 {
     let mut attempt = 0u32;
     loop {
@@ -2012,7 +2027,7 @@ where
                     delay = delay.as_secs(),
                     "recoverable IMAP read failure; retrying"
                 );
-                thread::sleep(delay);
+                sleep_fn(delay);
             }
             Err(error) => return Err(error),
         }
@@ -3408,6 +3423,74 @@ mod tests {
     use super::*;
     use crate::classifier::SmartCategory;
 
+    fn fixture_imap_session<F>(
+        scenario: F,
+    ) -> (imap::Session<imap::Connection>, thread::JoinHandle<()>)
+    where
+        F: FnOnce(&mut BufReader<TcpStream>, &mut TcpStream) + Send + 'static,
+    {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind IMAP fixture");
+        let address = listener.local_addr().expect("IMAP fixture address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept IMAP fixture");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set IMAP fixture read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("set IMAP fixture write timeout");
+            stream
+                .write_all(b"* OK MailGo provider fixture ready\r\n")
+                .expect("write IMAP fixture greeting");
+            stream.flush().expect("flush IMAP fixture greeting");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone IMAP fixture"));
+            let mut command = String::new();
+            reader
+                .read_line(&mut command)
+                .expect("read IMAP fixture LOGIN");
+            assert!(command.to_ascii_uppercase().contains(" LOGIN "));
+            let tag = command.split_ascii_whitespace().next().expect("LOGIN tag");
+            write!(stream, "{tag} OK LOGIN completed\r\n")
+                .expect("write IMAP fixture LOGIN response");
+            stream.flush().expect("flush IMAP fixture LOGIN response");
+            scenario(&mut reader, &mut stream);
+        });
+
+        let stream = TcpStream::connect(address).expect("connect IMAP fixture");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set fixture client read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set fixture client write timeout");
+        let mut client = imap::Client::new(Box::new(stream) as imap::Connection);
+        client.read_greeting().expect("read IMAP fixture greeting");
+        let session = client
+            .login("fixture@example.invalid", "fixture-password")
+            .map_err(|(error, _)| error)
+            .expect("login to IMAP fixture");
+        (session, server)
+    }
+
+    fn respond_to_select(
+        reader: &mut BufReader<TcpStream>,
+        stream: &mut TcpStream,
+        uid_validity: u32,
+    ) {
+        let mut command = String::new();
+        reader
+            .read_line(&mut command)
+            .expect("read IMAP fixture SELECT");
+        assert!(command.to_ascii_uppercase().contains(" SELECT "));
+        let tag = command.split_ascii_whitespace().next().expect("SELECT tag");
+        write!(
+            stream,
+            "* FLAGS (\\Seen \\Flagged)\r\n* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY {uid_validity}] UIDs valid\r\n{tag} OK [READ-WRITE] SELECT completed\r\n"
+        )
+        .expect("write IMAP fixture SELECT response");
+        stream.flush().expect("flush IMAP fixture SELECT response");
+    }
+
     #[test]
     fn imap_socket_applies_connect_and_io_timeouts() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture socket");
@@ -3444,6 +3527,22 @@ mod tests {
             crate::providers::ProviderKind::Google,
             "[Gmail]/Trash"
         ));
+    }
+
+    #[test]
+    fn provider_folder_fixtures_cover_google_qq_and_outlook_system_mailboxes() {
+        let google = folders_for(ProviderKind::Google);
+        assert!(google.contains(&"[Gmail]/All Mail"));
+        assert!(google.contains(&"[Gmail]/Trash"));
+
+        let qq = folders_for(ProviderKind::Qq);
+        assert!(qq.contains(&"Sent Messages"));
+        assert!(qq.contains(&"Spam"));
+
+        let outlook = folders_for(ProviderKind::Outlook);
+        assert!(outlook.contains(&"Sent Items"));
+        assert!(outlook.contains(&"Junk Email"));
+        assert!(outlook.contains(&"Deleted Items"));
     }
 
     #[test]
@@ -3726,12 +3825,47 @@ mod tests {
             "OAuth access token expired; reauthorization is required"
         )));
         assert!(!needs_reauthorization(&anyhow!("connection reset by peer")));
-        assert!(is_retryable_error(&anyhow!("connection reset by peer")));
-        assert!(is_retryable_error(&anyhow!(
-            "IMAP rate limit: try again later"
-        )));
-        assert!(!is_retryable_error(&anyhow!("IMAP authentication failed")));
-        assert!(!is_retryable_error(&anyhow!("mailbox does not exist")));
+        assert!(is_retryable_error(
+            &anyhow!("connection reset by peer"),
+            ProviderKind::Qq
+        ));
+        assert!(is_retryable_error(
+            &anyhow!("IMAP rate limit: try again later"),
+            ProviderKind::Google
+        ));
+        assert!(!is_retryable_error(
+            &anyhow!("IMAP authentication failed"),
+            ProviderKind::Google
+        ));
+        assert!(!is_retryable_error(
+            &anyhow!("mailbox does not exist"),
+            ProviderKind::Other
+        ));
+    }
+
+    #[test]
+    fn read_only_imap_retry_control_flow_reconnects_twice_with_bounded_backoff() {
+        let mut attempts = 0usize;
+        let mut delays = Vec::new();
+        let value = retry_imap_operation_with_sleeper(
+            "fixture-account",
+            "fixture fetch",
+            ProviderKind::Qq,
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(anyhow!("connection reset by peer"))
+                } else {
+                    Ok(42)
+                }
+            },
+            |delay| delays.push(delay),
+        )
+        .unwrap();
+
+        assert_eq!(value, 42);
+        assert_eq!(attempts, 3);
+        assert_eq!(delays, vec![Duration::from_secs(1), Duration::from_secs(2)]);
     }
 
     #[test]
@@ -3772,6 +3906,54 @@ mod tests {
             ),
             SyncErrorClass::Permanent
         );
+    }
+
+    #[test]
+    fn provider_throttling_fixtures_drive_mutations_into_the_retry_queue() {
+        let fixtures = [
+            (
+                ProviderKind::Google,
+                "NO [LIMIT] User-rate limit exceeded. (Failure)",
+                true,
+            ),
+            (
+                ProviderKind::Google,
+                "NO [LIMIT] Bandwidth limit exceeded.",
+                true,
+            ),
+            (
+                ProviderKind::Google,
+                "NO [ALERT] Too many simultaneous connections. (Failure)",
+                true,
+            ),
+            (
+                ProviderKind::Outlook,
+                "NO Maximum number of connections from user+IP exceeded",
+                true,
+            ),
+            (
+                ProviderKind::Outlook,
+                "NO Mailbox is throttled. Retry-After: 45",
+                true,
+            ),
+            (
+                ProviderKind::Qq,
+                "NO System busy, please try again later",
+                true,
+            ),
+            (ProviderKind::Qq, "NO Authentication failed", false),
+            (ProviderKind::Outlook, "NO Mailbox does not exist", false),
+        ];
+
+        for (provider, response, retryable) in fixtures {
+            let error = anyhow!(response).context("apply mail mutation");
+            assert_eq!(
+                is_retryable_error(&error, provider),
+                retryable,
+                "unexpected retry decision for {} fixture: {response}",
+                provider.as_str()
+            );
+        }
     }
 
     #[test]
@@ -3952,6 +4134,88 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!updated.messages[0].unread);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn imap_mutation_conflict_keeps_the_encrypted_flag_queue_for_retry() {
+        let root = std::env::temp_dir().join(format!(
+            "mailgo-imap-conflict-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.uid_validity = Some(7);
+        mailbox.messages = vec![fixture_message(7, "INBOX")];
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        queue_flag_mutation(&root, "fixture-account", "INBOX", 7, "\\Seen", true).unwrap();
+
+        let (mut session, server) = fixture_imap_session(|reader, stream| {
+            respond_to_select(reader, stream, 7);
+            let mut command = String::new();
+            reader
+                .read_line(&mut command)
+                .expect("read conflicting UID STORE");
+            assert!(command
+                .to_ascii_uppercase()
+                .contains(" UID STORE 7 +FLAGS.SILENT (\\SEEN)"));
+            let tag = command
+                .split_ascii_whitespace()
+                .next()
+                .expect("UID STORE tag");
+            write!(stream, "{tag} NO [MODIFIED 7] server-side conflict\r\n")
+                .expect("write conflicting UID STORE response");
+            stream
+                .flush()
+                .expect("flush conflicting UID STORE response");
+        });
+        flush_queued_flags(&mut session, &root, "fixture-account");
+        drop(session);
+        server.join().expect("join conflicting IMAP fixture");
+
+        let queued = load_mutations(
+            &root
+                .join(safe_component("fixture-account"))
+                .join(MUTATION_FILE),
+        )
+        .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].uid, 7);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn changed_uidvalidity_discards_stale_flag_without_sending_store() {
+        let root = std::env::temp_dir().join(format!(
+            "mailgo-imap-uidvalidity-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.uid_validity = Some(7);
+        mailbox.messages = vec![fixture_message(7, "INBOX")];
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        queue_flag_mutation(&root, "fixture-account", "INBOX", 7, "\\Seen", true).unwrap();
+
+        let (mut session, server) = fixture_imap_session(|reader, stream| {
+            respond_to_select(reader, stream, 8);
+            let mut unexpected = String::new();
+            let read = reader
+                .read_line(&mut unexpected)
+                .expect("observe UIDVALIDITY fixture completion");
+            assert_eq!(read, 0, "stale mutation sent a command: {unexpected}");
+        });
+        flush_queued_flags(&mut session, &root, "fixture-account");
+        drop(session);
+        server.join().expect("join UIDVALIDITY IMAP fixture");
+
+        let queued = load_mutations(
+            &root
+                .join(safe_component("fixture-account"))
+                .join(MUTATION_FILE),
+        )
+        .unwrap();
+        assert!(queued.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
