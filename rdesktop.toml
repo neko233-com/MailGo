@@ -6,6 +6,9 @@ version = "0.1.0"
 [renderer]
 kind = "webview"
 webgpu = false
+trusted_origins = ["rdesktop://localhost"]
+max_ipc_message_bytes = 524288
+max_ipc_in_flight = 32
 
 [window]
 title = "MailGo"

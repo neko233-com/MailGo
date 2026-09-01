@@ -1095,6 +1095,10 @@ fn generate_ipc_capability() -> String {
         .collect()
 }
 
+fn ipc_capability_is_well_formed(value: &str) -> bool {
+    value.len() == IPC_CAPABILITY_LENGTH && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
 fn cache_stats_response(state: &CacheScanState) -> Value {
     json!({
         "state": if state.running { "loading" } else if state.error.is_some() { "error" } else { "ready" },
@@ -1152,7 +1156,16 @@ fn validate_ipc_capability(message: &IpcMessage, expected: &str) -> Result<()> {
         .get(IPC_CAPABILITY_FIELD)
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if received != expected {
+    if !ipc_capability_is_well_formed(received)
+        || !ipc_capability_is_well_formed(expected)
+        || received
+            .bytes()
+            .zip(expected.bytes())
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (left ^ right)
+            })
+            != 0
+    {
         return Err(anyhow!("native IPC caller is not trusted"));
     }
     Ok(())
@@ -3501,22 +3514,26 @@ mod tests {
     }
 
     #[test]
-    fn ipc_capability_validation_rejects_forged_or_missing_callers() {
-        let message = IpcMessage {
-            id: "capability-test".into(),
-            cmd: "app.get_state".into(),
-            payload: json!({ IPC_CAPABILITY_FIELD: "expected" }),
+    fn ipc_capability_validation_rejects_forged_missing_or_malformed_callers() {
+        let expected = "A".repeat(IPC_CAPABILITY_LENGTH);
+        let forged = format!("{}B", "A".repeat(IPC_CAPABILITY_LENGTH - 1));
+        let message = |capability: Option<&str>| IpcMessage {
+            id: "capability-test".to_string(),
+            cmd: "app.get_state".to_string(),
+            payload: capability
+                .map(|value| json!({ IPC_CAPABILITY_FIELD: value }))
+                .unwrap_or_else(|| json!({})),
         };
-        assert!(validate_ipc_capability(&message, "forged").is_err());
-        assert!(validate_ipc_capability(&message, "expected").is_ok());
+        assert!(validate_ipc_capability(&message(Some(&expected)), &forged).is_err());
+        assert!(validate_ipc_capability(&message(Some(&expected)), &expected).is_ok());
+        assert!(validate_ipc_capability(&message(None), &expected).is_err());
+        assert!(validate_ipc_capability(&message(Some(&"A".repeat(47))), &expected).is_err());
         assert!(validate_ipc_capability(
-            &IpcMessage {
-                payload: json!({}),
-                ..message
-            },
-            "expected"
+            &message(Some(&format!("{}!", "A".repeat(47)))),
+            &expected
         )
         .is_err());
+        assert!(validate_ipc_capability(&message(Some(&expected)), "short").is_err());
     }
 
     #[test]
@@ -3568,6 +3585,9 @@ fn main() -> Result<()> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         renderer: RendererConfig {
             webgpu: false,
+            trusted_origins: vec!["rdesktop://localhost".to_string()],
+            max_ipc_message_bytes: 512 * 1024,
+            max_ipc_in_flight: 32,
             ..RendererConfig::default()
         },
         window: WindowConfig {

@@ -22,14 +22,32 @@ declare global {
 }
 
 const pending = new Map<string, PendingRequest>()
+const IPC_CAPABILITY_HASH = /^#ipc=([A-Za-z0-9]{48})$/
 
-function readNativeCapability() {
-  if (typeof window === 'undefined' || !window.location.hash.startsWith('#ipc=')) return undefined
-  const value = new URLSearchParams(window.location.hash.slice(1)).get('ipc')?.trim()
-  return value && value.length <= 128 ? value : undefined
+type NativeLocation = Pick<Location, 'protocol' | 'host' | 'hash' | 'pathname' | 'search'>
+type NativeHistory = Pick<History, 'replaceState'>
+
+export function readNativeCapability(location: NativeLocation, history: NativeHistory) {
+  const protocol = location.protocol.toLowerCase()
+  const host = location.host.toLowerCase()
+  const trustedOrigin = (protocol === 'rdesktop:' && host === 'localhost')
+    || (protocol === 'http:' && host === 'rdesktop.localhost')
+  if (!trustedOrigin) return undefined
+
+  const capability = IPC_CAPABILITY_HASH.exec(location.hash)?.[1]
+  if (!capability) return undefined
+
+  try {
+    history.replaceState(null, '', `${location.pathname || '/'}${location.search}`)
+  } catch {
+    return undefined
+  }
+  return capability
 }
 
-const nativeCapability = readNativeCapability()
+const nativeCapability = typeof window === 'undefined'
+  ? undefined
+  : readNativeCapability(window.location, window.history)
 
 if (typeof window !== 'undefined') {
   window.__RDESKTOP_IPC__ = (incoming) => {
