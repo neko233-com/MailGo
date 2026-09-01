@@ -120,6 +120,27 @@ pub struct SyncResult {
     pub folder_labels: HashMap<String, String>,
 }
 
+#[derive(Debug, Default)]
+struct MailboxSyncDelta {
+    new_messages: Vec<CachedMessage>,
+    flag_updates: Vec<(u32, bool, bool)>,
+    removed_uids: Vec<u32>,
+}
+
+impl MailboxSyncDelta {
+    fn is_empty(&self) -> bool {
+        self.new_messages.is_empty() && self.flag_updates.is_empty() && self.removed_uids.is_empty()
+    }
+}
+
+#[derive(Debug)]
+struct FolderSyncOutcome {
+    mailbox: CachedMailbox,
+    fetched: usize,
+    delta: MailboxSyncDelta,
+    force_full_rewrite: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResult {
@@ -1187,13 +1208,16 @@ fn sync_account_once(
     let mut inbox_fetched = 0usize;
     let mut inbox_unread = 0usize;
     let mut cache_path = cache_root.join(safe_component(account_id)).join(CACHE_FILE);
+    let mut metadata_only_folders = 0usize;
+    let mut exact_delta_folders = 0usize;
+    let mut full_rewrite_folders = 0usize;
 
     for folder in discover_folders(&mut session, profile.provider) {
         let status_highest_mod_seq = incremental_status(&mut session, &folder, incremental_mode);
         let Ok(mailbox) = session.select(&folder) else {
             continue;
         };
-        let (cached, fetched) = sync_folder_latest(
+        let outcome = sync_folder_latest(
             &mut session,
             account_id,
             &folder,
@@ -1203,11 +1227,22 @@ fn sync_account_once(
             cache_root,
             synced_at.clone(),
         )?;
-        let path = save_mailbox(cache_root, account_id, &cached)?;
+        let path = if outcome.force_full_rewrite {
+            full_rewrite_folders = full_rewrite_folders.saturating_add(1);
+            save_mailbox(cache_root, account_id, &outcome.mailbox)?
+        } else {
+            if outcome.delta.is_empty() {
+                metadata_only_folders = metadata_only_folders.saturating_add(1);
+            } else {
+                exact_delta_folders = exact_delta_folders.saturating_add(1);
+            }
+            save_mailbox_delta(cache_root, account_id, &outcome.mailbox, &outcome.delta)?
+        };
         if folder.eq_ignore_ascii_case("INBOX") {
             cache_path = path;
-            inbox_fetched = fetched;
-            inbox_unread = cached
+            inbox_fetched = outcome.fetched;
+            inbox_unread = outcome
+                .mailbox
                 .messages
                 .iter()
                 .filter(|message| message.unread)
@@ -1224,6 +1259,13 @@ fn sync_account_once(
     }
 
     let folder_labels = folder_display_labels(&synced_folders);
+    tracing::info!(
+        account_id = %account_id,
+        metadata_only_folders,
+        exact_delta_folders,
+        full_rewrite_folders,
+        "mailbox cache persistence completed"
+    );
     crate::cache_db::spawn_search_indexer(cache_root.to_path_buf());
     if let Err(error) = crate::cache_db::refresh_backup(cache_root) {
         tracing::warn!(
@@ -1254,18 +1296,20 @@ fn sync_folder_latest(
     incremental_mode: Option<IncrementalMode>,
     cache_root: &Path,
     synced_at: String,
-) -> Result<(CachedMailbox, usize)> {
+) -> Result<FolderSyncOutcome> {
     validate_mailbox_name(folder)?;
-    let mut cached = load_mailbox_for_folder(cache_root, account_id, folder)?
-        .unwrap_or_else(|| CachedMailbox::empty(account_id, folder));
+    let cached_state = load_mailbox_for_sync(cache_root, account_id, folder)?;
+    let mut force_full_rewrite = cached_state.is_none();
+    let mut cached = cached_state.unwrap_or_else(|| CachedMailbox::empty(account_id, folder));
     let cache_reparse_required = upgrade_mailbox_cache(&mut cached);
     let uid_validity_changed = cached.uid_validity.is_some() && cached.uid_validity != uid_validity;
     if uid_validity_changed || cache_reparse_required {
+        force_full_rewrite = true;
         reset_mailbox_sync_window(&mut cached);
     } else if let (Some(mode), Some(current), Some(previous)) =
         (incremental_mode, highest_mod_seq, cached.highest_mod_seq)
     {
-        if let Some(fetched) = sync_folder_incremental(
+        if let Some(delta) = sync_folder_incremental(
             session,
             account_id,
             folder,
@@ -1276,9 +1320,16 @@ fn sync_folder_latest(
             &mut cached,
             synced_at.clone(),
         )? {
-            return Ok((cached, fetched));
+            return Ok(FolderSyncOutcome {
+                fetched: delta.new_messages.len(),
+                mailbox: cached,
+                delta,
+                force_full_rewrite,
+            });
         }
     }
+
+    let mut delta = MailboxSyncDelta::default();
 
     let mut all_uids = session
         .uid_search("ALL")
@@ -1346,6 +1397,13 @@ fn sync_folder_latest(
     }
     fetched_messages.sort_by_key(|message| std::cmp::Reverse(message.uid));
 
+    delta.removed_uids.extend(
+        cached
+            .messages
+            .iter()
+            .filter(|message| !current_uids.contains(&message.uid))
+            .map(|message| message.uid),
+    );
     cached
         .messages
         .retain(|message| current_uids.contains(&message.uid));
@@ -1372,11 +1430,16 @@ fn sync_folder_latest(
                 .iter_mut()
                 .find(|message| message.uid == uid)
             {
-                message.unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
-                message.starred = item
+                let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
+                let starred = item
                     .flags()
                     .iter()
                     .any(|flag| matches!(flag, Flag::Flagged));
+                if message.unread != unread || message.starred != starred {
+                    message.unread = unread;
+                    message.starred = starred;
+                    delta.flag_updates.push((uid, unread, starred));
+                }
             }
         }
     }
@@ -1406,7 +1469,14 @@ fn sync_folder_latest(
         .sort_by_key(|message| std::cmp::Reverse(message.uid));
     cached.oldest_uid = cached.messages.iter().map(|message| message.uid).min();
     cached.has_more = total_uids > cached.messages.len();
-    Ok((cached, fetched_messages.len()))
+    let fetched = fetched_messages.len();
+    delta.new_messages = fetched_messages;
+    Ok(FolderSyncOutcome {
+        mailbox: cached,
+        fetched,
+        delta,
+        force_full_rewrite,
+    })
 }
 
 fn delta_fetch_query(mode: IncrementalMode, previous_mod_seq: u64) -> String {
@@ -1449,7 +1519,7 @@ fn sync_folder_incremental(
     mode: IncrementalMode,
     cached: &mut CachedMailbox,
     synced_at: String,
-) -> Result<Option<usize>> {
+) -> Result<Option<MailboxSyncDelta>> {
     if current_mod_seq < previous_mod_seq {
         return Ok(None);
     }
@@ -1457,7 +1527,7 @@ fn sync_folder_incremental(
         cached.uid_validity = uid_validity;
         cached.highest_mod_seq = Some(current_mod_seq);
         cached.synced_at = synced_at;
-        return Ok(Some(0));
+        return Ok(Some(MailboxSyncDelta::default()));
     }
 
     let Some(cached_uid_set) = cached_uid_set(cached) else {
@@ -1576,11 +1646,30 @@ fn sync_folder_incremental(
         .map(|message| message.uid)
         .collect::<HashSet<_>>();
     let all_requested_headers_fetched = header_uids.iter().all(|uid| fetched_uids.contains(uid));
+    let mut delta = MailboxSyncDelta::default();
     if let Some(current_uids) = current_uids {
+        delta.removed_uids.extend(
+            cached
+                .messages
+                .iter()
+                .filter(|message| !current_uids.contains(&message.uid))
+                .map(|message| message.uid),
+        );
         cached
             .messages
             .retain(|message| current_uids.contains(&message.uid));
     } else if !vanished_ranges.is_empty() {
+        delta.removed_uids.extend(
+            cached
+                .messages
+                .iter()
+                .filter(|message| {
+                    vanished_ranges
+                        .iter()
+                        .any(|range| range.contains(&message.uid))
+                })
+                .map(|message| message.uid),
+        );
         cached.messages.retain(|message| {
             !vanished_ranges
                 .iter()
@@ -1593,8 +1682,11 @@ fn sync_folder_incremental(
             .iter_mut()
             .find(|message| message.uid == uid)
         {
-            message.unread = unread;
-            message.starred = starred;
+            if message.unread != unread || message.starred != starred {
+                message.unread = unread;
+                message.starred = starred;
+                delta.flag_updates.push((uid, unread, starred));
+            }
         }
     }
     cached
@@ -1612,7 +1704,8 @@ fn sync_folder_incremental(
     };
     cached.synced_at = synced_at;
     cached.oldest_uid = cached.messages.iter().map(|message| message.uid).min();
-    Ok(Some(fetched_messages.len()))
+    delta.new_messages = fetched_messages;
+    Ok(Some(delta))
 }
 
 /// Fetch one older page for a folder and merge it into the encrypted local cache. The cursor is
@@ -1676,11 +1769,13 @@ fn sync_folder_page_once(
     let mailbox = session
         .select(folder)
         .with_context(|| format!("select {folder}"))?;
-    let mut cached = load_mailbox_for_folder(cache_root, account_id, folder)?
-        .unwrap_or_else(|| CachedMailbox::empty(account_id, folder));
+    let cached_state = load_mailbox_for_sync(cache_root, account_id, folder)?;
+    let mut force_full_rewrite = cached_state.is_none();
+    let mut cached = cached_state.unwrap_or_else(|| CachedMailbox::empty(account_id, folder));
     let uid_validity_changed =
         cached.uid_validity.is_some() && cached.uid_validity != mailbox.uid_validity;
     if uid_validity_changed {
+        force_full_rewrite = true;
         cached.messages.clear();
         cached.oldest_uid = None;
         cached.has_more = false;
@@ -1700,7 +1795,7 @@ fn sync_folder_page_once(
                     .filter(|message| message.unread)
                     .count()
             } else {
-                load_mailbox_for_folder(cache_root, account_id, "INBOX")?
+                load_mailbox_for_sync(cache_root, account_id, "INBOX")?
                     .map(|mailbox| {
                         mailbox
                             .messages
@@ -1792,7 +1887,20 @@ fn sync_folder_page_once(
         .sort_by_key(|message| std::cmp::Reverse(message.uid));
     cached.oldest_uid = cached.messages.iter().map(|message| message.uid).min();
     cached.has_more = has_more;
-    let path = save_mailbox(cache_root, account_id, &cached)?;
+    let fetched = fetched_messages.len();
+    let path = if force_full_rewrite {
+        save_mailbox(cache_root, account_id, &cached)?
+    } else {
+        save_mailbox_delta(
+            cache_root,
+            account_id,
+            &cached,
+            &MailboxSyncDelta {
+                new_messages: fetched_messages,
+                ..MailboxSyncDelta::default()
+            },
+        )?
+    };
     crate::cache_db::spawn_search_indexer(cache_root.to_path_buf());
     let unread = if folder.eq_ignore_ascii_case("INBOX") {
         cached
@@ -1801,7 +1909,7 @@ fn sync_folder_page_once(
             .filter(|message| message.unread)
             .count()
     } else {
-        load_mailbox_for_folder(cache_root, account_id, "INBOX")?
+        load_mailbox_for_sync(cache_root, account_id, "INBOX")?
             .map(|mailbox| {
                 mailbox
                     .messages
@@ -1815,7 +1923,7 @@ fn sync_folder_page_once(
     Ok(SyncResult {
         account_id: account_id.to_string(),
         folder: folder.to_string(),
-        fetched: fetched_messages.len(),
+        fetched,
         unread,
         cache_path: path.display().to_string(),
         synced_at: cached.synced_at,
@@ -2251,6 +2359,30 @@ pub fn load_mailbox_for_folder(
         return Err(error);
     }
     Ok(None)
+}
+
+fn load_mailbox_for_sync(
+    cache_root: &Path,
+    account_id: &str,
+    folder: &str,
+) -> Result<Option<CachedMailbox>> {
+    if let Some(mailbox) = crate::cache_db::load_mailbox_summaries(
+        cache_root,
+        account_id,
+        folder,
+        MAX_CACHED_MESSAGES_PER_FOLDER,
+    )? {
+        return Ok(Some(mailbox));
+    }
+    if load_mailbox_for_folder(cache_root, account_id, folder)?.is_none() {
+        return Ok(None);
+    }
+    crate::cache_db::load_mailbox_summaries(
+        cache_root,
+        account_id,
+        folder,
+        MAX_CACHED_MESSAGES_PER_FOLDER,
+    )
 }
 
 fn load_mailbox_file(
@@ -3025,6 +3157,24 @@ fn save_move_mutations_unlocked(path: &Path, mutations: &[PendingMoveMutation]) 
 fn save_mailbox(cache_root: &Path, account_id: &str, mailbox: &CachedMailbox) -> Result<PathBuf> {
     let _write_guard = cache_write_guard();
     save_mailbox_unlocked(cache_root, account_id, mailbox)
+}
+
+fn save_mailbox_delta(
+    cache_root: &Path,
+    account_id: &str,
+    mailbox: &CachedMailbox,
+    delta: &MailboxSyncDelta,
+) -> Result<PathBuf> {
+    let _write_guard = cache_write_guard();
+    crate::cache_db::apply_mailbox_sync_delta(
+        cache_root,
+        account_id,
+        mailbox,
+        &delta.new_messages,
+        &delta.flag_updates,
+        &delta.removed_uids,
+        MAX_CACHED_MESSAGES_PER_FOLDER,
+    )
 }
 
 fn save_mailbox_unlocked(
