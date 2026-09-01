@@ -169,13 +169,7 @@ fn build_message(
         .map(|html| sanitize_html(html.as_ref()))
         .filter(|html| !html.is_empty())
         .map(|html| truncate_utf8(&html, MAX_CACHED_HTML_BYTES));
-    let preview = text_body
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(MAX_PREVIEW_CHARS)
-        .collect();
+    let preview = bounded_preview(&text_body);
     let has_list_unsubscribe = parsed
         .headers_raw()
         .any(|(name, _)| name.eq_ignore_ascii_case("list-unsubscribe"));
@@ -474,6 +468,32 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     value[..end].to_string()
 }
 
+fn bounded_preview(value: &str) -> String {
+    let mut output = String::with_capacity(MAX_PREVIEW_CHARS);
+    let mut output_chars = 0usize;
+    let mut pending_space = false;
+    for character in value.chars() {
+        if character.is_whitespace() {
+            pending_space = !output.is_empty();
+            continue;
+        }
+        if pending_space {
+            if output_chars == MAX_PREVIEW_CHARS {
+                break;
+            }
+            output.push(' ');
+            output_chars += 1;
+            pending_space = false;
+        }
+        if output_chars == MAX_PREVIEW_CHARS {
+            break;
+        }
+        output.push(character);
+        output_chars += 1;
+    }
+    output.trim_end().to_string()
+}
+
 fn address_parts(address: Option<&Address<'_>>) -> (String, String) {
     let Some(first) = address.and_then(Address::first) else {
         return (String::new(), String::new());
@@ -604,6 +624,118 @@ mod tests {
 
     const RAW: &str = "From: no-reply@apple.com\r\nTo: teammate@example.com, owner@example.com\r\nCc: reviewer@example.com\r\nSubject: Your Apple Account was used to sign in\r\nMessage-ID: <mailgo-test@example.com>\r\nDate: Tue, 01 Jan 2026 12:00:00 +0000\r\nList-Unsubscribe: <https://example.com/unsubscribe>\r\nContent-Type: multipart/alternative; boundary=mailgo\r\n\r\n--mailgo\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nSecurity notice\r\n--mailgo\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Safe <strong>notice</strong></p><script>alert(1)</script>\r\n--mailgo--\r\n";
 
+    const GMAIL_FIXTURE: &str = concat!(
+        "Delivered-To: fixture@gmail.invalid\r\n",
+        "From: =?UTF-8?B?R29vZ2xlIOWboumYnw==?= <updates@google.invalid>\r\n",
+        "To: Fixture User <fixture@example.invalid>\r\n",
+        "Subject: =?UTF-8?B?5oKo55qE5q+P5pyI?=\r\n",
+        " =?UTF-8?B?5a6J5YWo5pGY6KaB?=\r\n",
+        "Message-ID: <gmail-fixture-1@google.invalid>\r\n",
+        "In-Reply-To: <gmail-parent@google.invalid>\r\n",
+        "References: <gmail-root@google.invalid>\r\n",
+        " <gmail-parent@google.invalid>\r\n",
+        "Date: Wed, 02 Sep 2026 08:00:00 +0000\r\n",
+        "MIME-Version: 1.0\r\n",
+        "List-Unsubscribe: <mailto:unsubscribe@google.invalid>,\r\n",
+        " <https://google.invalid/unsubscribe>\r\n",
+        "Content-Type: multipart/alternative; boundary=\"gmail-alt\"\r\n",
+        "\r\n",
+        "--gmail-alt\r\n",
+        "Content-Type: text/plain; charset=UTF-8\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "6L+Z5pivIEdtYWlsIOmjjuagvOeahOWuieWFqOaRmOimgeOAgg==\r\n",
+        "--gmail-alt\r\n",
+        "Content-Type: text/html; charset=UTF-8\r\n",
+        "Content-Transfer-Encoding: 8bit\r\n",
+        "\r\n",
+        "<html><body><p style=\"color:red\" onclick=\"evil()\">Gmail 安全摘要</p><img src=\"http://tracker.invalid/pixel\"><img src=\"https://images.invalid/logo.png\"><a href=\"javascript:alert(1)\">bad</a></body></html>\r\n",
+        "--gmail-alt--\r\n",
+    );
+
+    const QQ_FIXTURE: &str = concat!(
+        "Received: from qqmail.invalid by fixture.invalid; Wed, 02 Sep 2026 16:10:00 +0800\r\n",
+        "From: =?GB2312?B?UVHTys/k?= <notice@qq.invalid>\r\n",
+        "To: fixture@example.invalid\r\n",
+        "Subject: =?GB2312?B?UVHTys/kzajWqg==?=\r\n",
+        "Message-ID: <qq-fixture-1@qq.invalid>\r\n",
+        "Date: Wed, 02 Sep 2026 16:10:00 +0800\r\n",
+        "MIME-Version: 1.0\r\n",
+        "X-QQ-mid: esmtp-test-fixture\r\n",
+        "X-QQ-STYLE: 1\r\n",
+        "Content-Type: multipart/mixed; boundary=\"qq-mixed\"\r\n",
+        "\r\n",
+        "--qq-mixed\r\n",
+        "Content-Type: multipart/alternative; boundary=\"qq-alt\"\r\n",
+        "\r\n",
+        "--qq-alt\r\n",
+        "Content-Type: text/plain; charset=gb18030\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "1eLKx8C019RRUdPKz+S1xNbQzsTV/c7EoaMNCrXatv7Q0KGj\r\n",
+        "--qq-alt\r\n",
+        "Content-Type: text/html; charset=gb18030\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "PGh0bWw+PGJvZHk+PHA+UVHTys/kuLvOxLG+PC9wPjxpbWcgc3JjPSJodHRwOi8vdHJhY2tlci5leGFtcGxlL3BpeGVsIj48aW1nIHNyYz0iaHR0cHM6Ly9pbWFnZXMuZXhhbXBsZS9sb2dvLnBuZyI+PC9ib2R5PjwvaHRtbD4=\r\n",
+        "--qq-alt--\r\n",
+        "--qq-mixed\r\n",
+        "Content-Type: application/pdf; name=\"=?GB2312?B?1cu1pS5wZGY=?=\"\r\n",
+        "Content-Disposition: attachment; filename=\"=?GB2312?B?1cu1pS5wZGY=?=\"\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "JVBERi0xLjQK\r\n",
+        "--qq-mixed--\r\n",
+    );
+
+    const OUTLOOK_FIXTURE: &str = concat!(
+        "From: Microsoft Teams <noreply@teams.microsoft.invalid>\r\n",
+        "To: Fixture User <fixture@example.invalid>\r\n",
+        "Subject: =?UTF-8?B?5Lya6K6u6YKA6K+377ya5Lqn5ZOB6K+E5a6h?=\r\n",
+        "Message-ID: <outlook-fixture-1@outlook.invalid>\r\n",
+        "Date: Wed, 02 Sep 2026 08:30:00 +0000\r\n",
+        "Thread-Topic: Product review\r\n",
+        "Thread-Index: AQHfixtureindex\r\n",
+        "Content-Language: zh-CN\r\n",
+        "MIME-Version: 1.0\r\n",
+        "Content-Type: multipart/mixed; boundary=\"outlook-mixed\"\r\n",
+        "\r\n",
+        "--outlook-mixed\r\n",
+        "Content-Type: multipart/related; boundary=\"outlook-related\"\r\n",
+        "\r\n",
+        "--outlook-related\r\n",
+        "Content-Type: multipart/alternative; boundary=\"outlook-alt\"\r\n",
+        "\r\n",
+        "--outlook-alt\r\n",
+        "Content-Type: text/plain; charset=utf-8\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "6K+35Y+C5Yqg5Lqn5ZOB6K+E5a6h5Lya6K6u44CC\r\n",
+        "--outlook-alt\r\n",
+        "Content-Type: text/html; charset=utf-8\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "PGh0bWwgeG1sbnM6bz0idXJuOnNjaGVtYXMtbWljcm9zb2Z0LWNvbTpvZmZpY2U6b2ZmaWNlIj48aGVhZD48c3R5bGU+Lk1zb05vcm1hbHtjb2xvcjpyZWR9PC9zdHlsZT48L2hlYWQ+PGJvZHk+PHAgY2xhc3M9Ik1zb05vcm1hbCIgc3R5bGU9ImNvbG9yOnJlZCIgb25jbGljaz0iZXZpbCgpIj7kuqflk4Hor4TlrqHkvJrorq48L3A+PGltZyBzcmM9ImNpZDppbWFnZTAwMS5wbmdAb3V0bG9vayI+PC9ib2R5PjwvaHRtbD4=\r\n",
+        "--outlook-alt--\r\n",
+        "--outlook-related\r\n",
+        "Content-Type: image/png; name=\"image001.png\"\r\n",
+        "Content-Disposition: inline; filename=\"image001.png\"\r\n",
+        "Content-ID: <image001.png@outlook>\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=\r\n",
+        "--outlook-related--\r\n",
+        "--outlook-mixed\r\n",
+        "Content-Type: text/calendar; method=REQUEST; charset=utf-8;\r\n",
+        " name*=utf-8''%E4%BC%9A%E8%AE%AE%E9%82%80%E8%AF%B7.ics\r\n",
+        "Content-Disposition: attachment;\r\n",
+        " filename*=utf-8''%E4%BC%9A%E8%AE%AE%E9%82%80%E8%AF%B7.ics\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "QkVHSU46VkNBTEVOREFSDQpWRVJTSU9OOjIuMA0KTUVUSE9EOlJFUVVFU1QNCkJFR0lOOlZFVkVOVA0KU1VNTUFSWTrkuqflk4Hor4TlrqENCkVORDpWRVZFTlQNCkVORDpWQ0FMRU5EQVINCg==\r\n",
+        "--outlook-mixed--\r\n",
+    );
+
     #[test]
     fn parses_and_sanitizes_full_message() {
         let message = parse_full("account", "INBOX", 7, true, false, RAW.as_bytes()).unwrap();
@@ -620,6 +752,129 @@ mod tests {
         let html = message.html_body.unwrap();
         assert!(html.contains("<strong>notice</strong>"));
         assert!(!html.contains("script"));
+    }
+
+    #[test]
+    fn parses_gmail_folded_headers_and_sanitizes_tracking_html() {
+        let header = parse_header(
+            "gmail-account",
+            "INBOX",
+            101,
+            true,
+            false,
+            GMAIL_FIXTURE.as_bytes(),
+        )
+        .unwrap();
+        let message = parse_full(
+            "gmail-account",
+            "INBOX",
+            101,
+            true,
+            false,
+            GMAIL_FIXTURE.as_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(header.subject, "您的每月安全摘要");
+        assert_eq!(message.subject, header.subject);
+        assert_eq!(message.sender_name, "Google 团队");
+        assert_eq!(message.sender_email, "updates@google.invalid");
+        assert_eq!(message.thread_id, "gmail-root@google.invalid");
+        assert_eq!(
+            message.references,
+            ["gmail-root@google.invalid", "gmail-parent@google.invalid"]
+        );
+        assert!(message.text_body.contains("Gmail 风格的安全摘要"));
+        assert_eq!(message.preview, "这是 Gmail 风格的安全摘要。");
+        let html = message.html_body.unwrap();
+        assert!(html.contains("Gmail 安全摘要"));
+        assert!(html.contains("https://images.invalid/logo.png"));
+        assert!(!html.contains("http://tracker.invalid"));
+        assert!(!html.contains("onclick"));
+        assert!(!html.contains("style="));
+        assert!(!html.contains("javascript:"));
+    }
+
+    #[test]
+    fn parses_qq_gb18030_bodies_and_encoded_attachment_names() {
+        let message = parse_full(
+            "qq-account",
+            "INBOX",
+            202,
+            true,
+            false,
+            QQ_FIXTURE.as_bytes(),
+        )
+        .unwrap();
+        let payloads = extract_attachment_payloads(QQ_FIXTURE.as_bytes()).unwrap();
+
+        assert_eq!(message.subject, "QQ邮箱通知");
+        assert_eq!(message.sender_name, "QQ邮箱");
+        assert_eq!(message.sender_email, "notice@qq.invalid");
+        assert!(message.text_body.contains("这是来自QQ邮箱的中文正文。"));
+        assert!(message.text_body.contains("第二行。"));
+        assert_eq!(message.preview, "这是来自QQ邮箱的中文正文。 第二行。");
+        let html = message.html_body.unwrap();
+        assert!(html.contains("QQ邮箱富文本"));
+        assert!(html.contains("https://images.example/logo.png"));
+        assert!(!html.contains("http://tracker.example"));
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(message.attachments[0].file_name, "账单.pdf");
+        assert_eq!(message.attachments[0].content_type, "application/pdf");
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].bytes, b"%PDF-1.4\n");
+    }
+
+    #[test]
+    fn parses_outlook_related_calendar_and_embeds_inline_content() {
+        let mut message = parse_full(
+            "outlook-account",
+            "INBOX",
+            303,
+            false,
+            true,
+            OUTLOOK_FIXTURE.as_bytes(),
+        )
+        .unwrap();
+        let payloads = extract_attachment_payloads(OUTLOOK_FIXTURE.as_bytes()).unwrap();
+
+        assert_eq!(message.subject, "会议邀请：产品评审");
+        assert_eq!(message.sender_name, "Microsoft Teams");
+        assert!(message.text_body.contains("请参加产品评审会议。"));
+        assert_eq!(message.preview, "请参加产品评审会议。");
+        let sanitized = message.html_body.as_deref().unwrap();
+        assert!(sanitized.contains("产品评审会议"));
+        assert!(sanitized.contains("cid:image001.png@outlook"));
+        assert!(!sanitized.contains("onclick"));
+        assert!(!sanitized.contains("color:red"));
+        assert_eq!(message.attachments.len(), 2);
+        assert!(message.attachments.iter().any(|attachment| {
+            attachment.file_name == "会议邀请.ics" && attachment.content_type == "text/calendar"
+        }));
+        assert!(payloads.iter().any(|payload| {
+            payload.content_type == "text/calendar"
+                && payload
+                    .bytes
+                    .windows(b"SUMMARY:".len())
+                    .any(|window| window == b"SUMMARY:")
+        }));
+
+        embed_inline_images(&mut message.html_body, &payloads);
+        assert!(message
+            .html_body
+            .as_deref()
+            .is_some_and(|html| html.contains("data:image/png;base64,")));
+    }
+
+    #[test]
+    fn preview_normalization_stops_at_the_renderer_bound() {
+        let body = format!("  {}\nshould-not-be-scanned", "正文 \t".repeat(10_000));
+        let preview = bounded_preview(&body);
+        assert!(preview.starts_with("正文 正文"));
+        assert!(!preview.contains('\n'));
+        assert!(!preview.contains('\t'));
+        assert!(!preview.contains("  "));
+        assert!(preview.chars().count() <= MAX_PREVIEW_CHARS);
     }
 
     #[test]
