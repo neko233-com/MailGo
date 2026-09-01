@@ -1335,6 +1335,17 @@ pub fn needs_reauthorization(error: &anyhow::Error) -> bool {
     classify_sync_error(error) == SyncErrorClass::Authentication
 }
 
+/// Return a privacy-safe category for diagnostics without persisting provider responses,
+/// addresses, or credentials in the local application log.
+pub fn error_category(error: &anyhow::Error, provider: ProviderKind) -> &'static str {
+    match classify_sync_error_for_provider(error, provider) {
+        SyncErrorClass::Authentication => "authentication",
+        SyncErrorClass::RateLimited => "rate-limit",
+        SyncErrorClass::Transport => "network",
+        SyncErrorClass::Permanent => "provider",
+    }
+}
+
 /// Only transient provider failures may enter the encrypted offline mutation queue. Permanent
 /// command failures and authentication errors must reach the renderer immediately instead of
 /// being replayed forever with stale credentials or an invalid destination.
@@ -3024,6 +3035,14 @@ mod tests {
         assert_eq!(
             classify_sync_error(&anyhow!("message headers could not be parsed")),
             SyncErrorClass::Permanent
+        );
+        assert_eq!(
+            error_category(&anyhow!("IMAP authentication failed"), ProviderKind::Qq),
+            "authentication"
+        );
+        assert_eq!(
+            error_category(&anyhow!("connection reset by peer"), ProviderKind::Qq),
+            "network"
         );
         assert!(needs_reauthorization(&anyhow!(
             "OAuth access token expired; reauthorization is required"

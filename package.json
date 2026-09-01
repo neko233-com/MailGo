@@ -16,6 +16,7 @@
     "release:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1"
   },
   "dependencies": {
+    "@tanstack/react-virtual": "^3.14.10",
     "motion": "^13.1.1",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",

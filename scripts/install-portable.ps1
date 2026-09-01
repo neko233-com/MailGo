@@ -98,6 +98,13 @@ try {
     if (!(Test-Path -LiteralPath $stagedExecutable -PathType Leaf)) { throw 'portable archive is missing MailGo.exe' }
     $header = [System.IO.File]::ReadAllBytes($stagedExecutable)
     if ($header.Length -lt 2 -or $header[0] -ne 0x4d -or $header[1] -ne 0x5a) { throw 'MailGo.exe is not a valid Windows PE file' }
+    $peOffset = [System.BitConverter]::ToInt32($header, 0x3c)
+    $subsystemOffset = $peOffset + 24 + 68
+    if ($peOffset -lt 0 -or $subsystemOffset + 2 -gt $header.Length) { throw 'MailGo.exe has an invalid PE optional header' }
+    $subsystem = [System.BitConverter]::ToUInt16($header, $subsystemOffset)
+    if ($subsystem -ne 2) { throw "MailGo.exe uses PE subsystem $subsystem; refusing to install a desktop build that opens a console window" }
+    $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($stagedExecutable)
+    if ($versionInfo.ProductName -ne 'MailGo') { throw 'MailGo.exe is missing the embedded MailGo Windows resource metadata and application icon' }
     if (!(Test-Path -LiteralPath (Join-Path $stagingRoot 'dist\index.html') -PathType Leaf)) { throw 'portable archive is missing the renderer' }
     if (!(Test-Path -LiteralPath (Join-Path $stagingRoot 'resources\icons\mailgo.ico') -PathType Leaf)) { throw 'portable archive is missing the tray icon' }
 

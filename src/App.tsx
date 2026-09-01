@@ -1,4 +1,5 @@
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
+import { useVirtualizer } from '@tanstack/react-virtual'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Icon, type IconName } from './components/Icon'
 import { sanitizeCustomCss } from './customCss'
@@ -13,6 +14,9 @@ type ActionMenu = 'bulk' | 'message'
 type TransferMode = 'export-encrypted' | 'import-encrypted'
 type MobilePane = 'list' | 'reading'
 type MailMoveTarget = { folder: string; label: string; icon: IconName }
+type VirtualMailItem =
+  | { type: 'group'; key: string; label: string }
+  | { type: 'mail'; key: string; mail: MailMessage }
 const MAX_CUSTOM_CSS_LENGTH = 64 * 1024
 
 const smartCategories: { id: SmartCategory; label: string; icon: IconName; color: string }[] = [
@@ -20,6 +24,13 @@ const smartCategories: { id: SmartCategory; label: string; icon: IconName; color
   { id: 'apple-ads', label: 'Apple 广告', icon: 'grid', color: '#ed7191' },
   { id: 'social', label: '社交通知', icon: 'message', color: '#46cfa1' },
   { id: 'ads', label: '其他广告', icon: 'bell', color: '#f0a868' },
+]
+
+const inboxTabs: { id: string; label: string; icon: IconName; category: SmartCategory | null }[] = [
+  { id: 'primary', label: '主要', icon: 'inbox', category: null },
+  { id: 'updates', label: '动态', icon: 'bell', category: 'social' },
+  { id: 'apple-connect', label: 'Apple Connect', icon: 'shieldCheck', category: 'apple-connect' },
+  { id: 'promotions', label: '推广', icon: 'grid', category: 'ads' },
 ]
 
 const initialHtml = `
@@ -322,7 +333,7 @@ function writeLocalStorageValue(key: string, value: string) {
 
 function loadTheme(): ThemeMode {
   const stored = readLocalStorageValue('mailgo-theme')
-  return stored === 'light' ? 'light' : 'dark'
+  return stored === 'dark' ? 'dark' : 'light'
 }
 
 function loadRemoteImages() {
@@ -398,7 +409,9 @@ function App() {
   const [selectedMailId, setSelectedMailId] = useState(() => isNativeRuntime ? '' : 'launch-plan')
   const [selectedMailIds, setSelectedMailIds] = useState<string[]>([])
   const [mobilePane, setMobilePane] = useState<MobilePane>('list')
+  const [isMobileLayout, setMobileLayout] = useState(() => window.matchMedia('(max-width: 760px)').matches)
   const [isMobileSidebarOpen, setMobileSidebarOpen] = useState(false)
+  const [isSidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [isMobileAuthOpen, setMobileAuthOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [filterUnread, setFilterUnread] = useState(false)
@@ -408,12 +421,13 @@ function App() {
   const [composeSource, setComposeSource] = useState<MailMessage | undefined>()
   const [isAccountModalOpen, setAccountModalOpen] = useState(false)
   const [isAddingAccount, setAddingAccount] = useState(false)
-  const [isAuthPanelOpen, setAuthPanelOpen] = useState(true)
+  const [isAuthPanelOpen, setAuthPanelOpen] = useState(false)
   const [isSettingsOpen, setSettingsOpen] = useState(false)
   const [openMenu, setOpenMenu] = useState<ActionMenu | null>(null)
   const [isHelpOpen, setHelpOpen] = useState(false)
   const [isSyncing, setSyncing] = useState(false)
   const [isLoadingEarlier, setLoadingEarlier] = useState(false)
+  const [loadingMessageId, setLoadingMessageId] = useState<string | null>(null)
   const [mailboxMeta, setMailboxMeta] = useState<Record<string, { oldestUid?: number; hasMore?: boolean }>>({})
   const [nativeFolders, setNativeFolders] = useState<Record<string, string[]>>({})
   const [selectedNativeFolder, setSelectedNativeFolder] = useState<{ accountId: string; name: string } | null>(null)
@@ -457,7 +471,9 @@ function App() {
   const isAddingAccountRef = useRef(false)
   const selectedMailRef = useRef<MailMessage | undefined>(undefined)
   const attachmentCancelsRef = useRef(new Map<string, () => void>())
+  const mailListRef = useRef<HTMLDivElement>(null)
   const [nativeStateReady, setNativeStateReady] = useState(!isNativeRuntime)
+  const [nativeStateError, setNativeStateError] = useState<string | null>(null)
 
   const openExternalUrl = async (url: string) => {
     if (isNativeRuntime) {
@@ -484,6 +500,16 @@ function App() {
   useEffect(() => () => {
     attachmentCancelsRef.current.forEach((cancel) => cancel())
     attachmentCancelsRef.current.clear()
+  }, [])
+
+  useEffect(() => {
+    const media = window.matchMedia('(max-width: 760px)')
+    const updateLayout = (event: MediaQueryListEvent) => {
+      setMobileLayout(event.matches)
+      if (!event.matches) setMobileSidebarOpen(false)
+    }
+    media.addEventListener('change', updateLayout)
+    return () => media.removeEventListener('change', updateLayout)
   }, [])
 
   const pushToast = (message: string, tone: ToastTone = 'info') => {
@@ -675,6 +701,10 @@ function App() {
   }, [isNativeRuntime, nativeStateReady, offlineMode])
 
   useEffect(() => {
+    if (!isNativeRuntime) {
+      setNativeStateReady(true)
+      return
+    }
     let cancelled = false
     void readNativeState().then(async (nativeState) => {
       if (cancelled) return
@@ -682,6 +712,7 @@ function App() {
         setNativeStateReady(true)
         return
       }
+      setNativeStateError(null)
       if (isNativeRuntime) setAccounts(nativeState.accounts)
       if (isNativeRuntime) setNativeFolders(nativeState.folders ?? {})
       if (isNativeRuntime) {
@@ -709,11 +740,16 @@ function App() {
             setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(account.id, result.mailbox!.folder)]: { oldestUid: result.mailbox!.oldestUid, hasMore: result.mailbox!.hasMore } }))
           }
           setMails((current) => [...current.filter((mail) => mail.accountId !== account.id), ...converted])
-          if (converted.length) setSelectedMailId((current) => current === 'launch-plan' ? converted[0].id : current)
+          if (converted.length) setSelectedMailId((current) => !current || current === 'launch-plan' ? converted[0].id : current)
         } catch {
           // An empty cache is a valid first-run state; sync will populate it later.
         }
       }))
+    }).catch((error) => {
+      if (cancelled) return
+      setNativeStateError(error instanceof Error ? error.message : '无法连接本地邮件服务')
+      setNativeStateReady(true)
+      pushToast('本地邮件服务连接失败，账户与缓存没有被修改', 'error')
     })
     return () => { cancelled = true }
   }, [isNativeRuntime])
@@ -722,18 +758,38 @@ function App() {
     if (!isNativeRuntime) return
     let cancelled = false
     const refreshBackgroundStatuses = async () => {
-      const nativeState = await readNativeState()
-      if (cancelled || !nativeState) return
-      setAccounts((current) => current.map((account) => {
-        const refreshed = nativeState.accounts.find((item) => item.id === account.id)
-        return refreshed
-          ? { ...account, unread: refreshed.unread, status: refreshed.status, lastSync: refreshed.lastSync }
-          : account
-      }))
+      try {
+        const nativeState = await readNativeState()
+        if (cancelled || !nativeState) return
+        setNativeStateError(null)
+        setAccounts((current) => current.map((account) => {
+          const refreshed = nativeState.accounts.find((item) => item.id === account.id)
+          return refreshed
+            ? { ...account, unread: refreshed.unread, status: refreshed.status, lastSync: refreshed.lastSync }
+            : account
+        }))
+        setNativeFolders(nativeState.folders ?? {})
+        await Promise.all(nativeState.accounts.map(async (account) => {
+          try {
+            const result = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id })
+            if (cancelled || !result.mailbox) return
+            const converted = result.mailbox.messages.map((message) => nativeMessageToUi(message, account))
+            setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(account.id, result.mailbox!.folder)]: { oldestUid: result.mailbox!.oldestUid, hasMore: result.mailbox!.hasMore } }))
+            setMails((current) => [...current.filter((mail) => mail.accountId !== account.id), ...converted])
+            if (converted.length) setSelectedMailId((current) => !current || current === 'launch-plan' ? converted[0].id : current)
+          } catch {
+            // The background scheduler may still be committing this mailbox snapshot; retry on the next local refresh.
+          }
+        }))
+      } catch (error) {
+        if (!cancelled) setNativeStateError(error instanceof Error ? error.message : '无法连接本地邮件服务')
+      }
     }
+    const initialTimer = window.setTimeout(() => { void refreshBackgroundStatuses() }, 4_000)
     const timer = window.setInterval(() => { void refreshBackgroundStatuses() }, 30_000)
     return () => {
       cancelled = true
+      window.clearTimeout(initialTimer)
       window.clearInterval(timer)
     }
   }, [isNativeRuntime])
@@ -904,7 +960,9 @@ function App() {
                 : mail.folder === selectedFolder
             })()
       const accountMatch = selectedNativeFolder ? true : !selectedAccountId || mail.accountId === selectedAccountId
-      const categoryMatch = !selectedCategory || mail.category === selectedCategory
+      const categoryMatch = !selectedCategory || (selectedCategory === 'ads'
+        ? mail.category === 'ads' || mail.category === 'apple-ads'
+        : mail.category === selectedCategory)
       const adMatch = !hideAds || !mail.isAd || Boolean(selectedCategory)
       const unreadMatch = !filterUnread || mail.unread
       const queryMatch = !lowerQuery || `${mail.senderName} ${mail.subject} ${mail.preview}`.toLowerCase().includes(lowerQuery)
@@ -944,6 +1002,23 @@ function App() {
     }, {})
   }, [visibleMails])
 
+  const virtualMailItems = useMemo<VirtualMailItem[]>(() => Object.entries(groupedMails).flatMap(([group, groupMails]) => [
+    { type: 'group' as const, key: `group:${group}`, label: group },
+    ...groupMails.map((mail) => ({ type: 'mail' as const, key: `mail:${mail.id}`, mail })),
+  ]), [groupedMails])
+  const getVirtualMailKey = useCallback(
+    (index: number) => virtualMailItems[index]?.key ?? `mail-index:${index}`,
+    [virtualMailItems],
+  )
+  const mailListVirtualizer = useVirtualizer({
+    count: virtualMailItems.length,
+    getScrollElement: () => mailListRef.current,
+    estimateSize: (index) => virtualMailItems[index]?.type === 'group' ? 32 : 70,
+    getItemKey: getVirtualMailKey,
+    overscan: 8,
+    useFlushSync: false,
+  })
+
   const selectedVisibleMails = useMemo(
     () => visibleMails.filter((mail) => selectedMailIds.includes(mail.id)),
     [selectedMailIds, visibleMails],
@@ -958,6 +1033,7 @@ function App() {
   const selectMail = async (mail: MailMessage) => {
     setSelectedMailId(mail.id)
     setMobilePane('reading')
+    setLoadingMessageId(null)
     const localDraft = nativeDrafts.find((draft) => mail.id === `local-draft:${draft.accountId}:${draft.id}`)
     if (localDraft) {
       setSelectedAccountId(localDraft.accountId)
@@ -976,6 +1052,7 @@ function App() {
             : account))
           pushToast('邮件仍未标记为已读，请重新授权或稍后重试', 'error')
         })
+      setLoadingMessageId(mail.id)
       try {
         const result = await invoke<NativeMessageResponse>('mail.get', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid })
         const account = accounts.find((item) => item.id === mail.accountId)
@@ -985,6 +1062,8 @@ function App() {
         }
       } catch {
         pushToast('邮件正文加载失败，仍可查看本地摘要', 'info')
+      } finally {
+        setLoadingMessageId((current) => current === mail.id ? null : current)
       }
     }
   }
@@ -1378,7 +1457,7 @@ function App() {
       const converted = result.mailbox.messages.map((message) => nativeMessageToUi(message, account))
       setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(account.id, folder)]: { oldestUid: result.mailbox!.oldestUid, hasMore: result.mailbox!.hasMore } }))
       setMails((current) => [...current.filter((mail) => !(mail.accountId === account.id && mail.nativeFolder && isSameNativeFolder(mail.nativeFolder, folder))), ...converted])
-      if (converted.length) setSelectedMailId((current) => current === 'launch-plan' ? converted[0].id : current)
+      if (converted.length) setSelectedMailId((current) => !current || current === 'launch-plan' ? converted[0].id : current)
     }).catch(() => pushToast(`${account.label} 的“${nativeFolderLabel(folder)}”暂时无法读取`, 'error'))
   }
 
@@ -1425,6 +1504,14 @@ function App() {
     }
   }
 
+  const handleMailListScroll = (event: React.UIEvent<HTMLDivElement>) => {
+    const element = event.currentTarget
+    const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight
+    if (distanceFromBottom <= 280 && canLoadEarlier && !isLoadingEarlier) {
+      void loadEarlier()
+    }
+  }
+
   const selectCategory = (category: SmartCategory) => {
     setSelectedCategory(category)
     setMobilePane('list')
@@ -1432,7 +1519,9 @@ function App() {
     setSelectedFolder('inbox')
     setSelectedNativeFolder(null)
     setSelectedAccountId(null)
-    const first = mails.find((mail) => mail.category === category)
+    const first = allMails.find((mail) => category === 'ads'
+      ? mail.category === 'ads' || mail.category === 'apple-ads'
+      : mail.category === category)
     if (first) setSelectedMailId(first.id)
   }
 
@@ -1956,15 +2045,53 @@ function App() {
     [accounts, nativeFolders],
   )
 
+  const activeMailboxTitle = selectedNativeFolder
+    ? nativeFolderLabel(selectedNativeFolder.name)
+    : selectedCategory
+      ? (smartCategories.find((category) => category.id === selectedCategory)?.label ?? '智能分类')
+      : (displayedFolderLabels.find((folder) => folder.id === selectedFolder)?.label ?? '收件箱')
+  const hasAccountNeedingAuth = accounts.some((account) => account.status === 'needs-auth')
+  const hasOfflineAccount = accounts.some((account) => account.status === 'offline')
+  const syncStatusLabel = nativeStateError
+    ? '本地服务连接失败'
+    : offlineMode
+      ? '仅离线模式'
+      : accounts.length === 0
+        ? '等待添加账户'
+        : isSyncing || accounts.some((account) => account.status === 'syncing')
+          ? '正在后台同步'
+          : hasAccountNeedingAuth
+            ? '账户需要重新授权'
+            : hasOfflineAccount
+              ? '后台同步待重试'
+              : '所有账户已同步'
+  const syncStatusTone = nativeStateError || hasAccountNeedingAuth ? 'is-error' : offlineMode || hasOfflineAccount ? 'is-offline' : ''
+  const toggleNavigation = () => {
+    if (isMobileLayout) {
+      setMobileSidebarOpen((value) => !value)
+      return
+    }
+    setSidebarCollapsed((value) => !value)
+  }
+
   return (
     <div className="app-shell">
       <style>{`.reicon { width: 1em; height: 1em; }`}</style>
       <header className="titlebar" data-rdesktop-drag="true" onDoubleClick={() => window.__RDESKTOP_WINDOW__?.maximize()}>
-        <div className="titlebar-brand"><BrandMark /><span>MailGo</span></div>
-        <div className="titlebar-center">统一收件箱</div>
+        <div className="titlebar-brand" data-no-drag="true">
+          <TooltipButton label={isMobileLayout ? (isMobileSidebarOpen ? '关闭导航' : '打开导航') : isSidebarCollapsed ? '展开导航' : '收起导航'} className="titlebar-menu" ariaExpanded={isMobileLayout ? isMobileSidebarOpen : !isSidebarCollapsed} onClick={toggleNavigation}><Icon name="menu" size={20} /></TooltipButton>
+          <BrandMark /><span>MailGo</span>
+        </div>
+        <div className="titlebar-search" data-no-drag="true" onDoubleClick={(event) => event.stopPropagation()}>
+          <div className="search-wrap"><Icon name="search" size={19} /><input id="mail-search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索邮件" aria-label="搜索邮件" /><kbd>Ctrl K</kbd>{query.trim().length >= 2 && isNativeRuntime && <span className={`search-status search-${serverSearchState}`} aria-live="polite">{serverSearchState === 'searching' && <span className="loading-spinner loading-spinner-small" aria-hidden="true" />}{serverSearchState === 'searching' ? '服务端搜索中…' : serverSearchState === 'error' ? '服务端搜索失败，显示本地结果' : serverSearchTruncated ? '已显示部分结果' : '本地 + 服务端'}</span>}</div>
+        </div>
+        <div className="titlebar-utilities" data-no-drag="true">
+          <button type="button" className={`sync-summary ${syncStatusTone}`} onClick={handleSync} aria-label={`${syncStatusLabel}，点击立即同步`}><span className="sync-summary-dot" />{syncStatusLabel}</button>
+          <TooltipButton label="授权码助手" active={isAuthPanelOpen} ariaExpanded={isAuthPanelOpen} onClick={() => { setMobileAuthOpen(true); setAuthPanelOpen(true) }}><Icon name="key" size={18} /></TooltipButton>
+          <TooltipButton label="偏好设置" active={isSettingsOpen} ariaExpanded={isSettingsOpen} onClick={() => setSettingsOpen((value) => !value)}><Icon name="settings" size={18} /></TooltipButton>
+          <TooltipButton label={theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'} onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}><Icon name={theme === 'dark' ? 'moon' : 'theme'} size={18} /></TooltipButton>
+        </div>
         <div className="window-controls" data-no-drag="true">
-          <TooltipButton label="打开导航" className="mobile-only-button" ariaExpanded={isMobileSidebarOpen} onClick={() => setMobileSidebarOpen((value) => !value)}><Icon name="menu" size={17} /></TooltipButton>
-          <TooltipButton label="打开授权码助手" className="mobile-only-button" ariaExpanded={isMobileAuthOpen} onClick={() => { setMobileAuthOpen(true); setAuthPanelOpen(true) }}><Icon name="key" size={17} /></TooltipButton>
           <TooltipButton label="写邮件" className="mobile-only-button" onClick={() => openCompose()}><Icon name="edit" size={17} /></TooltipButton>
           <TooltipButton label="最小化" onClick={() => window.__RDESKTOP_WINDOW__?.minimize()}><span className="window-minimize" /></TooltipButton>
           <TooltipButton label="最大化" onClick={() => window.__RDESKTOP_WINDOW__?.maximize()}><Icon name="maximize" size={16} /></TooltipButton>
@@ -1972,7 +2099,7 @@ function App() {
         </div>
       </header>
 
-      <div className={`workspace mobile-pane-${mobilePane}`}>
+      <div className={`workspace mobile-pane-${mobilePane} ${isSidebarCollapsed ? 'is-sidebar-collapsed' : ''}`}>
         {isMobileSidebarOpen && <button className="mobile-overlay" type="button" aria-label="关闭导航" onClick={() => setMobileSidebarOpen(false)} />}
         <aside className={`sidebar ${isMobileSidebarOpen ? 'is-mobile-open' : ''}`}>
           <div className="sidebar-top">
@@ -2049,15 +2176,21 @@ function App() {
           <div className="sidebar-footer">
             <TooltipButton label="设置" active={isSettingsOpen} onClick={() => setSettingsOpen((value) => !value)}><Icon name="settings" size={19} /></TooltipButton>
             <TooltipButton label="帮助中心" active={isHelpOpen} onClick={() => { setOpenMenu(null); setHelpOpen(true) }}><Icon name="help" size={19} /></TooltipButton>
-            <TooltipButton label="收起侧栏" className="sidebar-collapse"><Icon name="menu" size={19} /></TooltipButton>
+            <TooltipButton label={isSidebarCollapsed ? '展开侧栏' : '收起侧栏'} className="sidebar-collapse" onClick={toggleNavigation}><Icon name="menu" size={19} /></TooltipButton>
           </div>
         </aside>
 
         <main className="mail-list-panel">
           <div className="panel-toolbar">
-            <div className="search-wrap"><Icon name="search" size={19} /><input id="mail-search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索邮件" aria-label="搜索邮件" /><kbd>Ctrl K</kbd>{query.trim().length >= 2 && isNativeRuntime && <span className={`search-status search-${serverSearchState}`} aria-live="polite">{serverSearchState === 'searching' ? '服务端搜索中…' : serverSearchState === 'error' ? '服务端搜索失败，显示本地结果' : serverSearchTruncated ? '已显示部分结果' : '本地 + 服务端'}</span>}</div>
+            <div className="mailbox-heading"><strong>{activeMailboxTitle}</strong><span>{visibleMails.length} 封邮件</span></div>
             <button className={`filter-button ${filterUnread ? 'is-active' : ''}`} type="button" onClick={() => setFilterUnread((value) => !value)}><Icon name="filter" size={17} /> 筛选{filterUnread && <span className="filter-dot" />}</button>
           </div>
+          {selectedFolder === 'inbox' && !selectedNativeFolder && <nav className="inbox-tabs" aria-label="收件箱分类">
+            {inboxTabs.map((tab) => {
+              const selected = tab.category === selectedCategory
+              return <button key={tab.id} type="button" className={selected ? 'is-selected' : ''} aria-current={selected ? 'page' : undefined} onClick={() => { if (tab.category) selectCategory(tab.category); else selectFolder('inbox') }}><Icon name={tab.icon} size={17} weight={selected ? 'Filled' : 'Outline'} /><span>{tab.label}</span></button>
+            })}
+          </nav>}
           <div className="list-toolbar">
             <label className="checkbox-wrap"><input type="checkbox" aria-label="选择所有邮件" checked={allVisibleSelected} onChange={toggleAllVisible} /><span /></label>{selectedVisibleMails.length > 0 && <span className="selection-count">已选 {selectedVisibleMails.length} 封</span>}
             <button type="button" className="toolbar-action" onClick={() => { void applyBulkMove('archive') }} disabled={!selectedVisibleMails.length}><Icon name="archive" size={17} /> <span>归档</span></button>
@@ -2075,23 +2208,26 @@ function App() {
               </div>}
             </div>
           </div>
-          <div className="mail-list-scroll">
-            <AnimatePresence initial={false} mode="popLayout">
-              {Object.entries(groupedMails).map(([group, mails]) => (
-                <motion.section key={group} className="mail-group" initial={prefersReducedMotion ? false : { opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-                  <div className="mail-group-label">{group}</div>
-                  {mails.map((mail) => (
-                    <motion.div layout key={mail.id} className={`mail-row ${selectedMailId === mail.id ? 'is-selected' : ''} ${mail.unread ? 'is-unread' : ''}`} onClick={() => selectMail(mail)} whileHover={prefersReducedMotion ? undefined : { y: -1 }} transition={{ duration: 0.16 }}>
-                      <label className="checkbox-wrap row-checkbox" onClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`选择 ${mail.subject}`} checked={selectedMailIds.includes(mail.id)} onChange={() => toggleMailSelection(mail.id)} /><span /></label>
-                      <Avatar message={mail} size="md" />
-                      <div className="mail-row-copy"><div className="mail-row-top"><strong>{mail.senderName}</strong><time>{mail.timestamp}</time></div><div className="mail-row-subject">{mail.subject}</div><p>{mail.preview}</p></div>
-                      <button type="button" className={`star-button ${mail.starred ? 'is-starred' : ''}`} aria-label={mail.starred ? '取消星标' : '添加星标'} onClick={(event) => { event.stopPropagation(); toggleStar(mail) }}><Icon name="star" size={19} weight={mail.starred ? 'Filled' : 'Outline'} /></button>
-                    </motion.div>
-                  ))}
-                </motion.section>
-              ))}
-            </AnimatePresence>
+          <div ref={mailListRef} className="mail-list-scroll" onScroll={handleMailListScroll} aria-busy={isNativeRuntime && !nativeStateReady || isLoadingEarlier}>
+            {isNativeRuntime && !nativeStateReady && <div className="list-loading-strip" role="status"><span className="loading-spinner" aria-hidden="true" /><span>正在读取本地账户与缓存，主界面已可操作</span></div>}
+            {nativeStateError && <div className="local-state-error" role="alert"><Icon name="info" size={18} /><span><strong>本地邮件服务连接失败</strong>{nativeStateError}<small>账户文件与安全凭据保持原样，请重新启动 MailGo 或查看本机日志。</small></span></div>}
+            {virtualMailItems.length > 0 && <div className="mail-virtual-space" style={{ height: mailListVirtualizer.getTotalSize() }}>
+              {mailListVirtualizer.getVirtualItems().map((virtualItem) => {
+                const item = virtualMailItems[virtualItem.index]
+                if (!item) return null
+                return <div key={item.key} className={`virtual-mail-item virtual-mail-${item.type}`} style={{ height: virtualItem.size, transform: `translateY(${virtualItem.start}px)` }}>
+                  {item.type === 'group'
+                    ? <div className="mail-group-label">{item.label}</div>
+                    : <div className={`mail-row ${selectedMailId === item.mail.id ? 'is-selected' : ''} ${item.mail.unread ? 'is-unread' : ''}`} onClick={() => { void selectMail(item.mail) }}>
+                        <label className="checkbox-wrap row-checkbox" onClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`选择 ${item.mail.subject}`} checked={selectedMailIds.includes(item.mail.id)} onChange={() => toggleMailSelection(item.mail.id)} /><span /></label>
+                        <button type="button" className={`star-button ${item.mail.starred ? 'is-starred' : ''}`} aria-label={item.mail.starred ? '取消星标' : '添加星标'} onClick={(event) => { event.stopPropagation(); toggleStar(item.mail) }}><Icon name="star" size={18} weight={item.mail.starred ? 'Filled' : 'Outline'} /></button>
+                        <div className="mail-row-copy"><div className="mail-row-top"><strong>{item.mail.senderName}</strong><time>{item.mail.timestamp}</time></div><div className="mail-row-subject">{item.mail.subject}</div><p>{item.mail.preview}</p></div>
+                      </div>}
+                </div>
+              })}
+            </div>}
             {visibleMails.length === 0 && <div className="empty-list"><span className="empty-icon"><Icon name={isNativeRuntime && !nativeStateReady ? 'rotate' : accounts.length === 0 ? 'user' : 'search'} size={24} /></span><strong>{isNativeRuntime && !nativeStateReady ? '正在读取本地邮箱' : accounts.length === 0 ? '还没有添加邮箱账户' : '没有找到邮件'}</strong><p>{isNativeRuntime && !nativeStateReady ? '正在加载本机账户与加密缓存，请稍候。' : accounts.length === 0 ? '添加 Google、QQ、Outlook 或自定义 IMAP/SMTP 账户后开始使用。' : '试试清除筛选或搜索其他关键词。'}</p>{isNativeRuntime && nativeStateReady && accounts.length === 0 && <button type="button" className="empty-list-action" onClick={openNewAccount}><Icon name="add" size={16} />添加第一个账户</button>}</div>}
+            {isLoadingEarlier && <div className="mail-page-loading" role="status"><span className="loading-spinner" aria-hidden="true" />正在增量加载更早邮件…</div>}
           </div>
           <div className="list-footer"><span>{visibleMails.length ? `1–${visibleMails.length} / ${visibleMails.length}` : '0 封邮件'}</span><div className="list-footer-actions">{canLoadEarlier && <button type="button" className="load-earlier-button" onClick={() => { void loadEarlier() }} disabled={isLoadingEarlier}>{isLoadingEarlier ? '加载中…' : '加载更早邮件'}</button>}<TooltipButton label="刷新邮件" onClick={handleSync}><Icon name="rotate" size={17} /></TooltipButton></div></div>
         </main>
@@ -2113,6 +2249,7 @@ function App() {
           <div className="reading-scroll">
             <div className="reading-heading"><div><h1>{selectedMail.subject}</h1><div className="message-tags"><span className="tag tag-account"><ProviderMark provider={accounts.find((account) => account.id === selectedMail.accountId)?.provider ?? 'google'} size="sm" /> {accounts.find((account) => account.id === selectedMail.accountId)?.label ?? 'Google'}</span>{selectedMail.hasHtml && <span className="tag">HTML 邮件</span>}</div></div><TooltipButton label={selectedMail.starred ? '取消星标' : '添加星标'} className={`reading-star ${selectedMail.starred ? 'is-starred' : ''}`} onClick={() => toggleStar(selectedMail)}><Icon name="star" size={24} weight={selectedMail.starred ? 'Filled' : 'Outline'} /></TooltipButton></div>
             <div className="sender-row"><Avatar message={selectedMail} size="lg" /><div className="sender-copy"><div><strong>{selectedMail.senderName}</strong> <span>&lt;{selectedMail.from}&gt;</span></div><div className="recipient">收件人： {selectedMailAccount?.label ?? '当前账户'} &lt;{selectedMailAccount?.email ?? '—'}&gt;</div></div><time>{selectedMail.timestamp}<br /><span>今天</span></time><TooltipButton label="发件人更多信息"><Icon name="more" size={19} /></TooltipButton></div>
+            {loadingMessageId === selectedMail.id && <div className="reading-loading-strip" role="status"><span className="loading-spinner" aria-hidden="true" /><span><strong>正在补全邮件正文</strong>列表和已缓存摘要仍可继续浏览</span></div>}
             <div className="message-content">
               {selectedMail.hasHtml && <div className="content-mode-row"><span>此邮件包含富文本内容{(!remoteImagesEnabled || offlineMode) && ` · ${offlineMode ? '仅离线模式，远程图片已屏蔽' : '远程图片已屏蔽'}`}</span><button type="button" className="text-action" onClick={() => setHtmlMode((value) => !value)}>{isHtmlMode ? '查看纯文本' : '渲染 HTML'} <Icon name="grid" size={14} /></button></div>}
               {isHtmlMode && selectedMail.hasHtml ? <div className="html-rendered" onClick={handleRenderedLinkClick} dangerouslySetInnerHTML={{ __html: sanitizeHtml(selectedMail.htmlBody ?? initialHtml, remoteImagesEnabled && !offlineMode) }} /> : selectedMail.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}

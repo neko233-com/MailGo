@@ -61,6 +61,19 @@ $executableHeader = [System.IO.File]::ReadAllBytes($stagedExecutable)
 if ($executableHeader.Length -lt 2 -or $executableHeader[0] -ne 0x4d -or $executableHeader[1] -ne 0x5a) {
     throw 'staged MailGo.exe is not a valid Windows PE executable'
 }
+$peOffset = [System.BitConverter]::ToInt32($executableHeader, 0x3c)
+$subsystemOffset = $peOffset + 24 + 68
+if ($peOffset -lt 0 -or $subsystemOffset + 2 -gt $executableHeader.Length) {
+    throw 'staged MailGo.exe has an invalid PE optional header'
+}
+$subsystem = [System.BitConverter]::ToUInt16($executableHeader, $subsystemOffset)
+if ($subsystem -ne 2) {
+    throw "staged MailGo.exe uses PE subsystem $subsystem; Release builds must use Windows GUI subsystem 2 without a console window"
+}
+$versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($stagedExecutable)
+if ($versionInfo.ProductName -ne 'MailGo') {
+    throw 'staged MailGo.exe is missing the embedded MailGo Windows resource metadata and application icon'
+}
 if (-not (Test-Path -LiteralPath (Join-Path $distDestination 'index.html'))) {
     throw 'staged renderer is missing dist\index.html'
 }

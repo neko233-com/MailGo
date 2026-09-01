@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,7 +15,7 @@ use std::ptr::null;
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rand::{distributions::Alphanumeric, Rng};
-use rdesktop_core::config::{AppConfig, RendererConfig, WindowConfig};
+use rdesktop_core::config::{AppConfig, RendererConfig, WindowConfig, WindowIcon};
 use rdesktop_core::ipc::{FnIpcHandler, IpcMessage, IpcResponse};
 use rdesktop_core::renderer::Renderer;
 use rdesktop_webview::WebViewRenderer;
@@ -33,6 +38,53 @@ mod tray;
 const APP_SERVICE: &str = "MailGo";
 const STATE_SCHEMA_VERSION: u32 = 1;
 const ATTACHMENT_CHUNK_BYTES: usize = 192 * 1024;
+const LOG_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+fn app_window_icon() -> Result<WindowIcon> {
+    let image = image::load_from_memory_with_format(
+        include_bytes!("../../resources/icons/mailgo-64.png"),
+        image::ImageFormat::Png,
+    )?
+    .into_rgba8();
+    let (width, height) = image.dimensions();
+    Ok(WindowIcon {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
+}
+
+fn init_logging() -> Result<tracing_appender::non_blocking::WorkerGuard> {
+    let log_dir = app_data_dir().join("logs");
+    fs::create_dir_all(&log_dir).with_context(|| format!("create {}", log_dir.display()))?;
+    if let Ok(entries) = fs::read_dir(&log_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_mailgo_log = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("mailgo.log."));
+            let is_expired = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+                .is_ok_and(|age| age > LOG_RETENTION);
+            if is_mailgo_log && is_expired {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    let appender = tracing_appender::rolling::daily(log_dir, "mailgo.log");
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    tracing_subscriber::fmt()
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_target(false)
+        .compact()
+        .try_init()
+        .map_err(|error| anyhow!("initialize MailGo logging: {error}"))?;
+    Ok(guard)
+}
 const MAX_ATTACHMENT_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
 const MAX_LEGACY_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_ATTACHMENT_DOWNLOADS: usize = 2;
@@ -1987,6 +2039,10 @@ fn handle_ipc(
                     .state
                     .accounts
                     .clone();
+                tracing::info!(
+                    account_count = accounts.len(),
+                    "manual all-account sync started"
+                );
                 let mut synced = Vec::new();
                 let mut failed = Vec::new();
                 for account in accounts {
@@ -1996,6 +2052,7 @@ fn handle_ipc(
                             failed.push(
                                 json!({ "accountId": account.id, "message": error.to_string() }),
                             );
+                            tracing::warn!(category = "concurrency", "account sync skipped");
                             continue;
                         }
                     };
@@ -2010,6 +2067,7 @@ fn handle_ipc(
                             failed.push(
                                 json!({ "accountId": account.id, "message": error.to_string() }),
                             );
+                            tracing::warn!(category = "configuration", "account sync skipped");
                             continue;
                         }
                     };
@@ -2022,6 +2080,15 @@ fn handle_ipc(
                                 "message": if needs_auth { "requires authorization" } else { "credential store unavailable" },
                             }));
                             record_account_sync_failure(shared, &account.id, needs_auth);
+                            tracing::warn!(
+                                category = if needs_auth {
+                                    "authentication"
+                                } else {
+                                    "credential-store"
+                                },
+                                provider = profile.provider.as_str(),
+                                "account sync credential unavailable"
+                            );
                             continue;
                         }
                     };
@@ -2034,6 +2101,7 @@ fn handle_ipc(
                     ) {
                         tracing::warn!(account_id = %account.id, "all-account outbox flush failed: {error}");
                     }
+                    let provider = profile.provider;
                     match sync::sync_account(
                         &account.id,
                         profile,
@@ -2046,9 +2114,15 @@ fn handle_ipc(
                                 shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                             record_account_sync_success(&mut app, &result);
                             app.save()?;
+                            tracing::info!(
+                                provider = provider.as_str(),
+                                unread = result.unread,
+                                "account sync completed"
+                            );
                             synced.push(serde_json::to_value(result)?);
                         }
                         Err(error) => {
+                            let category = sync::error_category(&error, provider);
                             record_account_sync_failure(
                                 shared,
                                 &account.id,
@@ -2058,9 +2132,19 @@ fn handle_ipc(
                                 "accountId": account.id,
                                 "message": error.to_string(),
                             }));
+                            tracing::warn!(
+                                provider = provider.as_str(),
+                                category,
+                                "account sync failed"
+                            );
                         }
                     }
                 }
+                tracing::info!(
+                    synced = synced.len(),
+                    failed = failed.len(),
+                    "manual all-account sync finished"
+                );
                 Ok(json!({ "accepted": true, "mode": "imap", "synced": synced, "failed": failed }))
             }
             "mail.list" => {
@@ -3135,15 +3219,21 @@ mod tests {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .compact()
-        .init();
+    let _log_guard = init_logging()?;
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "MailGo starting");
     let Some(_instance_guard) = instance::acquire()? else {
+        tracing::info!("existing MailGo instance activated");
         tray::activate_main_window();
         return Ok(());
     };
     let shared_state = Arc::new(Mutex::new(MailGoState::load()?));
+    if let Ok(app) = shared_state.lock() {
+        tracing::info!(
+            account_count = app.state.accounts.len(),
+            offline_mode = app.state.offline_mode,
+            "local state loaded"
+        );
+    }
     let state_for_handler = shared_state.clone();
     let ipc_capability = generate_ipc_capability();
     let handler_capability = ipc_capability.clone();
@@ -3166,6 +3256,7 @@ fn main() -> Result<()> {
             min_size: Some((1120, 720)),
             decorations: false,
             resizable: true,
+            icon: Some(app_window_icon()?),
             ..WindowConfig::default()
         },
         ..AppConfig::default()
@@ -3187,6 +3278,8 @@ fn main() -> Result<()> {
         .minimize_to_tray;
     sync::spawn_scheduler(shared_state.clone(), cache_dir());
     tray::start(minimize_to_tray);
+    tracing::info!("MailGo desktop window ready; background synchronization scheduled");
     Box::new(renderer).run()?;
+    tracing::info!("MailGo stopped");
     Ok(())
 }

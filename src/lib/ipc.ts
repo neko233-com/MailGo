@@ -11,7 +11,7 @@ type PendingRequest = {
 declare global {
   interface Window {
     ipc?: { postMessage: (message: string) => void }
-    __RDESKTOP_IPC__?: (response: IpcResponse<unknown>) => void
+    __RDESKTOP_IPC__?: (response: IpcResponse<unknown> | string) => void
     __RDESKTOP_WINDOW__?: {
       minimize: () => void
       maximize: () => void
@@ -32,7 +32,14 @@ function readNativeCapability() {
 const nativeCapability = readNativeCapability()
 
 if (typeof window !== 'undefined') {
-  window.__RDESKTOP_IPC__ = (response) => {
+  window.__RDESKTOP_IPC__ = (incoming) => {
+    let response: IpcResponse<unknown>
+    try {
+      response = typeof incoming === 'string' ? JSON.parse(incoming) as IpcResponse<unknown> : incoming
+    } catch {
+      return
+    }
+    if (!response || typeof response.id !== 'string' || typeof response.success !== 'boolean') return
     const request = pending.get(response.id)
     if (!request) return
     pending.delete(response.id)
@@ -92,9 +99,5 @@ export async function invoke<T>(cmd: string, payload: Record<string, unknown> = 
 }
 
 export async function readNativeState(): Promise<NativeState | null> {
-  try {
-    return await invoke<NativeState>('app.get_state')
-  } catch {
-    return null
-  }
+  return invoke<NativeState>('app.get_state')
 }
