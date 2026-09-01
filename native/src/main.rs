@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use zeroize::{Zeroize, Zeroizing};
 
+mod cache_db;
 mod classifier;
 mod drafts;
 mod instance;
@@ -2271,11 +2272,31 @@ fn handle_ipc(
                 account_for(shared, &account_id)?;
                 let folder = optional_string_field(&message.payload, "folder")
                     .unwrap_or_else(|| "INBOX".to_string());
-                let mailbox = sync::load_mailbox_for_folder(&cache_dir(), &account_id, &folder)?;
-                Ok(json!({
-                    "offline": mailbox.is_some(),
-                    "mailbox": mailbox,
-                }))
+                let before_uid = message
+                    .payload
+                    .get("beforeUid")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok());
+                let limit = message
+                    .payload
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(120)
+                    .clamp(1, 500);
+                let page =
+                    sync::load_mailbox_page(&cache_dir(), &account_id, &folder, before_uid, limit)?;
+                match page {
+                    Some(page) => Ok(json!({
+                        "offline": true,
+                        "mailbox": page.mailbox,
+                        "localHasMore": page.local_has_more,
+                        "remoteHasMore": page.remote_has_more,
+                        "totalCached": page.total_cached,
+                        "revision": page.revision,
+                    })),
+                    None => Ok(json!({ "offline": false, "mailbox": null })),
+                }
             }
             "mail.get" => {
                 let account_id = string_field(&message.payload, "accountId")?;

@@ -267,6 +267,10 @@ export interface NativeMailbox {
 export interface NativeMailboxResponse {
   offline: boolean
   mailbox?: NativeMailbox
+  localHasMore?: boolean
+  remoteHasMore?: boolean
+  totalCached?: number
+  revision?: number
 }
 
 export interface NativeMessageResponse {

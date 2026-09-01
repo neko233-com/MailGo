@@ -143,7 +143,10 @@ fn classify(cache_root: &Path, path: &Path) -> CacheKind {
         CacheKind::Outbox
     } else if file_name.starts_with("mutations.bin") || file_name.starts_with("moves.bin") {
         CacheKind::Operation
-    } else if file_name.starts_with("inbox.bin") || file_name.starts_with("folder_") {
+    } else if file_name.starts_with("inbox.bin")
+        || file_name.starts_with("folder_")
+        || file_name.starts_with("mail-index-v1.sqlite3")
+    {
         CacheKind::Mail
     } else {
         CacheKind::Other
@@ -184,6 +187,7 @@ mod tests {
         fs::create_dir_all(&attachments).unwrap();
         fs::write(account.join("inbox.bin"), [0u8; 11]).unwrap();
         fs::write(account.join("folder_abcd.bin"), [0u8; 13]).unwrap();
+        fs::write(root.join("mail-index-v1.sqlite3-wal"), [0u8; 7]).unwrap();
         fs::write(attachments.join("1-0.bin"), [0u8; 17]).unwrap();
         fs::write(root.join("drafts.bin"), [0u8; 19]).unwrap();
         fs::write(root.join("outbox.bin.bak"), [0u8; 23]).unwrap();
@@ -191,14 +195,14 @@ mod tests {
         fs::write(root.join("unknown.dat"), [0u8; 31]).unwrap();
 
         let stats = measure(&root);
-        assert_eq!(stats.file_count, 7);
-        assert_eq!(stats.mail_bytes, 24);
+        assert_eq!(stats.file_count, 8);
+        assert_eq!(stats.mail_bytes, 31);
         assert_eq!(stats.attachment_bytes, 17);
         assert_eq!(stats.draft_bytes, 19);
         assert_eq!(stats.outbox_bytes, 23);
         assert_eq!(stats.operation_bytes, 29);
         assert_eq!(stats.other_bytes, 31);
-        assert_eq!(stats.total_bytes, 143);
+        assert_eq!(stats.total_bytes, 150);
         assert_eq!(
             stats.total_bytes,
             stats.mail_bytes

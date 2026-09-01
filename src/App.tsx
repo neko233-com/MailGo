@@ -1,6 +1,6 @@
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import appIconUrl from '../resources/icons/mailgo-64.png'
 import { Icon, type IconName } from './components/Icon'
 import { buildComposeThreadHeaders, type ComposeMode } from './compose-thread'
@@ -21,6 +21,17 @@ type VirtualMailItem =
   | { type: 'group'; key: string; label: string }
   | { type: 'thread'; key: string; thread: MailThread }
 const MAX_CUSTOM_CSS_LENGTH = 64 * 1024
+const INITIAL_MAILBOX_PAGE_SIZE = 120
+const EARLIER_MAILBOX_PAGE_SIZE = 50
+
+type MailboxPagingMeta = {
+  oldestUid?: number
+  hasMore: boolean
+  localHasMore: boolean
+  remoteHasMore: boolean
+  totalCached: number
+  revision: number
+}
 
 const smartCategories: { id: SmartCategory; label: string; icon: IconName; color: string }[] = [
   { id: 'apple-connect', label: 'Apple Connect', icon: 'shieldCheck', color: '#9ca6ba' },
@@ -191,6 +202,12 @@ function storageShare(bytes: number, total: number) {
   return total > 0 ? `${Math.max(0, Math.min(100, (bytes / total) * 100))}%` : '0%'
 }
 
+function plainTextFromHtml(input: string | undefined) {
+  if (!input) return ''
+  const documentParser = new DOMParser().parseFromString(sanitizeHtml(input), 'text/html')
+  return (documentParser.body.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 200_000)
+}
+
 function nativeMessageToUi(message: NativeCachedMessage, account: MailAccount): MailMessage {
   const date = message.receivedAt ? new Date(message.receivedAt) : null
   const validDate = date && !Number.isNaN(date.getTime()) ? date : null
@@ -201,6 +218,7 @@ function nativeMessageToUi(message: NativeCachedMessage, account: MailAccount): 
     ? validDate.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })
     : '最近'
   const senderName = message.senderName || message.senderEmail || '未知发件人'
+  const htmlPlainText = message.textBody ? '' : plainTextFromHtml(message.htmlBody)
   return {
     id: `${message.accountId}:${message.folder}:${message.uid}`,
     messageId: message.messageId,
@@ -224,7 +242,11 @@ function nativeMessageToUi(message: NativeCachedMessage, account: MailAccount): 
     isAd: message.isAd,
     accent: account.accent,
     avatar: senderName.split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase() || '?',
-    body: message.textBody ? message.textBody.split(/\r?\n\s*\r?\n/).filter(Boolean) : ['正在加载邮件正文…'],
+    body: message.textBody
+      ? message.textBody.split(/\r?\n\s*\r?\n/).filter(Boolean)
+      : htmlPlainText
+        ? [htmlPlainText]
+        : ['正在加载邮件正文…'],
     attachments: message.attachments.map((attachment, index) => ({
       id: `${message.accountId}:${message.uid}:attachment:${index}`,
       name: attachment.fileName || 'attachment',
@@ -237,6 +259,37 @@ function nativeMessageToUi(message: NativeCachedMessage, account: MailAccount): 
     nativeUid: message.uid,
     nativeFolder: message.folder,
   }
+}
+
+function pagingMetaFromResponse(result: NativeMailboxResponse): MailboxPagingMeta | undefined {
+  if (!result.mailbox) return undefined
+  const remoteHasMore = result.remoteHasMore ?? Boolean(result.mailbox.hasMore)
+  const localHasMore = result.localHasMore ?? false
+  return {
+    oldestUid: result.mailbox.oldestUid,
+    hasMore: localHasMore || remoteHasMore,
+    localHasMore,
+    remoteHasMore,
+    totalCached: Math.max(0, result.totalCached ?? result.mailbox.messages.length),
+    revision: Math.max(0, result.revision ?? 0),
+  }
+}
+
+function mergeMailboxPage(current: MailMessage[], incoming: MailMessage[], accountId: string, folder: string, mode: 'replace' | 'latest' | 'append') {
+  if (mode === 'latest' && incoming.length === 0) return current
+  const incomingIds = new Set(incoming.map((mail) => mail.id))
+  const oldestIncomingUid = incoming.reduce<number | undefined>((oldest, mail) => (
+    mail.nativeUid == null ? oldest : oldest == null ? mail.nativeUid : Math.min(oldest, mail.nativeUid)
+  ), undefined)
+  const retained = current.filter((mail) => {
+    const sameFolder = mail.accountId === accountId && Boolean(mail.nativeFolder) && isSameNativeFolder(mail.nativeFolder!, folder)
+    if (!sameFolder) return true
+    if (mode === 'replace') return false
+    if (incomingIds.has(mail.id)) return false
+    if (mode === 'latest' && oldestIncomingUid != null && mail.nativeUid != null) return mail.nativeUid < oldestIncomingUid
+    return true
+  })
+  return [...retained, ...incoming]
 }
 
 function draftToUi(draft: NativeDraft, account: MailAccount): MailMessage {
@@ -460,8 +513,9 @@ function App() {
   const [isHelpOpen, setHelpOpen] = useState(false)
   const [isSyncing, setSyncing] = useState(false)
   const [isLoadingEarlier, setLoadingEarlier] = useState(false)
+  const [isMailboxHydrating, setMailboxHydrating] = useState(isNativeRuntime)
   const [loadingMessageId, setLoadingMessageId] = useState<string | null>(null)
-  const [mailboxMeta, setMailboxMeta] = useState<Record<string, { oldestUid?: number; hasMore?: boolean }>>({})
+  const [mailboxMeta, setMailboxMeta] = useState<Record<string, MailboxPagingMeta>>({})
   const [nativeFolders, setNativeFolders] = useState<Record<string, string[]>>({})
   const [nativeFolderLabels, setNativeFolderLabels] = useState<Record<string, Record<string, string>>>({})
   const [selectedNativeFolder, setSelectedNativeFolder] = useState<{ accountId: string; name: string } | null>(null)
@@ -499,6 +553,25 @@ function App() {
   const [customSmtpSecurity, setCustomSmtpSecurity] = useState('tls')
   const [customAuthentication, setCustomAuthentication] = useState('password')
   const [attachmentProgress, setAttachmentProgress] = useState<Record<string, number>>({})
+
+  const rememberMailboxPage = useCallback((result: NativeMailboxResponse, preserveOlderCursor = false) => {
+    const next = pagingMetaFromResponse(result)
+    if (!result.mailbox || !next) return
+    const key = nativeMailboxKey(result.mailbox.accountId, result.mailbox.folder)
+    setMailboxMeta((current) => {
+      const previous = current[key]
+      if (preserveOlderCursor && previous?.oldestUid != null && next.oldestUid != null && previous.oldestUid < next.oldestUid) {
+        const merged = {
+          ...next,
+          oldestUid: previous.oldestUid,
+          localHasMore: previous.localHasMore,
+          hasMore: previous.localHasMore || next.remoteHasMore,
+        }
+        return { ...current, [key]: merged }
+      }
+      return { ...current, [key]: next }
+    })
+  }, [])
   const importInputRef = useRef<HTMLInputElement>(null)
   const encryptedTransferInputRef = useRef<HTMLInputElement>(null)
   const accountPrefillRef = useRef<string | null>(null)
@@ -507,6 +580,7 @@ function App() {
   const isAddingAccountRef = useRef(false)
   const selectedMailRef = useRef<MailMessage | undefined>(undefined)
   const attachmentCancelsRef = useRef(new Map<string, () => void>())
+  const messageHydrationRef = useRef(new Map<string, Promise<NativeMessageResponse>>())
   const mailListRef = useRef<HTMLDivElement>(null)
   const [nativeStateReady, setNativeStateReady] = useState(!isNativeRuntime)
   const [nativeStateError, setNativeStateError] = useState<string | null>(null)
@@ -739,6 +813,7 @@ function App() {
   useEffect(() => {
     if (!isNativeRuntime) {
       setNativeStateReady(true)
+      setMailboxHydrating(false)
       return
     }
     let cancelled = false
@@ -746,6 +821,7 @@ function App() {
       if (cancelled) return
       if (!nativeState) {
         setNativeStateReady(true)
+        setMailboxHydrating(false)
         return
       }
       setNativeStateError(null)
@@ -770,26 +846,26 @@ function App() {
       if (!isNativeRuntime) return
       await Promise.all(nativeState.accounts.map(async (account) => {
         try {
-          const result = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id })
+          const result = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, limit: INITIAL_MAILBOX_PAGE_SIZE })
           const converted = (result.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, account))
           if (cancelled) return
-          if (result.mailbox) {
-            setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(account.id, result.mailbox!.folder)]: { oldestUid: result.mailbox!.oldestUid, hasMore: result.mailbox!.hasMore } }))
-          }
-          setMails((current) => [...current.filter((mail) => mail.accountId !== account.id), ...converted])
+          rememberMailboxPage(result)
+          startTransition(() => setMails((current) => mergeMailboxPage(current, converted, account.id, result.mailbox?.folder ?? 'INBOX', 'replace')))
           if (converted.length) setSelectedMailId((current) => !current || current === 'launch-plan' ? converted[0].id : current)
         } catch {
           // An empty cache is a valid first-run state; sync will populate it later.
         }
       }))
+      if (!cancelled) setMailboxHydrating(false)
     }).catch((error) => {
       if (cancelled) return
       setNativeStateError(error instanceof Error ? error.message : '无法连接本地邮件服务')
       setNativeStateReady(true)
+      setMailboxHydrating(false)
       pushToast('本地邮件服务连接失败，账户与缓存没有被修改', 'error')
     })
     return () => { cancelled = true }
-  }, [isNativeRuntime])
+  }, [isNativeRuntime, rememberMailboxPage])
 
   useEffect(() => {
     if (!isNativeRuntime) return
@@ -809,11 +885,11 @@ function App() {
         setNativeFolderLabels(nativeState.folderLabels ?? {})
         await Promise.all(nativeState.accounts.map(async (account) => {
           try {
-            const result = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id })
+            const result = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, limit: INITIAL_MAILBOX_PAGE_SIZE })
             if (cancelled || !result.mailbox) return
             const converted = result.mailbox.messages.map((message) => nativeMessageToUi(message, account))
-            setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(account.id, result.mailbox!.folder)]: { oldestUid: result.mailbox!.oldestUid, hasMore: result.mailbox!.hasMore } }))
-            setMails((current) => [...current.filter((mail) => mail.accountId !== account.id), ...converted])
+            rememberMailboxPage(result, true)
+            startTransition(() => setMails((current) => mergeMailboxPage(current, converted, account.id, result.mailbox!.folder, 'latest')))
             if (converted.length) setSelectedMailId((current) => !current || current === 'launch-plan' ? converted[0].id : current)
           } catch {
             // The background scheduler may still be committing this mailbox snapshot; retry on the next local refresh.
@@ -830,7 +906,7 @@ function App() {
       window.clearTimeout(initialTimer)
       window.clearInterval(timer)
     }
-  }, [isNativeRuntime])
+  }, [isNativeRuntime, rememberMailboxPage])
 
   useEffect(() => {
     if (!isNativeRuntime || !nativeStateReady) return
@@ -1061,6 +1137,9 @@ function App() {
     body: ['当前文件夹没有可显示的邮件。'],
   } satisfies MailMessage
   selectedMailRef.current = selectedMail
+  useEffect(() => {
+    setHtmlMode(Boolean(selectedMail.hasHtml))
+  }, [selectedMail.hasHtml, selectedMail.id])
   const selectedThread = visibleThreads.find((thread) => thread.messages.some((mail) => mail.id === selectedMail.id)) ?? visibleThreads[0]
   const selectedMailAccount = accounts.find((account) => account.id === selectedMail.accountId)
   const selectedMailMoveTargets = useMemo(() => {
@@ -1105,6 +1184,22 @@ function App() {
     .some((account) => mailboxMeta[nativeMailboxKey(account.id, nativeFolderName(account, selectedFolder))]?.hasMore)
     || isNativeRuntime && Boolean(selectedNativeFolder) && Boolean(mailboxMeta[nativeMailboxKey(selectedNativeFolder!.accountId, selectedNativeFolder!.name)]?.hasMore)
 
+  const requestNativeMessage = useCallback((mail: MailMessage) => {
+    const existing = messageHydrationRef.current.get(mail.id)
+    if (existing) return existing
+    const request = invoke<NativeMessageResponse>('mail.get', {
+      accountId: mail.accountId,
+      folder: mail.nativeFolder ?? 'INBOX',
+      uid: mail.nativeUid,
+    }, 60_000)
+    messageHydrationRef.current.set(mail.id, request)
+    request.then(
+      () => messageHydrationRef.current.delete(mail.id),
+      () => messageHydrationRef.current.delete(mail.id),
+    )
+    return request
+  }, [])
+
   const selectMail = async (mail: MailMessage) => {
     setSelectedMailId(mail.id)
     setMobilePane('reading')
@@ -1129,7 +1224,7 @@ function App() {
         })
       setLoadingMessageId(mail.id)
       try {
-        const result = await invoke<NativeMessageResponse>('mail.get', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid })
+        const result = await requestNativeMessage(mail)
         const account = accounts.find((item) => item.id === mail.accountId)
         if (account && result.message) {
           const converted = nativeMessageToUi(result.message, account)
@@ -1142,6 +1237,23 @@ function App() {
       }
     }
   }
+
+  useEffect(() => {
+    if (!isNativeRuntime || offlineMode || selectedMail.nativeUid == null || selectedMail.id === 'empty-mail') return
+    if (!(selectedMail.body.length === 1 && selectedMail.body[0] === '正在加载邮件正文…')) return
+    const timer = window.setTimeout(() => {
+      void requestNativeMessage(selectedMail).then((result) => {
+        const account = accounts.find((item) => item.id === selectedMail.accountId)
+        if (!account || !result.message) return
+        const converted = nativeMessageToUi(result.message, account)
+        startTransition(() => {
+          setMails((current) => current.map((mail) => mail.id === selectedMail.id ? converted : mail))
+          setServerSearchMails((current) => current.map((mail) => mail.id === selectedMail.id ? converted : mail))
+        })
+      }).catch(() => undefined)
+    }, 700)
+    return () => window.clearTimeout(timer)
+  }, [accounts, isNativeRuntime, offlineMode, requestNativeMessage, selectedMail.accountId, selectedMail.body, selectedMail.id, selectedMail.nativeUid])
 
   const toggleStar = (mail: MailMessage) => {
     const nextStarred = !mail.starred
@@ -1501,20 +1613,19 @@ function App() {
         : mail.folder === folder
     })
     if (first) setSelectedMailId(first.id)
-    if (isNativeRuntime && !offlineMode && folder !== 'starred') {
+    if (isNativeRuntime && folder !== 'starred') {
+      setMailboxHydrating(true)
       void Promise.all(accounts.map(async (account) => {
         try {
           const serverFolder = nativeFolderName(account, folder)
-          const result = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, folder: serverFolder })
+          const result = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, folder: serverFolder, limit: INITIAL_MAILBOX_PAGE_SIZE })
           const converted = (result.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, account))
-          if (result.mailbox) {
-            setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(account.id, serverFolder)]: { oldestUid: result.mailbox!.oldestUid, hasMore: result.mailbox!.hasMore } }))
-          }
-          setMails((current) => [...current.filter((mail) => !(mail.accountId === account.id && mail.nativeFolder === serverFolder)), ...converted])
+          rememberMailboxPage(result)
+          startTransition(() => setMails((current) => mergeMailboxPage(current, converted, account.id, serverFolder, 'replace')))
         } catch {
           // A provider may not expose every optional folder; its cached copy remains untouched.
         }
-      }))
+      })).finally(() => setMailboxHydrating(false))
     }
   }
 
@@ -1528,18 +1639,20 @@ function App() {
     setSelectedMailIds([])
     const first = allMails.find((mail) => mail.accountId === account.id && mail.nativeFolder && isSameNativeFolder(mail.nativeFolder, folder))
     if (first) setSelectedMailId(first.id)
-    if (!isNativeRuntime || offlineMode) return
-    void invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, folder }).then((result) => {
+    if (!isNativeRuntime) return
+    setMailboxHydrating(true)
+    void invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, folder, limit: INITIAL_MAILBOX_PAGE_SIZE }).then((result) => {
       if (!result.mailbox) return
       const converted = result.mailbox.messages.map((message) => nativeMessageToUi(message, account))
-      setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(account.id, folder)]: { oldestUid: result.mailbox!.oldestUid, hasMore: result.mailbox!.hasMore } }))
-      setMails((current) => [...current.filter((mail) => !(mail.accountId === account.id && mail.nativeFolder && isSameNativeFolder(mail.nativeFolder, folder))), ...converted])
+      rememberMailboxPage(result)
+      startTransition(() => setMails((current) => mergeMailboxPage(current, converted, account.id, folder, 'replace')))
       if (converted.length) setSelectedMailId((current) => !current || current === 'launch-plan' ? converted[0].id : current)
     }).catch(() => pushToast(`${account.label} 的“${nativeFolderLabel(folder, nativeFolderLabels[account.id]?.[folder])}”暂时无法读取`, 'error'))
+      .finally(() => setMailboxHydrating(false))
   }
 
   const loadEarlier = async () => {
-    if (!isNativeRuntime || offlineMode || selectedFolder === 'starred' || isLoadingEarlier) return
+    if (!isNativeRuntime || selectedFolder === 'starred' || isLoadingEarlier) return
     const targetAccounts = selectedNativeFolder
       ? accounts.filter((account) => account.id === selectedNativeFolder.accountId)
       : accounts.filter((account) => !selectedAccountId || account.id === selectedAccountId)
@@ -1558,19 +1671,40 @@ function App() {
         const serverFolder = selectedNativeFolder?.name ?? nativeFolderName(account, selectedFolder)
         const meta = mailboxMeta[nativeMailboxKey(account.id, serverFolder)]
         try {
-          const pageResult = await invoke<NativeSyncItem>('sync.page', {
+          const localPage = await invoke<NativeMailboxResponse>('mail.list', {
             accountId: account.id,
             folder: serverFolder,
             ...(meta?.oldestUid != null ? { beforeUid: meta.oldestUid } : {}),
-            limit: 50,
+            limit: EARLIER_MAILBOX_PAGE_SIZE,
+          })
+          if (localPage.mailbox?.messages.length) {
+            const converted = localPage.mailbox.messages.map((message) => nativeMessageToUi(message, account))
+            loaded += converted.length
+            rememberMailboxPage(localPage)
+            startTransition(() => setMails((current) => mergeMailboxPage(current, converted, account.id, serverFolder, 'append')))
+            return
+          }
+          if (offlineMode || !localPage.remoteHasMore) {
+            rememberMailboxPage({ ...localPage, localHasMore: false, remoteHasMore: false })
+            return
+          }
+          await invoke<NativeSyncItem>('sync.page', {
+            accountId: account.id,
+            folder: serverFolder,
+            ...(meta?.oldestUid != null ? { beforeUid: meta.oldestUid } : {}),
+            limit: EARLIER_MAILBOX_PAGE_SIZE,
           }, 60_000)
-          const mailbox = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, folder: serverFolder })
-          if (!mailbox.mailbox) return
-          loaded += pageResult.fetched
-          setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(account.id, serverFolder)]: { oldestUid: mailbox.mailbox!.oldestUid, hasMore: mailbox.mailbox!.hasMore } }))
-          const converted = mailbox.mailbox.messages.map((message) => nativeMessageToUi(message, account))
-          const incomingIds = new Set(converted.map((mail) => mail.id))
-          setMails((current) => [...current.filter((mail) => !incomingIds.has(mail.id)), ...converted])
+          const remotePage = await invoke<NativeMailboxResponse>('mail.list', {
+            accountId: account.id,
+            folder: serverFolder,
+            ...(meta?.oldestUid != null ? { beforeUid: meta.oldestUid } : {}),
+            limit: EARLIER_MAILBOX_PAGE_SIZE,
+          })
+          if (!remotePage.mailbox) return
+          const converted = remotePage.mailbox.messages.map((message) => nativeMessageToUi(message, account))
+          loaded += converted.length
+          rememberMailboxPage(remotePage)
+          startTransition(() => setMails((current) => mergeMailboxPage(current, converted, account.id, serverFolder, 'append')))
         } catch {
           pushToast(`${account.label} 的更早邮件加载失败，可稍后重试`, 'error')
         }
@@ -1644,12 +1778,12 @@ function App() {
       if (isNativeRuntime) {
         await Promise.all(accounts.map(async (account) => {
           try {
-            const mailbox = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id })
+            const mailbox = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, limit: INITIAL_MAILBOX_PAGE_SIZE })
             const converted = (mailbox.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, account))
             if (mailbox.mailbox) {
-              setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(account.id, mailbox.mailbox!.folder)]: { oldestUid: mailbox.mailbox!.oldestUid, hasMore: mailbox.mailbox!.hasMore } }))
+              rememberMailboxPage(mailbox, true)
+              startTransition(() => setMails((current) => mergeMailboxPage(current, converted, account.id, mailbox.mailbox!.folder, 'latest')))
             }
-            setMails((current) => [...current.filter((mail) => mail.accountId !== account.id), ...converted])
           } catch {
             // Preserve the previous offline copy if one account has a transient cache error.
           }
@@ -1673,12 +1807,12 @@ function App() {
 
   const refreshAccountMailbox = async (account: MailAccount) => {
     if (!isNativeRuntime) return
-    const mailbox = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id })
+    const mailbox = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, limit: INITIAL_MAILBOX_PAGE_SIZE })
     const converted = (mailbox.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, account))
     if (mailbox.mailbox) {
-      setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(account.id, mailbox.mailbox!.folder)]: { oldestUid: mailbox.mailbox!.oldestUid, hasMore: mailbox.mailbox!.hasMore } }))
+      rememberMailboxPage(mailbox, true)
+      startTransition(() => setMails((current) => mergeMailboxPage(current, converted, account.id, mailbox.mailbox!.folder, 'latest')))
     }
-    setMails((current) => [...current.filter((mail) => mail.accountId !== account.id), ...converted])
     if (converted.length) setSelectedMailId((current) => current === '' || current === 'launch-plan' ? converted[0].id : current)
   }
 
@@ -2322,8 +2456,8 @@ function App() {
               </div>}
             </div>
           </div>
-          <div ref={mailListRef} className="mail-list-scroll" onScroll={handleMailListScroll} aria-busy={isNativeRuntime && !nativeStateReady || isLoadingEarlier}>
-            {isNativeRuntime && !nativeStateReady && <div className="list-loading-strip" role="status"><span className="loading-spinner" aria-hidden="true" /><span>正在读取本地账户与缓存，主界面已可操作</span></div>}
+          <div ref={mailListRef} className="mail-list-scroll" onScroll={handleMailListScroll} aria-busy={isNativeRuntime && (!nativeStateReady || isMailboxHydrating) || isLoadingEarlier}>
+            {isNativeRuntime && (!nativeStateReady || isMailboxHydrating) && <div className="list-loading-strip" role="status"><span className="loading-spinner" aria-hidden="true" /><span>{nativeStateReady ? '正在从本地索引加载当前页，其他区域仍可操作' : '正在读取本地账户，主界面已可操作'}</span></div>}
             {nativeStateError && <div className="local-state-error" role="alert"><Icon name="info" size={18} /><span><strong>本地邮件服务连接失败</strong>{nativeStateError}<small>账户文件与安全凭据保持原样，请重新启动 MailGo 或查看本机日志。</small></span></div>}
             {virtualMailItems.length > 0 && <div className="mail-virtual-space" style={{ height: mailListVirtualizer.getTotalSize() }}>
               {mailListVirtualizer.getVirtualItems().map((virtualItem) => {
@@ -2340,7 +2474,7 @@ function App() {
                 </div>
               })}
             </div>}
-            {visibleMails.length === 0 && <div className="empty-list"><span className="empty-icon"><Icon name={isNativeRuntime && !nativeStateReady ? 'rotate' : accounts.length === 0 ? 'user' : 'search'} size={24} /></span><strong>{isNativeRuntime && !nativeStateReady ? '正在读取本地邮箱' : accounts.length === 0 ? '还没有添加邮箱账户' : '没有找到邮件'}</strong><p>{isNativeRuntime && !nativeStateReady ? '正在加载本机账户与加密缓存，请稍候。' : accounts.length === 0 ? '添加 Google、QQ、Outlook 或自定义 IMAP/SMTP 账户后开始使用。' : '试试清除筛选或搜索其他关键词。'}</p>{isNativeRuntime && nativeStateReady && accounts.length === 0 && <button type="button" className="empty-list-action" onClick={openNewAccount}><Icon name="add" size={16} />添加第一个账户</button>}</div>}
+            {visibleMails.length === 0 && <div className="empty-list"><span className="empty-icon"><Icon name={isNativeRuntime && (!nativeStateReady || isMailboxHydrating) ? 'rotate' : accounts.length === 0 ? 'user' : 'search'} size={24} /></span><strong>{isNativeRuntime && (!nativeStateReady || isMailboxHydrating) ? '正在打开本地邮箱' : accounts.length === 0 ? '还没有添加邮箱账户' : '没有找到邮件'}</strong><p>{isNativeRuntime && (!nativeStateReady || isMailboxHydrating) ? '先显示本地索引页；远程邮件会在进入后异步同步。' : accounts.length === 0 ? '添加 Google、QQ、Outlook 或自定义 IMAP/SMTP 账户后开始使用。' : '试试清除筛选或搜索其他关键词。'}</p>{isNativeRuntime && nativeStateReady && accounts.length === 0 && <button type="button" className="empty-list-action" onClick={openNewAccount}><Icon name="add" size={16} />添加第一个账户</button>}</div>}
             {isLoadingEarlier && <div className="mail-page-loading" role="status"><span className="loading-spinner" aria-hidden="true" />正在增量加载更早邮件…</div>}
           </div>
           <div className="list-footer"><span>{visibleThreads.length ? `${visibleThreads.length} 个会话 · ${visibleMails.length} 封邮件` : '0 封邮件'}</span><div className="list-footer-actions">{canLoadEarlier && <button type="button" className="load-earlier-button" onClick={() => { void loadEarlier() }} disabled={isLoadingEarlier}>{isLoadingEarlier ? '加载中…' : '加载更早邮件'}</button>}<TooltipButton label="刷新邮件" onClick={handleSync}><Icon name="rotate" size={17} /></TooltipButton></div></div>

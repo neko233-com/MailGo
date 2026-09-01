@@ -5,7 +5,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use base64::{
@@ -53,6 +53,7 @@ const IDLE_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(5);
 const IDLE_RETRY_BASE_SECONDS: u64 = 15;
 const IDLE_RETRY_MAX_SECONDS: u64 = 300;
 const IDLE_SYNC_BUSY_RETRIES: usize = 12;
+const BODY_SESSION_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
 const CACHE_FILE: &str = "inbox.bin";
 const MUTATION_FILE: &str = "mutations.bin";
 const MOVE_MUTATION_FILE: &str = "moves.bin";
@@ -64,6 +65,17 @@ const NON_WINDOWS_CACHE_KEY_SERVICE: &str = "com.neko233.mailgo.cache";
 const NON_WINDOWS_CACHE_KEY_ACCOUNT: &str = "cache-encryption-key";
 
 static CACHE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+type BodySessionSlot = Arc<Mutex<Option<PooledBodySession>>>;
+type BodySessionRegistry = HashMap<String, BodySessionSlot>;
+
+static BODY_SESSIONS: OnceLock<Mutex<BodySessionRegistry>> = OnceLock::new();
+
+struct PooledBodySession {
+    credential_fingerprint: [u8; 32],
+    selected_folder: Option<String>,
+    last_used: Instant,
+    session: imap::Session<imap::Connection>,
+}
 
 fn cache_write_guard() -> std::sync::MutexGuard<'static, ()> {
     CACHE_WRITE_LOCK
@@ -311,6 +323,137 @@ fn authenticate(
             )
             .map_err(|(error, _)| anyhow!("IMAP OAuth authentication failed: {error}")),
     }
+}
+
+fn body_session_fingerprint(profile: &ProviderProfile, email: &str, credential: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(profile.provider.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(profile.imap.host.as_bytes());
+    hasher.update(profile.imap.port.to_be_bytes());
+    hasher.update([match profile.imap.security {
+        TransportSecurity::Tls => 1,
+        TransportSecurity::StartTls => 2,
+    }]);
+    hasher.update([match profile.authentication {
+        Authentication::OAuth2 => 1,
+        Authentication::AppPassword => 2,
+        Authentication::Password => 3,
+    }]);
+    hasher.update(email.trim().to_ascii_lowercase().as_bytes());
+    hasher.update([0]);
+    hasher.update(credential.as_bytes());
+    hasher.finalize().into()
+}
+
+fn body_session_slot(account_id: &str) -> Result<BodySessionSlot> {
+    let sessions = BODY_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut sessions = sessions
+        .lock()
+        .map_err(|_| anyhow!("IMAP body session registry lock poisoned"))?;
+    Ok(Arc::clone(
+        sessions
+            .entry(account_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(None))),
+    ))
+}
+
+fn clear_body_session(account_id: &str) {
+    let Some(sessions) = BODY_SESSIONS.get() else {
+        return;
+    };
+    let slot = sessions
+        .lock()
+        .ok()
+        .and_then(|mut sessions| sessions.remove(account_id));
+    if let Some(slot) = slot {
+        if let Ok(mut session) = slot.lock() {
+            if let Some(mut session) = session.take() {
+                session.session.logout().ok();
+            }
+        }
+    }
+}
+
+fn fetch_raw_message_with_pooled_session(
+    account_id: &str,
+    profile: &ProviderProfile,
+    email: &str,
+    credential: &str,
+    folder: &str,
+    uid: u32,
+) -> Result<(Vec<u8>, bool, bool)> {
+    let fingerprint = body_session_fingerprint(profile, email, credential);
+    let slot = body_session_slot(account_id)?;
+    let mut pooled = slot
+        .lock()
+        .map_err(|_| anyhow!("IMAP body session lock poisoned"))?;
+    let must_reconnect = pooled.as_ref().is_none_or(|session| {
+        session.credential_fingerprint != fingerprint
+            || session.last_used.elapsed() > BODY_SESSION_IDLE_TTL
+    });
+    if must_reconnect {
+        if let Some(mut stale) = pooled.take() {
+            stale.session.logout().ok();
+        }
+        *pooled = Some(PooledBodySession {
+            credential_fingerprint: fingerprint,
+            selected_folder: None,
+            last_used: Instant::now(),
+            session: authenticate(profile, email, credential)?,
+        });
+    }
+
+    let result = (|| {
+        let session = pooled
+            .as_mut()
+            .ok_or_else(|| anyhow!("IMAP body session is unavailable"))?;
+        if session
+            .selected_folder
+            .as_deref()
+            .is_none_or(|selected| !selected.eq_ignore_ascii_case(folder))
+        {
+            session
+                .session
+                .select(folder)
+                .with_context(|| format!("select {folder}"))?;
+            session.selected_folder = Some(folder.to_string());
+        }
+        let size_probe = session
+            .session
+            .uid_fetch(uid.to_string(), SIZE_FETCH_QUERY)?;
+        let advertised_size = size_probe
+            .iter()
+            .next()
+            .and_then(|item| item.size)
+            .ok_or_else(|| anyhow!("message UID {uid} did not include RFC822.SIZE"))?;
+        validate_advertised_message_size(advertised_size)?;
+        let fetched = session
+            .session
+            .uid_fetch(uid.to_string(), FULL_FETCH_QUERY)?;
+        let item = fetched
+            .iter()
+            .next()
+            .ok_or_else(|| anyhow!("message UID {uid} was not found"))?;
+        let raw = item
+            .body()
+            .ok_or_else(|| anyhow!("message UID {uid} has no RFC822 body"))?
+            .to_vec();
+        let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
+        let starred = item
+            .flags()
+            .iter()
+            .any(|flag| matches!(flag, Flag::Flagged));
+        session.last_used = Instant::now();
+        Ok((raw, unread, starred))
+    })();
+
+    if result.is_err() {
+        if let Some(mut failed) = pooled.take() {
+            failed.session.logout().ok();
+        }
+    }
+    result
 }
 
 fn detect_incremental_mode(
@@ -1931,33 +2074,13 @@ fn fetch_message_once(
     cache_root: &Path,
 ) -> Result<MailDetail> {
     validate_mailbox_name(folder)?;
-    let mut session = authenticate(&profile, email, credential)?;
-    session.select(folder)?;
-    let size_probe = session.uid_fetch(uid.to_string(), SIZE_FETCH_QUERY)?;
-    let advertised_size = size_probe
-        .iter()
-        .next()
-        .and_then(|item| item.size)
-        .ok_or_else(|| anyhow!("message UID {uid} did not include RFC822.SIZE"))?;
-    validate_advertised_message_size(advertised_size)?;
-    let fetched = session.uid_fetch(uid.to_string(), FULL_FETCH_QUERY)?;
-    let item = fetched
-        .iter()
-        .next()
-        .ok_or_else(|| anyhow!("message UID {uid} was not found"))?;
-    let raw = item
-        .body()
-        .ok_or_else(|| anyhow!("message UID {uid} has no RFC822 body"))?;
-    let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
-    let starred = item
-        .flags()
-        .iter()
-        .any(|flag| matches!(flag, Flag::Flagged));
-    let mut message = parse_full(account_id, folder, uid, unread, starred, raw)?;
-    let payloads = crate::mail::extract_attachment_payloads(raw)?;
+    let (raw, unread, starred) = fetch_raw_message_with_pooled_session(
+        account_id, &profile, email, credential, folder, uid,
+    )?;
+    let mut message = parse_full(account_id, folder, uid, unread, starred, &raw)?;
+    let payloads = crate::mail::extract_attachment_payloads(&raw)?;
     crate::mail::embed_inline_images(&mut message.html_body, &payloads);
     store_attachment_payloads(cache_root, account_id, folder, uid, &mut message, &payloads)?;
-    session.logout().ok();
     Ok(MailDetail { message })
 }
 
@@ -2014,12 +2137,7 @@ pub fn load_attachment_data(
     uid: u32,
     index: usize,
 ) -> Result<AttachmentData> {
-    let mailbox = load_mailbox_for_folder(cache_root, account_id, folder)?
-        .ok_or_else(|| anyhow!("message is not cached"))?;
-    let message = mailbox
-        .messages
-        .iter()
-        .find(|message| message.uid == uid)
+    let message = load_cached_message(cache_root, account_id, folder, uid)?
         .ok_or_else(|| anyhow!("message is not cached"))?;
     let metadata = message
         .attachments
@@ -2060,6 +2178,9 @@ pub fn load_mailbox_for_folder(
     folder: &str,
 ) -> Result<Option<CachedMailbox>> {
     validate_mailbox_name(folder)?;
+    if let Some(mailbox) = crate::cache_db::load_mailbox(cache_root, account_id, folder)? {
+        return Ok(Some(mailbox));
+    }
     let directory = cache_root.join(safe_component(account_id));
     let encrypted_path = directory.join(cache_file_name(folder));
     let mut candidates = vec![
@@ -2087,6 +2208,10 @@ pub fn load_mailbox_for_folder(
                         "mailbox cache primary was invalid; recovered from backup"
                     );
                 }
+                // Legacy encrypted snapshots are migrated transactionally on first access. They
+                // remain in place as a recovery source until normal cache cleanup removes them.
+                crate::cache_db::save_mailbox(cache_root, account_id, &mailbox)
+                    .context("migrate legacy mailbox into indexed cache")?;
                 return Ok(Some(mailbox));
             }
             Err(error)
@@ -2138,6 +2263,8 @@ fn load_mailbox_file(
 }
 
 pub fn remove_account_cache(cache_root: &Path, account_id: &str) -> Result<()> {
+    clear_body_session(account_id);
+    crate::cache_db::remove_account(cache_root, account_id)?;
     let directory = cache_root.join(safe_component(account_id));
     match fs::remove_dir_all(&directory) {
         Ok(()) => Ok(()),
@@ -2154,14 +2281,33 @@ pub fn load_cached_message(
     folder: &str,
     uid: u32,
 ) -> Result<Option<CachedMessage>> {
-    Ok(
-        load_mailbox_for_folder(cache_root, account_id, folder)?.and_then(|mailbox| {
-            mailbox
-                .messages
-                .into_iter()
-                .find(|message| message.uid == uid && message.folder.eq_ignore_ascii_case(folder))
-        }),
-    )
+    if let Some(message) = crate::cache_db::load_message(cache_root, account_id, folder, uid)? {
+        return Ok(Some(message));
+    }
+    // A one-time legacy load populates the index; subsequent exact reads stay O(log n).
+    if load_mailbox_for_folder(cache_root, account_id, folder)?.is_none() {
+        return Ok(None);
+    }
+    crate::cache_db::load_message(cache_root, account_id, folder, uid)
+}
+
+pub fn load_mailbox_page(
+    cache_root: &Path,
+    account_id: &str,
+    folder: &str,
+    before_uid: Option<u32>,
+    limit: usize,
+) -> Result<Option<crate::cache_db::MailboxPage>> {
+    validate_mailbox_name(folder)?;
+    if let Some(page) =
+        crate::cache_db::load_mailbox_page(cache_root, account_id, folder, before_uid, limit)?
+    {
+        return Ok(Some(page));
+    }
+    if load_mailbox_for_folder(cache_root, account_id, folder)?.is_none() {
+        return Ok(None);
+    }
+    crate::cache_db::load_mailbox_page(cache_root, account_id, folder, before_uid, limit)
 }
 
 pub fn save_cached_message(
@@ -2169,19 +2315,7 @@ pub fn save_cached_message(
     account_id: &str,
     message: &CachedMessage,
 ) -> Result<()> {
-    let _write_guard = cache_write_guard();
-    let mut mailbox = load_mailbox_for_folder(cache_root, account_id, &message.folder)?
-        .unwrap_or_else(|| CachedMailbox::empty(account_id, message.folder.as_str()));
-    mailbox
-        .messages
-        .retain(|cached| cached.uid != message.uid || cached.folder != message.folder);
-    mailbox.messages.push(message.clone());
-    mailbox
-        .messages
-        .sort_by_key(|cached| std::cmp::Reverse(cached.uid));
-    mailbox.oldest_uid = mailbox.messages.iter().map(|cached| cached.uid).min();
-    mailbox.synced_at = now_stamp();
-    save_mailbox_unlocked(cache_root, account_id, &mailbox).map(|_| ())
+    crate::cache_db::save_message(cache_root, account_id, message)
 }
 
 fn save_search_messages(
@@ -2228,23 +2362,15 @@ pub fn update_cached_flags(
     flag: &str,
     enabled: bool,
 ) -> Result<()> {
-    let _write_guard = cache_write_guard();
-    let Some(mut mailbox) = load_mailbox_for_folder(cache_root, account_id, folder)? else {
+    let Some(mut message) = load_cached_message(cache_root, account_id, folder, uid)? else {
         return Ok(());
     };
-    if let Some(message) = mailbox
-        .messages
-        .iter_mut()
-        .find(|message| message.uid == uid && message.folder.eq_ignore_ascii_case(folder))
-    {
-        match flag {
-            "\\Seen" => message.unread = !enabled,
-            "\\Flagged" => message.starred = enabled,
-            _ => return Ok(()),
-        }
-        save_mailbox_unlocked(cache_root, account_id, &mailbox)?;
+    match flag {
+        "\\Seen" => message.unread = !enabled,
+        "\\Flagged" => message.starred = enabled,
+        _ => return Ok(()),
     }
-    Ok(())
+    crate::cache_db::save_message(cache_root, account_id, &message)
 }
 
 fn refresh_mailbox_metadata(mailbox: &mut CachedMailbox) {
@@ -2321,14 +2447,7 @@ fn remove_cached_message_unlocked(
     folder: &str,
     uid: u32,
 ) -> Result<()> {
-    let Some(mut mailbox) = load_mailbox_for_folder(cache_root, account_id, folder)? else {
-        return Ok(());
-    };
-    mailbox
-        .messages
-        .retain(|message| !(message.uid == uid && message.folder.eq_ignore_ascii_case(folder)));
-    refresh_mailbox_metadata(&mut mailbox);
-    save_mailbox_unlocked(cache_root, account_id, &mailbox).map(|_| ())
+    crate::cache_db::remove_message(cache_root, account_id, folder, uid)
 }
 
 fn validate_mailbox_name(name: &str) -> Result<()> {
@@ -2896,11 +3015,6 @@ fn save_mailbox_unlocked(
     account_id: &str,
     mailbox: &CachedMailbox,
 ) -> Result<PathBuf> {
-    let directory = cache_root.join(safe_component(account_id));
-    fs::create_dir_all(&directory).with_context(|| format!("create {}", directory.display()))?;
-    let file_name = cache_file_name(&mailbox.folder);
-    let path = directory.join(&file_name);
-    let temporary = directory.join(format!("{file_name}.tmp"));
     let mut bounded_mailbox = mailbox.clone();
     if bounded_mailbox.messages.len() > MAX_CACHED_MESSAGES_PER_FOLDER {
         bounded_mailbox
@@ -2913,28 +3027,7 @@ fn save_mailbox_unlocked(
             .map(|message| message.uid)
             .min();
     }
-    let serialized = serde_json::to_vec_pretty(&bounded_mailbox)?;
-    if serialized.len() > MAX_CACHE_FILE_BYTES {
-        return Err(anyhow!("mailbox cache is too large"));
-    }
-    let payload = protect_cache(&serialized)?;
-    if payload.len() > MAX_CACHE_FILE_BYTES {
-        return Err(anyhow!("mailbox cache is too large"));
-    }
-    fs::write(&temporary, payload).context("write mailbox cache")?;
-    if path.exists() {
-        let backup = directory.join(format!("{file_name}.bak"));
-        let _ = fs::remove_file(&backup);
-        fs::rename(&path, &backup).context("backup mailbox cache")?;
-        if let Err(error) = fs::rename(&temporary, &path) {
-            let _ = fs::rename(&backup, &path);
-            return Err(error).context("replace mailbox cache");
-        }
-        let _ = fs::remove_file(backup);
-    } else {
-        fs::rename(&temporary, &path).context("commit mailbox cache")?;
-    }
-    Ok(path)
+    crate::cache_db::save_mailbox(cache_root, account_id, &bounded_mailbox)
 }
 
 #[cfg(target_os = "windows")]
@@ -3552,6 +3645,16 @@ mod tests {
     }
 
     #[test]
+    fn body_session_fingerprint_rotates_when_credentials_change() {
+        let profile = crate::providers::profile_for(ProviderKind::Qq).unwrap();
+        let first = body_session_fingerprint(&profile, "person@example.invalid", "secret-one");
+        let same = body_session_fingerprint(&profile, "PERSON@example.invalid", "secret-one");
+        let rotated = body_session_fingerprint(&profile, "person@example.invalid", "secret-two");
+        assert_eq!(first, same);
+        assert_ne!(first, rotated);
+    }
+
+    #[test]
     fn sync_retries_transport_and_rate_limits_but_not_auth_failures() {
         assert_eq!(
             retry_delay(&anyhow!("connect IMAP host timed out"), ProviderKind::Qq, 0),
@@ -3851,7 +3954,7 @@ mod tests {
     }
 
     #[test]
-    fn mailbox_cache_recovers_from_previous_atomic_snapshot() {
+    fn legacy_mailbox_cache_recovers_from_previous_atomic_snapshot_during_migration() {
         let root =
             std::env::temp_dir().join(format!("mailgo-cache-backup-test-{}", std::process::id()));
         let first = CachedMailbox {
@@ -3865,16 +3968,13 @@ mod tests {
             oldest_uid: Some(1),
             has_more: false,
         };
-        let mut second = first.clone();
-        second.messages[0].uid = 2;
-        save_mailbox(&root, "fixture-account", &first).unwrap();
         let directory = root.join(safe_component("fixture-account"));
+        fs::create_dir_all(&directory).unwrap();
         let primary = directory.join(CACHE_FILE);
         let backup = directory.join(format!("{CACHE_FILE}.bak"));
-        fs::rename(&primary, &backup).unwrap();
         fs::write(
-            &primary,
-            protect_cache(&serde_json::to_vec_pretty(&second).unwrap()).unwrap(),
+            &backup,
+            protect_cache(&serde_json::to_vec_pretty(&first).unwrap()).unwrap(),
         )
         .unwrap();
         fs::write(&primary, b"corrupt cache").unwrap();
@@ -3883,6 +3983,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.messages[0].uid, 1);
+        assert_eq!(
+            crate::cache_db::load_message(&root, "fixture-account", "INBOX", 1)
+                .unwrap()
+                .unwrap()
+                .uid,
+            1
+        );
         let _ = fs::remove_dir_all(root);
     }
 
