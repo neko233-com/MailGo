@@ -8,7 +8,7 @@ import { sanitizeCustomCss } from './customCss'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
 import { invoke, readNativeState } from './lib/ipc'
 import { buildMailThreads, type MailThread } from './threading'
-import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeDraft, NativeLocalSearchResponse, NativeMailboxResponse, NativeMessageResponse, NativeOutboxStatus, NativeQueueStatus, NativeSearchResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
+import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeDraft, NativeDraftAttachment, NativeLocalSearchResponse, NativeMailboxResponse, NativeMessageResponse, NativeOutboxStatus, NativeQueueStatus, NativeSearchResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 type ToastTone = 'info' | 'success' | 'error'
 type Toast = { id: number; message: string; tone: ToastTone }
@@ -313,7 +313,17 @@ function draftToUi(draft: NativeDraft, account: MailAccount): MailMessage {
   }
 }
 
-type ComposeInlineImage = { file: File; contentId: string; previewUrl: string }
+type ComposeAttachmentStatus = 'saving' | 'saved' | 'failed' | 'removing'
+type ComposeAttachmentItem = {
+  localId: string
+  persistedId?: string
+  fileName: string
+  contentType: string
+  size: number
+  file?: File
+  status: ComposeAttachmentStatus
+}
+type ComposeInlineImage = ComposeAttachmentItem & { contentId: string; previewUrl?: string }
 
 function composeSubject(mode: ComposeMode, subject: string) {
   const trimmed = subject.trim() || '(无主题)'
@@ -359,6 +369,13 @@ function createInlineContentId() {
   return `mailgo-inline-${randomPart.replace(/[^a-zA-Z0-9-]/g, '')}`
 }
 
+function createComposeAttachmentId() {
+  const randomPart = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  return `compose-attachment-${randomPart.replace(/[^a-zA-Z0-9-]/g, '')}`
+}
+
 function createAccountId(provider: Provider) {
   const randomPart = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
@@ -382,8 +399,8 @@ function composeHtmlBody(body: string, inlineImages: ComposeInlineImage[]) {
   const textBlock = body.trim()
     ? `<div>${escapeHtml(body).replace(/\r?\n/g, '<br>')}</div>`
     : '<div></div>'
-  const imageBlocks = inlineImages.map(({ file, contentId }) => (
-    `<p><img src="cid:${escapeHtml(contentId)}" alt="${escapeHtml(file.name)}" style="max-width:100%;height:auto"></p>`
+  const imageBlocks = inlineImages.map(({ fileName, contentId }) => (
+    `<p><img src="cid:${escapeHtml(contentId)}" alt="${escapeHtml(fileName)}" style="max-width:100%;height:auto"></p>`
   )).join('')
   return textBlock + imageBlocks
 }
@@ -1107,7 +1124,7 @@ function App() {
         event.preventDefault()
         document.getElementById('mail-search')?.focus()
       }
-      if (event.key === 'Escape') {
+      if (event.key === 'Escape' && !document.querySelector('.compose-modal')) {
         setComposeOpen(false)
         setComposeDraftId(undefined)
         setComposeMode('new')
@@ -2675,31 +2692,124 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
   const [draftId, setDraftId] = useState<string | undefined>()
   const [draftStatus, setDraftStatus] = useState('')
   const [draftReady, setDraftReady] = useState(false)
-  const [attachments, setAttachments] = useState<File[]>([])
+  const [attachments, setAttachments] = useState<ComposeAttachmentItem[]>([])
   const [inlineImages, setInlineImages] = useState<ComposeInlineImage[]>([])
   const [isSending, setSending] = useState(false)
   const [uploadingName, setUploadingName] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
+  const attachmentsRef = useRef<ComposeAttachmentItem[]>([])
   const inlineImagesRef = useRef<ComposeInlineImage[]>([])
+  const draftIdRef = useRef<string | undefined>(undefined)
+  const pendingDraftSaveRef = useRef<Promise<NativeDraft | undefined>>(Promise.resolve(undefined))
+  const pendingAttachmentJobsRef = useRef(new Set<Promise<void>>())
+  const attachmentPersistenceQueueRef = useRef<Promise<void>>(Promise.resolve())
   const isNativeRuntime = Boolean(window.ipc?.postMessage)
   const maxAttachmentBytes = 25 * 1024 * 1024
   const maxTotalAttachmentBytes = 50 * 1024 * 1024
 
   useEffect(() => {
+    attachmentsRef.current = attachments
+  }, [attachments])
+
+  useEffect(() => {
     inlineImagesRef.current = inlineImages
   }, [inlineImages])
 
+  useEffect(() => {
+    draftIdRef.current = draftId
+  }, [draftId])
+
   useEffect(() => () => {
-    inlineImagesRef.current.forEach((image) => URL.revokeObjectURL(image.previewUrl))
+    inlineImagesRef.current.forEach((image) => { if (image.previewUrl) URL.revokeObjectURL(image.previewUrl) })
   }, [])
 
   const clearInlineImages = () => {
     setInlineImages((current) => {
-      current.forEach((image) => URL.revokeObjectURL(image.previewUrl))
+      current.forEach((image) => { if (image.previewUrl) URL.revokeObjectURL(image.previewUrl) })
+      inlineImagesRef.current = []
       return []
     })
   }
+
+  const saveDraftSnapshot = useCallback((force = false) => {
+    if (!isNativeRuntime || !accountId || !draftReady || isSending) return Promise.resolve(undefined)
+    if (!force && !draftIdRef.current && ![to, cc, bcc, subject, body].some((value) => value.trim())) return Promise.resolve(undefined)
+    const save = async () => {
+      setDraftStatus('正在保存草稿…')
+      const draft = await invoke<NativeDraft>('drafts.save', {
+        ...(draftIdRef.current ? { id: draftIdRef.current } : {}),
+        accountId,
+        to,
+        cc,
+        bcc,
+        subject,
+        body,
+        htmlMode,
+        ...(inReplyTo ? { inReplyTo } : {}),
+        ...(references.length ? { references } : {}),
+      }, 30_000)
+      draftIdRef.current = draft.id
+      setDraftId(draft.id)
+      setDraftStatus('草稿已自动保存')
+      onDraftChanged?.(draft)
+      return draft
+    }
+    const request = pendingDraftSaveRef.current.catch(() => undefined).then(save)
+    pendingDraftSaveRef.current = request
+    return request
+  }, [accountId, bcc, body, cc, draftReady, htmlMode, inReplyTo, isNativeRuntime, isSending, onDraftChanged, references, subject, to])
+
+  const waitForAttachmentJobs = useCallback(async () => {
+    while (pendingAttachmentJobsRef.current.size > 0) {
+      await Promise.allSettled(Array.from(pendingAttachmentJobsRef.current))
+    }
+  }, [])
+
+  const trackAttachmentJob = useCallback((job: Promise<void>) => {
+    pendingAttachmentJobsRef.current.add(job)
+    void job.finally(() => pendingAttachmentJobsRef.current.delete(job)).catch(() => undefined)
+  }, [])
+
+  const loadDraftInlinePreview = useCallback(async (savedDraftId: string, attachment: NativeDraftAttachment) => {
+    if (!accountId) return undefined
+    let downloadId: string | undefined
+    try {
+      const start = await invoke<NativeAttachmentStartResponse>('drafts.attachment.start', {
+        accountId,
+        draftId: savedDraftId,
+        attachmentId: attachment.id,
+      }, 60_000)
+      downloadId = start.downloadId
+      let offset = 0
+      let total = 0
+      const parts: Uint8Array[] = []
+      while (true) {
+        const chunk: NativeAttachmentChunkResponse = await invoke<NativeAttachmentChunkResponse>('mail.attachment.chunk', { downloadId, offset }, 60_000)
+        if (chunk.downloadId !== downloadId || chunk.offset !== offset || chunk.nextOffset < offset || chunk.nextOffset > start.size || (!chunk.done && chunk.nextOffset === offset)) {
+          throw new Error('草稿图片传输响应无效')
+        }
+        const bytes = Uint8Array.from(atob(chunk.dataBase64), (character) => character.charCodeAt(0))
+        if (chunk.nextOffset - offset !== bytes.length) throw new Error('草稿图片传输大小校验失败')
+        parts.push(bytes)
+        total += bytes.length
+        if (total > start.size) throw new Error('草稿图片超过声明大小')
+        offset = chunk.nextOffset
+        if (chunk.done) break
+      }
+      if (total !== start.size) throw new Error('草稿图片传输不完整')
+      const binary = new Uint8Array(total)
+      let writeOffset = 0
+      for (const part of parts) {
+        binary.set(part, writeOffset)
+        writeOffset += part.length
+      }
+      return URL.createObjectURL(new Blob([binary], { type: start.contentType }))
+    } catch (error) {
+      if (downloadId) void invoke('mail.attachment.cancel', { downloadId }).catch(() => undefined)
+      throw error
+    }
+  }, [accountId])
 
   useEffect(() => {
     let cancelled = false
@@ -2707,6 +2817,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
     const threadHeaders = buildComposeThreadHeaders(mode, source)
     setDraftReady(false)
     setDraftStatus('')
+    draftIdRef.current = openDraftId
     setDraftId(openDraftId)
     setTo(seed.to)
     setCc(seed.cc)
@@ -2717,6 +2828,8 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
     setHtmlMode(false)
     setInReplyTo(threadHeaders.inReplyTo)
     setReferences(threadHeaders.references)
+    attachmentsRef.current = []
+    setAttachments([])
     clearInlineImages()
     if (!isNativeRuntime || !accountId || (!openDraftId && mode !== 'new')) {
       setDraftReady(true)
@@ -2725,6 +2838,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
     void invoke<NativeDraft[]>('drafts.list', { accountId }, 30_000).then((drafts) => {
       const draft = openDraftId ? drafts.find((item) => item.id === openDraftId) : drafts[0]
       if (cancelled || !draft) return
+      draftIdRef.current = draft.id
       setDraftId(draft.id)
       setTo(draft.to)
       setCc(draft.cc)
@@ -2735,44 +2849,70 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
       setHtmlMode(draft.htmlMode)
       setInReplyTo(draft.inReplyTo)
       setReferences(draft.references)
+      const restoredAttachments: ComposeAttachmentItem[] = []
+      const restoredImages: ComposeInlineImage[] = []
+      for (const attachment of draft.attachments ?? []) {
+        const item = {
+          localId: `restored-${attachment.id}`,
+          persistedId: attachment.id,
+          fileName: attachment.fileName,
+          contentType: attachment.contentType,
+          size: attachment.size,
+          status: 'saved' as const,
+        }
+        if (attachment.contentId) restoredImages.push({ ...item, contentId: attachment.contentId })
+        else restoredAttachments.push(item)
+      }
+      attachmentsRef.current = restoredAttachments
+      inlineImagesRef.current = restoredImages
+      setAttachments(restoredAttachments)
+      setInlineImages(restoredImages)
+      if (restoredImages.length) setHtmlMode(true)
       setDraftStatus(openDraftId ? '已恢复草稿' : '已恢复最近草稿')
       onDraftChanged?.(draft)
+      void (async () => {
+        for (const image of restoredImages) {
+          if (cancelled || !image.persistedId) return
+          const metadata = draft.attachments.find((attachment) => attachment.id === image.persistedId)
+          if (!metadata) continue
+          try {
+            const previewUrl = await loadDraftInlinePreview(draft.id, metadata)
+            if (!previewUrl) continue
+            if (cancelled) {
+              URL.revokeObjectURL(previewUrl)
+              return
+            }
+            setInlineImages((current) => {
+              const next = current.map((item) => item.persistedId === image.persistedId ? { ...item, previewUrl } : item)
+              inlineImagesRef.current = next
+              return next
+            })
+          } catch {
+            if (!cancelled) setDraftStatus('草稿已恢复，部分图片预览暂不可用')
+          }
+        }
+      })()
     }).catch(() => undefined).finally(() => {
       if (!cancelled) setDraftReady(true)
     })
     return () => { cancelled = true }
-  }, [accountId, isNativeRuntime, mode, onDraftChanged, openDraftId, senderEmail, source])
+  }, [accountId, isNativeRuntime, loadDraftInlinePreview, mode, onDraftChanged, openDraftId, senderEmail, source])
 
   useEffect(() => {
     if (!isNativeRuntime || !accountId || !draftReady || isSending) return
-    if (![to, cc, bcc, subject, body].some((value) => value.trim())) return
+    if (!draftIdRef.current && ![to, cc, bcc, subject, body].some((value) => value.trim())) return
     const timer = window.setTimeout(() => {
-      void invoke<NativeDraft>('drafts.save', {
-        ...(draftId ? { id: draftId } : {}),
-        accountId,
-        to,
-        cc,
-        bcc,
-        subject,
-        body,
-        htmlMode,
-        ...(inReplyTo ? { inReplyTo } : {}),
-        ...(references.length ? { references } : {}),
-      }, 30_000).then((draft) => {
-        setDraftId(draft.id)
-        setDraftStatus('草稿已自动保存')
-        onDraftChanged?.(draft)
-      }).catch(() => setDraftStatus('草稿保存失败，将在下次输入时重试'))
+      void saveDraftSnapshot().catch(() => setDraftStatus('草稿保存失败，将在下次输入时重试'))
     }, 700)
     return () => window.clearTimeout(timer)
-  }, [accountId, bcc, body, cc, draftId, draftReady, htmlMode, inReplyTo, isNativeRuntime, isSending, onDraftChanged, references, subject, to])
+  }, [accountId, bcc, body, cc, draftReady, htmlMode, inReplyTo, isNativeRuntime, isSending, references, saveDraftSnapshot, subject, to])
 
   const addFiles = (event: React.ChangeEvent<HTMLInputElement>) => {
     const incoming = Array.from(event.target.files ?? [])
     event.target.value = ''
-    let total = attachments.reduce((sum, file) => sum + file.size, 0)
-      + inlineImages.reduce((sum, image) => sum + image.file.size, 0)
-    const accepted: File[] = []
+    let total = attachments.reduce((sum, attachment) => sum + attachment.size, 0)
+      + inlineImages.reduce((sum, image) => sum + image.size, 0)
+    const accepted: ComposeAttachmentItem[] = []
     for (const file of incoming) {
       if (attachments.length + inlineImages.length + accepted.length >= 10) {
         onError('单封邮件最多添加 10 个附件')
@@ -2786,17 +2926,35 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
         onError('附件总大小不能超过 50 MB')
         break
       }
-      accepted.push(file)
+      accepted.push({
+        localId: createComposeAttachmentId(),
+        fileName: file.name,
+        contentType: file.type || 'application/octet-stream',
+        size: file.size,
+        file,
+        status: isNativeRuntime ? 'saving' : 'saved',
+      })
       total += file.size
     }
-    if (accepted.length) setAttachments((current) => [...current, ...accepted])
+    if (accepted.length) {
+      setAttachments((current) => {
+        const next = [...current, ...accepted]
+        attachmentsRef.current = next
+        return next
+      })
+      if (isNativeRuntime) {
+        const job = attachmentPersistenceQueueRef.current.catch(() => undefined).then(() => persistAttachmentItems(accepted))
+        attachmentPersistenceQueueRef.current = job
+        trackAttachmentJob(job)
+      }
+    }
   }
 
   const addInlineImages = (event: React.ChangeEvent<HTMLInputElement>) => {
     const incoming = Array.from(event.target.files ?? [])
     event.target.value = ''
-    let total = attachments.reduce((sum, file) => sum + file.size, 0)
-      + inlineImages.reduce((sum, image) => sum + image.file.size, 0)
+    let total = attachments.reduce((sum, attachment) => sum + attachment.size, 0)
+      + inlineImages.reduce((sum, image) => sum + image.size, 0)
     const accepted: ComposeInlineImage[] = []
     for (const file of incoming) {
       if (!file.type.toLowerCase().startsWith('image/')) {
@@ -2815,12 +2973,30 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
         onError('附件和内嵌图片总大小不能超过 50 MB')
         break
       }
-      accepted.push({ file, contentId: createInlineContentId(), previewUrl: URL.createObjectURL(file) })
+      accepted.push({
+        localId: createComposeAttachmentId(),
+        fileName: file.name,
+        contentType: file.type || 'application/octet-stream',
+        size: file.size,
+        file,
+        contentId: createInlineContentId(),
+        previewUrl: URL.createObjectURL(file),
+        status: isNativeRuntime ? 'saving' : 'saved',
+      })
       total += file.size
     }
     if (accepted.length) {
-      setInlineImages((current) => [...current, ...accepted])
+      setInlineImages((current) => {
+        const next = [...current, ...accepted]
+        inlineImagesRef.current = next
+        return next
+      })
       setHtmlMode(true)
+      if (isNativeRuntime) {
+        const job = attachmentPersistenceQueueRef.current.catch(() => undefined).then(() => persistAttachmentItems(accepted))
+        attachmentPersistenceQueueRef.current = job
+        trackAttachmentJob(job)
+      }
     }
   }
 
@@ -2857,16 +3033,232 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
     }
   }
 
+  const persistAttachmentItems = async (items: Array<ComposeAttachmentItem | ComposeInlineImage>) => {
+    let draft: NativeDraft | undefined
+    try {
+      draft = await saveDraftSnapshot(true)
+      if (!draft) throw new Error('无法创建本地草稿')
+    } catch {
+      const failedIds = new Set(items.map((item) => item.localId))
+      setAttachments((current) => {
+        const next = current.map((entry) => failedIds.has(entry.localId) ? { ...entry, status: 'failed' as const } : entry)
+        attachmentsRef.current = next
+        return next
+      })
+      setInlineImages((current) => {
+        const next = current.map((entry) => failedIds.has(entry.localId) ? { ...entry, status: 'failed' as const } : entry)
+        inlineImagesRef.current = next
+        return next
+      })
+      setDraftStatus('附件无法写入本地草稿；关闭前请移除，或直接发送')
+      onError('无法创建本地草稿，附件尚未安全保存')
+      return
+    }
+    let cursor = 0
+    const worker = async () => {
+      while (cursor < items.length) {
+        const item = items[cursor++]
+        if (!item.file) continue
+        let uploadId: string | undefined
+        const expectedContentId = 'contentId' in item ? item.contentId : undefined
+        const metadataMatches = (attachment: NativeDraftAttachment) => (
+          attachment.id === item.localId
+          && attachment.fileName === item.fileName
+          && attachment.contentType === item.contentType
+          && attachment.contentId === expectedContentId
+          && attachment.size === item.size
+        )
+        const markSaved = (savedDraft: NativeDraft, attachment: NativeDraftAttachment) => {
+          const update = <T extends ComposeAttachmentItem>(current: T[]) => current.map((entry) => (
+            entry.localId === item.localId
+              ? { ...entry, file: undefined, persistedId: attachment.id, status: 'saved' as const }
+              : entry
+          ))
+          if ('contentId' in item) {
+            setInlineImages((current) => {
+              const next = update(current)
+              inlineImagesRef.current = next
+              return next
+            })
+          } else {
+            setAttachments((current) => {
+              const next = update(current)
+              attachmentsRef.current = next
+              return next
+            })
+          }
+          setDraftStatus('附件已加密保存到草稿')
+          onDraftChanged?.(savedDraft)
+        }
+        try {
+          setUploadingName('正在加密保存 ' + item.fileName)
+          uploadId = await uploadAttachment(item.file, expectedContentId)
+          const result = await invoke<{ draft: NativeDraft; attachment: NativeDraftAttachment }>('drafts.attachment.commit', {
+            accountId,
+            draftId: draft.id,
+            attachmentId: item.localId,
+            uploadId,
+          }, 60_000)
+          uploadId = undefined
+          if (!metadataMatches(result.attachment)) {
+            throw new Error('草稿附件保存响应无效')
+          }
+          markSaved(result.draft, result.attachment)
+        } catch {
+          if (uploadId) void invoke('mail.attachment.upload.cancel', { uploadId }).catch(() => undefined)
+          try {
+            const savedDrafts = await invoke<NativeDraft[]>('drafts.list', { accountId }, 30_000)
+            const recoveredDraft = savedDrafts.find((candidate) => candidate.id === draft.id)
+            const recoveredAttachment = recoveredDraft?.attachments.find((attachment) => attachment.id === item.localId)
+            if (recoveredDraft && recoveredAttachment && metadataMatches(recoveredAttachment)) {
+              markSaved(recoveredDraft, recoveredAttachment)
+              continue
+            }
+          } catch {
+            // The original failure is reflected as a recoverable local-only attachment below.
+          }
+          const markFailed = <T extends ComposeAttachmentItem>(current: T[]) => current.map((entry) => (
+            entry.localId === item.localId ? { ...entry, status: 'failed' as const } : entry
+          ))
+          if ('contentId' in item) {
+            setInlineImages((current) => {
+              const next = markFailed(current)
+              inlineImagesRef.current = next
+              return next
+            })
+          } else {
+            setAttachments((current) => {
+              const next = markFailed(current)
+              attachmentsRef.current = next
+              return next
+            })
+          }
+          setDraftStatus('部分附件保存失败；发送前会重试，关闭窗口前请先处理')
+          onError(`${item.fileName} 未能保存到本地草稿`)
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(3, items.length) }, () => worker()))
+    try {
+      const latestDrafts = await invoke<NativeDraft[]>('drafts.list', { accountId }, 30_000)
+      const latestDraft = latestDrafts.find((candidate) => candidate.id === draft.id)
+      if (latestDraft) onDraftChanged?.(latestDraft)
+    } catch {
+      // Per-item commit responses already updated the UI; a later draft refresh will reconcile it.
+    }
+    const hasFailure = [...attachmentsRef.current, ...inlineImagesRef.current]
+      .some((attachment) => attachment.status === 'failed')
+    setDraftStatus(hasFailure ? '部分附件保存失败；发送前会重试，关闭窗口前请先处理' : '附件已加密保存到草稿')
+    setUploadingName('')
+  }
+
+  const removeComposeAttachment = async (item: ComposeAttachmentItem | ComposeInlineImage, inline: boolean) => {
+    if (item.status === 'saving' || item.status === 'removing') return
+    const removeLocal = () => {
+      if (inline && 'previewUrl' in item && item.previewUrl) URL.revokeObjectURL(item.previewUrl)
+      if (inline) setInlineImages((current) => {
+        const next = current.filter((entry) => entry.localId !== item.localId)
+        inlineImagesRef.current = next
+        return next
+      })
+      else setAttachments((current) => {
+        const next = current.filter((entry) => entry.localId !== item.localId)
+        attachmentsRef.current = next
+        return next
+      })
+    }
+    if (!isNativeRuntime || !accountId || !draftIdRef.current || !item.persistedId) {
+      removeLocal()
+      return
+    }
+    const mark = <T extends ComposeAttachmentItem>(current: T[], status: ComposeAttachmentStatus) => current.map((entry) => (
+      entry.localId === item.localId ? { ...entry, status } : entry
+    ))
+    if (inline) setInlineImages((current) => {
+      const next = mark(current, 'removing')
+      inlineImagesRef.current = next
+      return next
+    })
+    else setAttachments((current) => {
+      const next = mark(current, 'removing')
+      attachmentsRef.current = next
+      return next
+    })
+    try {
+      const draft = await invoke<NativeDraft>('drafts.attachment.remove', {
+        accountId,
+        draftId: draftIdRef.current,
+        attachmentId: item.persistedId,
+      }, 30_000)
+      removeLocal()
+      setDraftStatus('附件已从草稿移除')
+      onDraftChanged?.(draft)
+    } catch (error) {
+      if (inline) setInlineImages((current) => {
+        const next = mark(current, 'saved')
+        inlineImagesRef.current = next
+        return next
+      })
+      else setAttachments((current) => {
+        const next = mark(current, 'saved')
+        attachmentsRef.current = next
+        return next
+      })
+      onError(error instanceof Error ? error.message : '附件移除失败')
+    }
+  }
+
+  const requestClose = useCallback(async () => {
+    if (isSending) return
+    try {
+      await waitForAttachmentJobs()
+      const hasFailedAttachment = [...attachmentsRef.current, ...inlineImagesRef.current]
+        .some((attachment) => attachment.status === 'failed')
+      if (hasFailedAttachment) {
+        setDraftStatus('有附件尚未安全保存；请移除后再关闭，或直接发送')
+        onError('有附件未保存，为避免丢失，撰写窗口暂未关闭')
+        return
+      }
+      const hasContent = [to, cc, bcc, subject, body].some((value) => value.trim())
+      const currentDraftId = draftIdRef.current
+      if (!hasContent && attachmentsRef.current.length === 0 && inlineImagesRef.current.length === 0 && isNativeRuntime && accountId && currentDraftId) {
+        await invoke('drafts.remove', { accountId, id: currentDraftId }, 30_000)
+        onDraftRemoved?.(currentDraftId)
+        draftIdRef.current = undefined
+        onClose()
+        return
+      }
+      await saveDraftSnapshot(false)
+      onClose()
+    } catch (error) {
+      setDraftStatus('关闭前保存失败，请重试')
+      onError(error instanceof Error ? error.message : '关闭前保存草稿失败')
+    }
+  }, [accountId, bcc, body, cc, isNativeRuntime, isSending, onClose, onDraftRemoved, onError, saveDraftSnapshot, subject, to, waitForAttachmentJobs])
+
+  useEffect(() => {
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      void requestClose()
+    }
+    window.addEventListener('keydown', handleEscape, true)
+    return () => window.removeEventListener('keydown', handleEscape, true)
+  }, [requestClose])
+
   const discard = async () => {
-    if (!draftId) {
+    await waitForAttachmentJobs()
+    const currentDraftId = draftIdRef.current
+    if (!currentDraftId) {
       onClose()
       return
     }
     setSending(true)
     try {
       if (isNativeRuntime && accountId) {
-        await invoke('drafts.remove', { accountId, id: draftId }, 30_000)
-        onDraftRemoved?.(draftId)
+        await invoke('drafts.remove', { accountId, id: currentDraftId }, 30_000)
+        onDraftRemoved?.(currentDraftId)
       }
       onClose()
     } catch (error) {
@@ -2890,15 +3282,32 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
     let queued = false
     try {
       if (isNativeRuntime) {
-        for (const file of attachments) {
-          setUploadingName('正在上传 ' + file.name)
-          uploadIds.push(await uploadAttachment(file))
+        await waitForAttachmentJobs()
+        await saveDraftSnapshot(true)
+        const currentAttachments = attachmentsRef.current
+        const currentInlineImages = inlineImagesRef.current
+        const allItems = [...currentAttachments, ...currentInlineImages]
+        const missingAttachments = allItems.filter((item) => !item.persistedId && !item.file)
+        if (missingAttachments.length) throw new Error('部分草稿附件无法读取，请移除后重试')
+        const fallbackItems = allItems.filter((item): item is typeof item & { file: File } => !item.persistedId && Boolean(item.file))
+        let cursor = 0
+        const uploadedByIndex: string[] = []
+        const worker = async () => {
+          while (cursor < fallbackItems.length) {
+            const index = cursor++
+            const item = fallbackItems[index]
+            setUploadingName('正在上传 ' + item.fileName)
+            const contentId = typeof (item as Partial<ComposeInlineImage>).contentId === 'string'
+              ? (item as ComposeInlineImage).contentId
+              : undefined
+            uploadedByIndex[index] = await uploadAttachment(item.file, contentId)
+          }
         }
-        for (const image of inlineImages) {
-          setUploadingName('正在上传内嵌图片 ' + image.file.name)
-          uploadIds.push(await uploadAttachment(image.file, image.contentId))
-        }
-        const effectiveHtml = htmlMode || inlineImages.length > 0
+        await Promise.all(Array.from({ length: Math.min(3, fallbackItems.length) }, () => worker()))
+        uploadIds.push(...uploadedByIndex)
+        const persistedIds = allItems.flatMap((item) => item.persistedId ? [item.persistedId] : [])
+        const currentDraftId = draftIdRef.current
+        const effectiveHtml = htmlMode || currentInlineImages.length > 0
         const result = await invoke<{ queued?: boolean }>('mail.send', {
           accountId,
           to: to.trim(),
@@ -2908,16 +3317,18 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
           textBody: body,
           ...(inReplyTo ? { inReplyTo } : {}),
           ...(references.length ? { references } : {}),
-          ...(effectiveHtml && (body.trim() || inlineImages.length) ? { htmlBody: composeHtmlBody(body, inlineImages) } : {}),
+          ...(effectiveHtml && (body.trim() || currentInlineImages.length) ? { htmlBody: composeHtmlBody(body, currentInlineImages) } : {}),
           ...(uploadIds.length ? { attachmentIds: uploadIds } : {}),
+          ...(persistedIds.length ? { draftId: currentDraftId, draftAttachmentIds: persistedIds } : {}),
         })
         queued = Boolean(result.queued)
       } else {
         await new Promise((resolve) => window.setTimeout(resolve, 700))
       }
-      if (isNativeRuntime && accountId && draftId) {
-        await invoke('drafts.remove', { accountId, id: draftId }, 30_000).catch(() => undefined)
-        onDraftRemoved?.(draftId)
+      const sentDraftId = draftIdRef.current
+      if (isNativeRuntime && accountId && sentDraftId) {
+        await invoke('drafts.remove', { accountId, id: sentDraftId }, 30_000).catch(() => undefined)
+        onDraftRemoved?.(sentDraftId)
       }
       onSent(Boolean(isNativeRuntime && queued))
     } catch (error) {
@@ -2931,7 +3342,21 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
 
   const composeTitle = mode === 'reply' ? '回复邮件' : mode === 'reply-all' ? '回复全部' : mode === 'forward' ? '转发邮件' : '新邮件'
   const htmlEnabled = htmlMode || inlineImages.length > 0
-  return <motion.div className="modal-backdrop compose-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="compose-modal" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1 }} exit={{ opacity: 0, y: 20 }}><div className="compose-header"><strong>{composeTitle}</strong><div><TooltipButton label="最小化撰写窗口"><span className="window-minimize" /></TooltipButton><TooltipButton label="关闭撰写窗口" onClick={onClose}><Icon name="close" size={17} /></TooltipButton></div></div><div className="compose-recipient-row"><label>收件人<input autoFocus value={to} onChange={(event) => setTo(event.target.value)} placeholder="name@example.com，可用逗号分隔多个地址" /></label><button type="button" className="copy-fields-button" onClick={() => setShowCopyFields((value) => !value)} aria-expanded={showCopyFields}>{showCopyFields ? '隐藏抄送' : '抄送 / 密送'}</button></div>{showCopyFields && <><label>抄送<input value={cc} onChange={(event) => setCc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label><label>密送<input value={bcc} onChange={(event) => setBcc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label></>}<label>主题<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="主题" /></label><textarea className="compose-body" value={body} onChange={(event) => setBody(event.target.value)} placeholder={htmlEnabled ? '输入内容，将以 HTML + 纯文本双格式发送…' : '写下你的邮件…'} />{draftStatus && <div className="compose-draft-status" aria-live="polite"><Icon name="cloud" size={14} />{draftStatus}</div>}{htmlEnabled && <div className="compose-format-note"><Icon name="grid" size={14} />将发送安全的 HTML + 纯文本版本{inlineImages.length > 0 ? '，内嵌图片会显示在正文末尾' : ''}</div>}{inlineImages.length > 0 && <div className="compose-inline-images" aria-label="待发送内嵌图片">{inlineImages.map((image) => <div className="compose-inline-image" key={image.contentId}><img src={image.previewUrl} alt={image.file.name} /><span>{image.file.name}</span><button type="button" onClick={() => { URL.revokeObjectURL(image.previewUrl); setInlineImages((current) => current.filter((item) => item.contentId !== image.contentId)) }} aria-label={'移除内嵌图片 ' + image.file.name}>×</button></div>)}</div>}{attachments.length > 0 && <div className="compose-attachments" aria-label="待发送附件">{attachments.map((file, index) => <div className="compose-attachment" key={file.name + '-' + file.size + '-' + index}><span>{file.name}</span><small>{Math.max(1, Math.round(file.size / 1024))} KB</small><button type="button" onClick={() => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))} aria-label={'移除附件 ' + file.name}>×</button></div>)}</div>}{uploadingName && <div className="compose-uploading" aria-live="polite"><Icon name="rotate" size={14} />{uploadingName}</div>}<div className="compose-footer"><div><TooltipButton label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={19} /></TooltipButton><input ref={fileInputRef} type="file" multiple hidden onChange={addFiles} /><TooltipButton label="插入图片" onClick={() => imageInputRef.current?.click()}><Icon name="image" size={19} /></TooltipButton><input ref={imageInputRef} type="file" accept="image/*" multiple hidden onChange={addInlineImages} /><TooltipButton label={htmlEnabled ? (inlineImages.length > 0 ? '内嵌图片需要 HTML 格式' : '关闭 HTML 格式') : '启用 HTML 格式'} active={htmlEnabled} onClick={() => { if (inlineImages.length > 0) { onError('已插入内嵌图片，HTML 格式必须保持开启'); return } setHtmlMode((value) => !value) }}><span className="reply-a">A</span></TooltipButton></div><div className="compose-send-actions">{draftId && <button type="button" className="danger-button" onClick={() => { void discard() }} disabled={isSending}><Icon name="trash" size={16} />丢弃草稿</button>}<button type="button" className="gradient-button" onClick={send} disabled={isSending}>{isSending ? (uploadingName || '发送中…') : '发送'}<Icon name="send" size={17} /></button></div></div></motion.div></motion.div>
+  return <motion.div className="modal-backdrop compose-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) void requestClose() }}>
+    <motion.div className="compose-modal" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1 }} exit={{ opacity: 0, y: 20 }}>
+      <div className="compose-header"><strong>{composeTitle}</strong><div><TooltipButton label="最小化撰写窗口"><span className="window-minimize" /></TooltipButton><TooltipButton label="关闭撰写窗口" onClick={() => { void requestClose() }}><Icon name="close" size={17} /></TooltipButton></div></div>
+      <div className="compose-recipient-row"><label>收件人<input autoFocus value={to} onChange={(event) => setTo(event.target.value)} placeholder="name@example.com，可用逗号分隔多个地址" /></label><button type="button" className="copy-fields-button" onClick={() => setShowCopyFields((value) => !value)} aria-expanded={showCopyFields}>{showCopyFields ? '隐藏抄送' : '抄送 / 密送'}</button></div>
+      {showCopyFields && <><label>抄送<input value={cc} onChange={(event) => setCc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label><label>密送<input value={bcc} onChange={(event) => setBcc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label></>}
+      <label>主题<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="主题" /></label>
+      <textarea className="compose-body" value={body} onChange={(event) => setBody(event.target.value)} placeholder={htmlEnabled ? '输入内容，将以 HTML + 纯文本双格式发送…' : '写下你的邮件…'} />
+      {draftStatus && <div className="compose-draft-status" aria-live="polite"><Icon name="cloud" size={14} />{draftStatus}</div>}
+      {htmlEnabled && <div className="compose-format-note"><Icon name="grid" size={14} />将发送安全的 HTML + 纯文本版本{inlineImages.length > 0 ? '，内嵌图片会显示在正文末尾' : ''}</div>}
+      {inlineImages.length > 0 && <div className="compose-inline-images" aria-label="待发送内嵌图片">{inlineImages.map((image) => <div className={`compose-inline-image is-${image.status}`} key={image.localId}>{image.previewUrl ? <img src={image.previewUrl} alt={image.fileName} /> : <span className="compose-inline-placeholder"><Icon name="image" size={22} /></span>}<span>{image.fileName}<small>{image.status === 'saving' ? '加密保存中…' : image.status === 'failed' ? '保存失败' : image.status === 'removing' ? '移除中…' : '已保存'}</small></span><button type="button" disabled={image.status === 'saving' || image.status === 'removing'} onClick={() => { trackAttachmentJob(removeComposeAttachment(image, true)) }} aria-label={'移除内嵌图片 ' + image.fileName}>×</button></div>)}</div>}
+      {attachments.length > 0 && <div className="compose-attachments" aria-label="待发送附件">{attachments.map((attachment) => <div className={`compose-attachment is-${attachment.status}`} key={attachment.localId}><span>{attachment.fileName}</span><small>{Math.max(1, Math.round(attachment.size / 1024))} KB · {attachment.status === 'saving' ? '加密保存中…' : attachment.status === 'failed' ? '保存失败' : attachment.status === 'removing' ? '移除中…' : '已保存'}</small><button type="button" disabled={attachment.status === 'saving' || attachment.status === 'removing'} onClick={() => { trackAttachmentJob(removeComposeAttachment(attachment, false)) }} aria-label={'移除附件 ' + attachment.fileName}>×</button></div>)}</div>}
+      {uploadingName && <div className="compose-uploading" aria-live="polite"><Icon name="rotate" size={14} />{uploadingName}</div>}
+      <div className="compose-footer"><div><TooltipButton label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={19} /></TooltipButton><input ref={fileInputRef} type="file" multiple hidden onChange={addFiles} /><TooltipButton label="插入图片" onClick={() => imageInputRef.current?.click()}><Icon name="image" size={19} /></TooltipButton><input ref={imageInputRef} type="file" accept="image/*" multiple hidden onChange={addInlineImages} /><TooltipButton label={htmlEnabled ? (inlineImages.length > 0 ? '内嵌图片需要 HTML 格式' : '关闭 HTML 格式') : '启用 HTML 格式'} active={htmlEnabled} onClick={() => { if (inlineImages.length > 0) { onError('已插入内嵌图片，HTML 格式必须保持开启'); return } setHtmlMode((value) => !value) }}><span className="reply-a">A</span></TooltipButton></div><div className="compose-send-actions">{draftId && <button type="button" className="danger-button" onClick={() => { void discard() }} disabled={isSending}><Icon name="trash" size={16} />丢弃草稿</button>}<button type="button" className="gradient-button" onClick={send} disabled={isSending}>{isSending ? (uploadingName || '发送中…') : '发送'}<Icon name="send" size={17} /></button></div></div>
+    </motion.div>
+  </motion.div>
 }
 
 export default App

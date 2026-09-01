@@ -43,7 +43,7 @@ The current foundation includes:
 - Compose supports bounded To/CC/BCC recipient lists, safe HTML alternatives, and chunked multi-file attachments without putting attachment bytes in a single IPC request.
 - Reply, reply-all, and forward preserve the active account, prefill recipients from MIME To/CC headers, add safe subject prefixes, and quote the original message without restoring an unrelated draft.
 - The desktop keyboard flow includes `C` for compose, `R` for replying to the selected message, `Ctrl/Cmd+K` for search, and `Esc` for closing transient UI.
-- Native mode automatically saves and restores the latest text draft per account in a DPAPI-protected local store; sending removes the draft, while attachments remain intentionally session-scoped.
+- Native mode automatically saves and restores per-account drafts in a DPAPI-protected local store. Draft attachments and inline images are encrypted as independent bounded files, restored without blocking the text editor, reused directly by native send/outbox paths, and removed after send or explicit discard.
 - Mailbox caches and MIME payloads have explicit byte/count limits; cached mutations are bound to UIDVALIDITY, and cache/outbox writes are serialized to avoid scheduler/IPC races.
 - MIME parsing enables the parser's complete legacy-charset support, including common GB2312/GBK/GB18030, Big5, and Japanese encodings. Cache schema v3 reparses derived header and conversation metadata only after a successful remote sync, so failed migrations leave the prior offline snapshot intact.
 - Native mode also surfaces those encrypted local drafts in the 草稿箱 list, with per-account counts, draft-specific continue-editing actions, and an explicit discard action.

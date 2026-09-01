@@ -168,7 +168,16 @@ export interface NativeDraft {
   htmlMode: boolean
   inReplyTo?: string
   references: string[]
+  attachments: NativeDraftAttachment[]
   updatedAt: number
+}
+
+export interface NativeDraftAttachment {
+  id: string
+  fileName: string
+  contentType: string
+  contentId?: string
+  size: number
 }
 
 export interface NativeCachedAttachment {
@@ -188,8 +197,10 @@ export interface NativeAttachmentResponse {
 
 export interface NativeAttachmentStartResponse {
   downloadId: string
+  attachmentId?: string
   fileName: string
   contentType: string
+  contentId?: string
   size: number
   chunkSize: number
 }

@@ -495,11 +495,15 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .compose-attachment span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .compose-attachment small { flex: 0 0 auto; color: var(--muted); font-size: 10px; }
 .compose-attachment button { flex: 0 0 auto; width: 18px; height: 18px; border-radius: 50%; color: var(--muted); background: transparent; font-size: 15px; line-height: 16px; }
-.compose-attachment button:hover { color: var(--text); background: var(--surface-hover); }
+.compose-attachment button:hover:not(:disabled) { color: var(--text); background: var(--surface-hover); }
+.compose-attachment button:disabled, .compose-inline-image button:disabled { cursor: wait; opacity: .55; }
+.compose-attachment.is-failed, .compose-inline-image.is-failed { border-color: color-mix(in srgb, var(--danger), transparent 38%); }
 .compose-inline-images { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 17px 10px; }
 .compose-inline-image { position: relative; width: 76px; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-strong); }
 .compose-inline-image img { width: 100%; height: 56px; display: block; object-fit: cover; }
-.compose-inline-image span { display: block; overflow: hidden; padding: 4px 5px; color: var(--muted-strong); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.compose-inline-image > span { display: block; overflow: hidden; padding: 4px 5px; color: var(--muted-strong); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.compose-inline-image > span small { display: block; margin-top: 2px; color: var(--muted); font-size: 8px; }
+.compose-inline-image .compose-inline-placeholder { height: 56px; padding: 17px 0 0; color: var(--muted); text-align: center; background: var(--surface-soft); }
 .compose-inline-image button { position: absolute; top: 3px; right: 3px; width: 18px; height: 18px; border-radius: 50%; color: #fff; background: rgba(15, 22, 40, .78); font-size: 14px; line-height: 16px; }
 .compose-inline-image button:hover { background: var(--danger); }
 .compose-uploading { display: flex; align-items: center; gap: 6px; padding: 0 17px 10px; color: var(--accent); font-size: 11px; }

@@ -91,9 +91,9 @@ const MAX_ATTACHMENT_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
 const MAX_LEGACY_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_ATTACHMENT_DOWNLOADS: usize = 2;
 const ATTACHMENT_DOWNLOAD_TTL: Duration = Duration::from_secs(10 * 60);
-const MAX_OUTGOING_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
-const MAX_OUTGOING_ATTACHMENT_TOTAL_BYTES: usize = 50 * 1024 * 1024;
-const MAX_OUTGOING_ATTACHMENTS: usize = 10;
+const MAX_OUTGOING_ATTACHMENT_BYTES: usize = drafts::MAX_ATTACHMENT_BYTES;
+const MAX_OUTGOING_ATTACHMENT_TOTAL_BYTES: usize = drafts::MAX_ATTACHMENT_TOTAL_BYTES;
+const MAX_OUTGOING_ATTACHMENTS: usize = drafts::MAX_ATTACHMENTS;
 const MAX_ACTIVE_ATTACHMENT_UPLOADS: usize = 4;
 const ATTACHMENT_UPLOAD_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_IMPORTED_ACCOUNTS: usize = 64;
@@ -1890,9 +1890,102 @@ fn handle_ipc(
                         .unwrap_or(false),
                     in_reply_to,
                     references,
+                    attachments: Vec::new(),
                     updated_at: 0,
                 };
                 Ok(serde_json::to_value(drafts::save(&cache_dir(), draft)?)?)
+            }
+            "drafts.attachment.commit" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
+                let draft_id = string_field(&message.payload, "draftId")?;
+                let attachment_id = string_field(&message.payload, "attachmentId")?;
+                let upload_id = string_field(&message.payload, "uploadId")?;
+                let upload = {
+                    let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                    purge_expired_attachment_uploads(&mut app);
+                    let upload = app
+                        .attachment_uploads
+                        .remove(&upload_id)
+                        .ok_or_else(|| anyhow!("attachment upload is missing or expired"))?;
+                    if upload.bytes.len() != upload.expected_size {
+                        app.attachment_uploads.insert(upload_id.clone(), upload);
+                        return Err(anyhow!("attachment upload is incomplete"));
+                    }
+                    upload
+                };
+                let draft = match drafts::attach(
+                    &cache_dir(),
+                    &account_id,
+                    &draft_id,
+                    drafts::NewDraftAttachment {
+                        id: attachment_id.clone(),
+                        file_name: upload.file_name.clone(),
+                        content_type: upload.content_type.clone(),
+                        content_id: upload.content_id.clone(),
+                    },
+                    &upload.bytes,
+                ) {
+                    Ok(draft) => draft,
+                    Err(error) => {
+                        if let Ok(mut app) = shared.lock() {
+                            app.attachment_uploads.insert(upload_id, upload);
+                        }
+                        return Err(error);
+                    }
+                };
+                let attachment = draft
+                    .attachments
+                    .iter()
+                    .find(|attachment| attachment.id == attachment_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("committed draft attachment metadata is missing"))?;
+                Ok(json!({ "draft": draft, "attachment": attachment }))
+            }
+            "drafts.attachment.remove" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
+                let draft_id = string_field(&message.payload, "draftId")?;
+                let attachment_id = string_field(&message.payload, "attachmentId")?;
+                Ok(serde_json::to_value(drafts::remove_attachment(
+                    &cache_dir(),
+                    &account_id,
+                    &draft_id,
+                    &attachment_id,
+                )?)?)
+            }
+            "drafts.attachment.start" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
+                let draft_id = string_field(&message.payload, "draftId")?;
+                let attachment_id = string_field(&message.payload, "attachmentId")?;
+                let attachment =
+                    drafts::load_attachment(&cache_dir(), &account_id, &draft_id, &attachment_id)?;
+                let size = attachment.bytes.len();
+                let download_id = format!("mailgo-draft-attachment-{:016x}", rand::random::<u64>());
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                purge_expired_attachment_downloads(&mut app);
+                if app.attachment_downloads.len() >= MAX_ACTIVE_ATTACHMENT_DOWNLOADS {
+                    return Err(anyhow!(
+                        "too many active attachment downloads; finish or cancel one first"
+                    ));
+                }
+                app.attachment_downloads.insert(
+                    download_id.clone(),
+                    AttachmentDownloadSession {
+                        bytes: attachment.bytes,
+                        created_at: Instant::now(),
+                    },
+                );
+                Ok(json!({
+                    "downloadId": download_id,
+                    "attachmentId": attachment.metadata.id,
+                    "fileName": attachment.metadata.file_name,
+                    "contentType": attachment.metadata.content_type,
+                    "contentId": attachment.metadata.content_id,
+                    "size": size,
+                    "chunkSize": ATTACHMENT_CHUNK_BYTES,
+                }))
             }
             "drafts.remove" => {
                 let account_id = string_field(&message.payload, "accountId")?;
@@ -2871,18 +2964,71 @@ fn handle_ipc(
                         })
                         .collect::<Result<Vec<_>>>()?,
                 };
-                if attachment_ids.len() > MAX_OUTGOING_ATTACHMENTS {
+                let draft_id = optional_string_field(&message.payload, "draftId");
+                let draft_attachment_ids = match message.payload.get("draftAttachmentIds") {
+                    None => Vec::new(),
+                    Some(value) => value
+                        .as_array()
+                        .ok_or_else(|| anyhow!("draftAttachmentIds must be an array"))?
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(str::to_string)
+                                .ok_or_else(|| anyhow!("draft attachment id must be a string"))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                };
+                if attachment_ids
+                    .len()
+                    .saturating_add(draft_attachment_ids.len())
+                    > MAX_OUTGOING_ATTACHMENTS
+                {
                     return Err(anyhow!(
                         "a message can contain at most {} attachments",
                         MAX_OUTGOING_ATTACHMENTS
                     ));
                 }
-                let attachments = {
+                if !draft_attachment_ids.is_empty() && draft_id.is_none() {
+                    return Err(anyhow!(
+                        "draftId is required when sending persisted draft attachments"
+                    ));
+                }
+                let account = account_for(shared, &account_id)?;
+                let mut attachments = Vec::with_capacity(
+                    attachment_ids
+                        .len()
+                        .saturating_add(draft_attachment_ids.len()),
+                );
+                let mut total = 0usize;
+                let mut seen_draft_attachments = HashSet::new();
+                for attachment_id in &draft_attachment_ids {
+                    if !seen_draft_attachments.insert(attachment_id) {
+                        return Err(anyhow!("duplicate draft attachment id"));
+                    }
+                    let attachment = drafts::load_attachment(
+                        &cache_dir(),
+                        &account_id,
+                        draft_id.as_deref().ok_or_else(|| {
+                            anyhow!("draftId is required when sending persisted draft attachments")
+                        })?,
+                        attachment_id,
+                    )?;
+                    total = total.saturating_add(attachment.bytes.len());
+                    if total > MAX_OUTGOING_ATTACHMENT_TOTAL_BYTES {
+                        return Err(anyhow!("attachments exceed the total size limit"));
+                    }
+                    attachments.push(send::OutgoingAttachment {
+                        file_name: attachment.metadata.file_name,
+                        content_type: attachment.metadata.content_type,
+                        content_id: attachment.metadata.content_id,
+                        bytes: attachment.bytes,
+                    });
+                }
+                {
                     let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                     purge_expired_attachment_uploads(&mut app);
                     let mut seen = HashSet::new();
-                    let mut total = 0usize;
-                    let mut attachments = Vec::with_capacity(attachment_ids.len());
                     for upload_id in &attachment_ids {
                         if !seen.insert(upload_id) {
                             return Err(anyhow!("duplicate attachment upload id"));
@@ -2905,9 +3051,7 @@ fn handle_ipc(
                             bytes: upload.bytes.clone(),
                         });
                     }
-                    attachments
-                };
-                let account = account_for(shared, &account_id)?;
+                }
                 if offline_mode_enabled(shared)? {
                     if let Ok(mut app) = shared.lock() {
                         for upload_id in &attachment_ids {

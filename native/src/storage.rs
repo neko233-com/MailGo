@@ -127,6 +127,14 @@ fn classify(cache_root: &Path, path: &Path) -> CacheKind {
         component
             .as_os_str()
             .to_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case("draft-attachments-v1"))
+    }) {
+        return CacheKind::Draft;
+    }
+    if relative.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
             .is_some_and(|value| value.eq_ignore_ascii_case("attachments"))
     }) {
         return CacheKind::Attachment;
@@ -193,19 +201,25 @@ mod tests {
         fs::write(root.join("search-index-key-v1.bin"), [0u8; 3]).unwrap();
         fs::write(attachments.join("1-0.bin"), [0u8; 17]).unwrap();
         fs::write(root.join("drafts.bin"), [0u8; 19]).unwrap();
+        let draft_attachment = root
+            .join("draft-attachments-v1")
+            .join("account-hash")
+            .join("draft-1");
+        fs::create_dir_all(&draft_attachment).unwrap();
+        fs::write(draft_attachment.join("attachment.bin"), [0u8; 9]).unwrap();
         fs::write(root.join("outbox.bin.bak"), [0u8; 23]).unwrap();
         fs::write(account.join("moves.bin"), [0u8; 29]).unwrap();
         fs::write(root.join("unknown.dat"), [0u8; 31]).unwrap();
 
         let stats = measure(&root);
-        assert_eq!(stats.file_count, 10);
+        assert_eq!(stats.file_count, 11);
         assert_eq!(stats.mail_bytes, 39);
         assert_eq!(stats.attachment_bytes, 17);
-        assert_eq!(stats.draft_bytes, 19);
+        assert_eq!(stats.draft_bytes, 28);
         assert_eq!(stats.outbox_bytes, 23);
         assert_eq!(stats.operation_bytes, 29);
         assert_eq!(stats.other_bytes, 31);
-        assert_eq!(stats.total_bytes, 158);
+        assert_eq!(stats.total_bytes, 167);
         assert_eq!(
             stats.total_bytes,
             stats.mail_bytes
