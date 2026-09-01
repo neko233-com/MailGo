@@ -188,6 +188,7 @@ mod tests {
         fs::write(account.join("inbox.bin"), [0u8; 11]).unwrap();
         fs::write(account.join("folder_abcd.bin"), [0u8; 13]).unwrap();
         fs::write(root.join("mail-index-v1.sqlite3-wal"), [0u8; 7]).unwrap();
+        fs::write(root.join("mail-index-v1.sqlite3.backup"), [0u8; 5]).unwrap();
         fs::write(attachments.join("1-0.bin"), [0u8; 17]).unwrap();
         fs::write(root.join("drafts.bin"), [0u8; 19]).unwrap();
         fs::write(root.join("outbox.bin.bak"), [0u8; 23]).unwrap();
@@ -195,14 +196,14 @@ mod tests {
         fs::write(root.join("unknown.dat"), [0u8; 31]).unwrap();
 
         let stats = measure(&root);
-        assert_eq!(stats.file_count, 8);
-        assert_eq!(stats.mail_bytes, 31);
+        assert_eq!(stats.file_count, 9);
+        assert_eq!(stats.mail_bytes, 36);
         assert_eq!(stats.attachment_bytes, 17);
         assert_eq!(stats.draft_bytes, 19);
         assert_eq!(stats.outbox_bytes, 23);
         assert_eq!(stats.operation_bytes, 29);
         assert_eq!(stats.other_bytes, 31);
-        assert_eq!(stats.total_bytes, 150);
+        assert_eq!(stats.total_bytes, 155);
         assert_eq!(
             stats.total_bytes,
             stats.mail_bytes

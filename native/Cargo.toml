@@ -18,7 +18,7 @@ lettre = { version = "0.11.23", default-features = false, features = ["builder",
 mail-parser = { version = "0.11.8", features = ["full_encoding"] }
 native-tls = "0.2.18"
 rand = "0.8"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["backup", "bundled"] }
 rdesktop-core = { git = "https://github.com/neko233-com/rdesktop", version = "0.1.8" }
 rdesktop-webview = { git = "https://github.com/neko233-com/rdesktop", version = "0.1.8" }
 serde = { version = "1", features = ["derive"] }

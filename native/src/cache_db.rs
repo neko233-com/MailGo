@@ -1,23 +1,29 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use rusqlite::ffi::ErrorCode;
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior, MAIN_DB};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::mail::{CachedMailbox, CachedMessage, CACHE_SCHEMA_VERSION};
 
 const DATABASE_FILE: &str = "mail-index-v1.sqlite3";
+const DATABASE_BACKUP_FILE: &str = "mail-index-v1.sqlite3.backup";
+const DATABASE_BACKUP_PREVIOUS_FILE: &str = "mail-index-v1.sqlite3.backup.previous";
+const DATABASE_BACKUP_PENDING_FILE: &str = "mail-index-v1.sqlite3.backup.pending";
 const DATABASE_SCHEMA_VERSION: i64 = 1;
 const MAX_PAGE_SIZE: usize = 500;
 const MAX_ENCRYPTED_ROW_BYTES: usize = 8 * 1024 * 1024;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 static INITIALIZED_DATABASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static DATABASE_ACCESS: OnceLock<RwLock<()>> = OnceLock::new();
+static BACKUP_ACCESS: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -76,6 +82,10 @@ pub fn database_path(cache_root: &Path) -> PathBuf {
     cache_root.join(DATABASE_FILE)
 }
 
+fn backup_path(cache_root: &Path) -> PathBuf {
+    cache_root.join(DATABASE_BACKUP_FILE)
+}
+
 fn identity_key(value: &str) -> [u8; 32] {
     Sha256::digest(value.as_bytes()).into()
 }
@@ -130,6 +140,328 @@ fn open(cache_root: &Path) -> Result<Connection> {
         initialized.insert(path);
     }
     Ok(connection)
+}
+
+fn is_sqlite_corruption(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        source
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(|error| match error {
+                rusqlite::Error::SqliteFailure(failure, _) => matches!(
+                    failure.code,
+                    ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase
+                ),
+                _ => false,
+            })
+    })
+}
+
+fn backup_maintenance_error(error: anyhow::Error) -> anyhow::Error {
+    // Backup destinations are separate SQLite files. Keep their error chain opaque so a damaged
+    // pending/previous copy can never be mistaken for corruption in the live primary database.
+    anyhow!("indexed mail cache backup maintenance failed: {error:#}")
+}
+
+fn with_recovery<T>(
+    cache_root: &Path,
+    mut operation: impl FnMut(&mut Connection) -> Result<T>,
+) -> Result<T> {
+    if !database_path(cache_root).exists()
+        && [
+            backup_path(cache_root),
+            cache_root.join(DATABASE_BACKUP_PREVIOUS_FILE),
+            cache_root.join(DATABASE_BACKUP_PENDING_FILE),
+        ]
+        .iter()
+        .any(|path| path.exists())
+    {
+        recover_database(cache_root)?;
+    }
+    let access = DATABASE_ACCESS.get_or_init(|| RwLock::new(()));
+    let first_attempt = {
+        let _read_guard = access
+            .read()
+            .map_err(|_| anyhow!("indexed mail cache access lock poisoned"))?;
+        let mut connection = match open(cache_root) {
+            Ok(connection) => connection,
+            Err(error) => {
+                if !is_sqlite_corruption(&error) {
+                    return Err(error);
+                }
+                drop(_read_guard);
+                recover_database(cache_root)?;
+                let _retry_guard = access
+                    .read()
+                    .map_err(|_| anyhow!("indexed mail cache access lock poisoned"))?;
+                let mut connection = open(cache_root)?;
+                return operation(&mut connection)
+                    .context("retry indexed mail cache operation after recovery");
+            }
+        };
+        operation(&mut connection)
+    };
+    match first_attempt {
+        Ok(value) => Ok(value),
+        Err(error) if is_sqlite_corruption(&error) => {
+            recover_database(cache_root)?;
+            let _read_guard = access
+                .read()
+                .map_err(|_| anyhow!("indexed mail cache access lock poisoned"))?;
+            let mut connection = open(cache_root)?;
+            operation(&mut connection).context("retry indexed mail cache operation after recovery")
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_database_file(path: &Path) -> Result<bool> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| {
+        format!(
+            "open indexed mail cache recovery candidate {}",
+            path.display()
+        )
+    })?;
+    connection.busy_timeout(BUSY_TIMEOUT)?;
+    let check: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+    if check != "ok" {
+        return Ok(false);
+    }
+    let schema_version: i64 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if schema_version <= 0 || schema_version > DATABASE_SCHEMA_VERSION {
+        return Ok(false);
+    }
+    let required_tables: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name IN ('mailbox_meta', 'messages')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(required_tables == 2)
+}
+
+fn remove_initialized_path(path: &Path) -> Result<()> {
+    let initialized = INITIALIZED_DATABASES.get_or_init(|| Mutex::new(HashSet::new()));
+    initialized
+        .lock()
+        .map_err(|_| anyhow!("indexed mail cache initialization lock poisoned"))?
+        .remove(path);
+    Ok(())
+}
+
+fn quarantine_database_files(cache_root: &Path) -> Result<Vec<PathBuf>> {
+    let stamp = format!("{}-{}", now_epoch_millis(), std::process::id());
+    let paths = [
+        database_path(cache_root),
+        cache_root.join(format!("{DATABASE_FILE}-wal")),
+        cache_root.join(format!("{DATABASE_FILE}-shm")),
+    ];
+    let mut quarantined = Vec::new();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("indexed mail cache path is not valid UTF-8"))?;
+        let mut target = cache_root.join(format!("{file_name}.corrupt-{stamp}"));
+        for sequence in 1..=100u8 {
+            if !target.exists() {
+                break;
+            }
+            target = cache_root.join(format!("{file_name}.corrupt-{stamp}-{sequence}"));
+        }
+        if target.exists() {
+            return Err(anyhow!("too many indexed mail cache recovery files"));
+        }
+        fs::rename(&path, &target)
+            .with_context(|| format!("quarantine damaged mail cache {}", path.display()))?;
+        quarantined.push(target);
+    }
+    Ok(quarantined)
+}
+
+fn restore_candidate(candidate: &Path, primary: &Path) -> Result<()> {
+    let temporary = primary.with_extension("sqlite3.recovery.pending");
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("remove stale recovery file {}", temporary.display()))
+        }
+    }
+    fs::copy(candidate, &temporary).with_context(|| {
+        format!(
+            "copy indexed mail cache recovery candidate {}",
+            candidate.display()
+        )
+    })?;
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&temporary)
+        .with_context(|| format!("open recovery file {}", temporary.display()))?
+        .sync_all()
+        .with_context(|| format!("flush recovery file {}", temporary.display()))?;
+    if !validate_database_file(&temporary)? {
+        return Err(anyhow!(
+            "indexed mail cache recovery candidate became invalid"
+        ));
+    }
+    fs::rename(&temporary, primary).with_context(|| {
+        format!(
+            "commit indexed mail cache recovery to {}",
+            primary.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn recover_database(cache_root: &Path) -> Result<()> {
+    let access = DATABASE_ACCESS.get_or_init(|| RwLock::new(()));
+    let _write_guard = access
+        .write()
+        .map_err(|_| anyhow!("indexed mail cache access lock poisoned"))?;
+    fs::create_dir_all(cache_root)
+        .with_context(|| format!("create mail cache directory {}", cache_root.display()))?;
+    let primary = database_path(cache_root);
+
+    if primary.exists() {
+        match validate_database_file(&primary) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) if is_sqlite_corruption(&error) => {}
+            Err(error) => return Err(error).context("verify indexed mail cache before recovery"),
+        }
+    }
+
+    let candidates = [
+        backup_path(cache_root),
+        cache_root.join(DATABASE_BACKUP_PREVIOUS_FILE),
+        cache_root.join(DATABASE_BACKUP_PENDING_FILE),
+    ];
+    let mut selected = None;
+    for candidate in candidates {
+        if !candidate.exists() {
+            continue;
+        }
+        match validate_database_file(&candidate) {
+            Ok(true) => {
+                selected = Some(candidate);
+                break;
+            }
+            Ok(false) => {
+                tracing::warn!("indexed mail cache recovery candidate failed integrity check")
+            }
+            Err(error) if is_sqlite_corruption(&error) => {
+                tracing::warn!("indexed mail cache recovery candidate is damaged")
+            }
+            Err(error) => {
+                return Err(error).context("validate indexed mail cache recovery candidate")
+            }
+        }
+    }
+
+    let quarantined = quarantine_database_files(cache_root)?;
+    remove_initialized_path(&primary)?;
+    if let Some(candidate) = selected {
+        restore_candidate(&candidate, &primary)?;
+        tracing::warn!(
+            quarantined_files = quarantined.len(),
+            "recovered damaged indexed mail cache from a validated backup"
+        );
+    } else {
+        tracing::warn!(
+            quarantined_files = quarantined.len(),
+            "damaged indexed mail cache had no valid backup; rebuilding the local index"
+        );
+    }
+    Ok(())
+}
+
+fn backup_is_due(cache_root: &Path) -> bool {
+    let Ok(modified) = fs::metadata(backup_path(cache_root)).and_then(|value| value.modified())
+    else {
+        return true;
+    };
+    modified
+        .elapsed()
+        .map_or(true, |elapsed| elapsed >= Duration::from_secs(60))
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn rotate_backup(cache_root: &Path) -> Result<()> {
+    let backup = backup_path(cache_root);
+    let previous = cache_root.join(DATABASE_BACKUP_PREVIOUS_FILE);
+    let pending = cache_root.join(DATABASE_BACKUP_PENDING_FILE);
+    remove_file_if_exists(&previous)?;
+    if backup.exists() {
+        fs::rename(&backup, &previous)
+            .with_context(|| format!("rotate indexed mail cache backup {}", backup.display()))?;
+    }
+    if let Err(error) = fs::rename(&pending, &backup) {
+        if previous.exists() && !backup.exists() {
+            let _ = fs::rename(&previous, &backup);
+        }
+        return Err(error)
+            .with_context(|| format!("commit indexed mail cache backup {}", backup.display()));
+    }
+    Ok(())
+}
+
+fn refresh_backup_with_connection(
+    connection: &Connection,
+    cache_root: &Path,
+    force: bool,
+) -> Result<()> {
+    if !force && !backup_is_due(cache_root) {
+        return Ok(());
+    }
+    let backup_access = BACKUP_ACCESS.get_or_init(|| Mutex::new(()));
+    let _backup_guard = backup_access
+        .lock()
+        .map_err(|_| anyhow!("indexed mail cache backup lock poisoned"))?;
+    if !force && !backup_is_due(cache_root) {
+        return Ok(());
+    }
+    let pending = cache_root.join(DATABASE_BACKUP_PENDING_FILE);
+    remove_file_if_exists(&pending)?;
+    connection
+        .backup(MAIN_DB, &pending, None)
+        .context("create online indexed mail cache backup")?;
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&pending)
+        .with_context(|| format!("open backup {}", pending.display()))?
+        .sync_all()
+        .with_context(|| format!("flush backup {}", pending.display()))?;
+    if !validate_database_file(&pending)? {
+        return Err(anyhow!(
+            "new indexed mail cache backup failed integrity check"
+        ));
+    }
+    rotate_backup(cache_root)
+}
+
+pub fn refresh_backup(cache_root: &Path) -> Result<()> {
+    with_recovery(cache_root, |connection| {
+        refresh_backup_with_connection(connection, cache_root, false)
+            .map_err(backup_maintenance_error)
+    })
 }
 
 fn initialize(connection: &mut Connection) -> Result<()> {
@@ -238,28 +570,29 @@ pub fn load_mailbox(
     account_id: &str,
     folder: &str,
 ) -> Result<Option<CachedMailbox>> {
-    let connection = open(cache_root)?;
-    let account_key = identity_key(account_id);
-    let folder_key = folder_identity_key(account_id, folder);
-    let Some((metadata, _)) = read_metadata(&connection, &account_key, &folder_key)? else {
-        return Ok(None);
-    };
-    validate_identity(&metadata, account_id, folder)?;
-    let mut statement = connection.prepare(
-        "SELECT uid, payload FROM messages
-         WHERE account_key = ?1 AND folder_key = ?2
-         ORDER BY uid DESC",
-    )?;
-    let rows = statement.query_map(params![account_key, folder_key], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })?;
-    let mut messages = Vec::new();
-    for row in rows {
-        let (uid, payload) = row?;
-        let uid = u32::try_from(uid).context("indexed message UID is out of range")?;
-        messages.push(decrypt_message(&payload, account_id, folder, uid)?);
-    }
-    Ok(Some(metadata.into_mailbox(messages)))
+    with_recovery(cache_root, |connection| {
+        let account_key = identity_key(account_id);
+        let folder_key = folder_identity_key(account_id, folder);
+        let Some((metadata, _)) = read_metadata(connection, &account_key, &folder_key)? else {
+            return Ok(None);
+        };
+        validate_identity(&metadata, account_id, folder)?;
+        let mut statement = connection.prepare(
+            "SELECT uid, payload FROM messages
+             WHERE account_key = ?1 AND folder_key = ?2
+             ORDER BY uid DESC",
+        )?;
+        let rows = statement.query_map(params![account_key, folder_key], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut messages = Vec::new();
+        for row in rows {
+            let (uid, payload) = row?;
+            let uid = u32::try_from(uid).context("indexed message UID is out of range")?;
+            messages.push(decrypt_message(&payload, account_id, folder, uid)?);
+        }
+        Ok(Some(metadata.into_mailbox(messages)))
+    })
 }
 
 pub fn load_mailbox_page(
@@ -269,53 +602,55 @@ pub fn load_mailbox_page(
     before_uid: Option<u32>,
     limit: usize,
 ) -> Result<Option<MailboxPage>> {
-    let connection = open(cache_root)?;
-    let account_key = identity_key(account_id);
-    let folder_key = folder_identity_key(account_id, folder);
-    let Some((metadata, revision)) = read_metadata(&connection, &account_key, &folder_key)? else {
-        return Ok(None);
-    };
-    validate_identity(&metadata, account_id, folder)?;
-    let page_size = limit.clamp(1, MAX_PAGE_SIZE);
-    let before = before_uid.map(i64::from);
-    let mut statement = connection.prepare(
-        "SELECT uid, payload FROM messages
-         WHERE account_key = ?1 AND folder_key = ?2
-           AND (?3 IS NULL OR uid < ?3)
-         ORDER BY uid DESC
-         LIMIT ?4",
-    )?;
-    let rows = statement.query_map(
-        params![account_key, folder_key, before, (page_size + 1) as i64],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
-    )?;
-    let mut encrypted_rows = Vec::with_capacity(page_size + 1);
-    for row in rows {
-        encrypted_rows.push(row?);
-    }
-    let local_has_more = encrypted_rows.len() > page_size;
-    encrypted_rows.truncate(page_size);
-    let mut messages = Vec::with_capacity(encrypted_rows.len());
-    for (uid, payload) in encrypted_rows {
-        let uid = u32::try_from(uid).context("indexed message UID is out of range")?;
-        messages.push(decrypt_message(&payload, account_id, folder, uid)?);
-    }
-    let total_cached: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM messages WHERE account_key = ?1 AND folder_key = ?2",
-        params![account_key, folder_key],
-        |row| row.get(0),
-    )?;
-    let remote_has_more = metadata.has_more;
-    let mut mailbox = metadata.into_mailbox(messages);
-    mailbox.oldest_uid = mailbox.messages.iter().map(|message| message.uid).min();
-    mailbox.has_more = local_has_more || remote_has_more;
-    Ok(Some(MailboxPage {
-        mailbox,
-        local_has_more,
-        remote_has_more,
-        total_cached: total_cached.max(0) as usize,
-        revision,
-    }))
+    with_recovery(cache_root, |connection| {
+        let account_key = identity_key(account_id);
+        let folder_key = folder_identity_key(account_id, folder);
+        let Some((metadata, revision)) = read_metadata(connection, &account_key, &folder_key)?
+        else {
+            return Ok(None);
+        };
+        validate_identity(&metadata, account_id, folder)?;
+        let page_size = limit.clamp(1, MAX_PAGE_SIZE);
+        let before = before_uid.map(i64::from);
+        let mut statement = connection.prepare(
+            "SELECT uid, payload FROM messages
+             WHERE account_key = ?1 AND folder_key = ?2
+               AND (?3 IS NULL OR uid < ?3)
+             ORDER BY uid DESC
+             LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![account_key, folder_key, before, (page_size + 1) as i64],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )?;
+        let mut encrypted_rows = Vec::with_capacity(page_size + 1);
+        for row in rows {
+            encrypted_rows.push(row?);
+        }
+        let local_has_more = encrypted_rows.len() > page_size;
+        encrypted_rows.truncate(page_size);
+        let mut messages = Vec::with_capacity(encrypted_rows.len());
+        for (uid, payload) in encrypted_rows {
+            let uid = u32::try_from(uid).context("indexed message UID is out of range")?;
+            messages.push(decrypt_message(&payload, account_id, folder, uid)?);
+        }
+        let total_cached: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM messages WHERE account_key = ?1 AND folder_key = ?2",
+            params![account_key, folder_key],
+            |row| row.get(0),
+        )?;
+        let remote_has_more = metadata.has_more;
+        let mut mailbox = metadata.into_mailbox(messages);
+        mailbox.oldest_uid = mailbox.messages.iter().map(|message| message.uid).min();
+        mailbox.has_more = local_has_more || remote_has_more;
+        Ok(Some(MailboxPage {
+            mailbox,
+            local_has_more,
+            remote_has_more,
+            total_cached: total_cached.max(0) as usize,
+            revision,
+        }))
+    })
 }
 
 pub fn load_message(
@@ -324,20 +659,21 @@ pub fn load_message(
     folder: &str,
     uid: u32,
 ) -> Result<Option<CachedMessage>> {
-    let connection = open(cache_root)?;
-    let account_key = identity_key(account_id);
-    let folder_key = folder_identity_key(account_id, folder);
-    let payload = connection
-        .query_row(
-            "SELECT payload FROM messages
-             WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3",
-            params![account_key, folder_key, i64::from(uid)],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .optional()?;
-    payload
-        .map(|payload| decrypt_message(&payload, account_id, folder, uid))
-        .transpose()
+    with_recovery(cache_root, |connection| {
+        let account_key = identity_key(account_id);
+        let folder_key = folder_identity_key(account_id, folder);
+        let payload = connection
+            .query_row(
+                "SELECT payload FROM messages
+                 WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3",
+                params![account_key, folder_key, i64::from(uid)],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        payload
+            .map(|payload| decrypt_message(&payload, account_id, folder, uid))
+            .transpose()
+    })
 }
 
 pub fn save_mailbox(
@@ -348,82 +684,84 @@ pub fn save_mailbox(
     if mailbox.account_id != account_id {
         return Err(anyhow!("indexed mail cache account mismatch"));
     }
-    let mut connection = open(cache_root)?;
-    let account_key = identity_key(account_id);
-    let folder_key = folder_identity_key(account_id, &mailbox.folder);
-    let now = now_epoch_millis();
-    let (metadata_payload, _) = encrypt_json(&MailboxMetadata::from(mailbox))?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute(
-        "INSERT INTO mailbox_meta(account_key, folder_key, payload, revision, updated_at)
-         VALUES (?1, ?2, ?3, 1, ?4)
-         ON CONFLICT(account_key, folder_key) DO UPDATE SET
-           payload = excluded.payload,
-           revision = mailbox_meta.revision + 1,
-           updated_at = excluded.updated_at",
-        params![account_key, folder_key, metadata_payload, now],
-    )?;
-
-    let existing = {
-        let mut statement = transaction.prepare(
-            "SELECT uid, payload_hash FROM messages
-             WHERE account_key = ?1 AND folder_key = ?2",
-        )?;
-        let rows = statement.query_map(params![account_key, folder_key], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?;
-        let mut result = HashMap::new();
-        for row in rows {
-            let (uid, digest) = row?;
-            result.insert(uid, digest);
-        }
-        result
-    };
-    let current_uids = mailbox
-        .messages
-        .iter()
-        .map(|message| i64::from(message.uid))
-        .collect::<HashSet<_>>();
-    {
-        let mut delete = transaction.prepare(
-            "DELETE FROM messages WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3",
-        )?;
-        for uid in existing.keys().filter(|uid| !current_uids.contains(uid)) {
-            delete.execute(params![account_key, folder_key, uid])?;
-        }
-    }
-    {
-        let mut upsert = transaction.prepare(
-            "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
-               payload_hash = excluded.payload_hash,
+    with_recovery(cache_root, |connection| {
+        let account_key = identity_key(account_id);
+        let folder_key = folder_identity_key(account_id, &mailbox.folder);
+        let now = now_epoch_millis();
+        let (metadata_payload, _) = encrypt_json(&MailboxMetadata::from(mailbox))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO mailbox_meta(account_key, folder_key, payload, revision, updated_at)
+             VALUES (?1, ?2, ?3, 1, ?4)
+             ON CONFLICT(account_key, folder_key) DO UPDATE SET
                payload = excluded.payload,
+               revision = mailbox_meta.revision + 1,
                updated_at = excluded.updated_at",
+            params![account_key, folder_key, metadata_payload, now],
         )?;
-        for message in &mailbox.messages {
-            if message.account_id != account_id
-                || !message.folder.eq_ignore_ascii_case(&mailbox.folder)
-            {
-                return Err(anyhow!("indexed message cache identity mismatch"));
+
+        let existing = {
+            let mut statement = transaction.prepare(
+                "SELECT uid, payload_hash FROM messages
+                 WHERE account_key = ?1 AND folder_key = ?2",
+            )?;
+            let rows = statement.query_map(params![account_key, folder_key], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            let mut result = HashMap::new();
+            for row in rows {
+                let (uid, digest) = row?;
+                result.insert(uid, digest);
             }
-            let serialized = serde_json::to_vec(message)?;
-            if serialized.len() > MAX_ENCRYPTED_ROW_BYTES {
-                return Err(anyhow!("indexed message cache row is too large"));
+            result
+        };
+        let current_uids = mailbox
+            .messages
+            .iter()
+            .map(|message| i64::from(message.uid))
+            .collect::<HashSet<_>>();
+        {
+            let mut delete = transaction.prepare(
+                "DELETE FROM messages WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3",
+            )?;
+            for uid in existing.keys().filter(|uid| !current_uids.contains(uid)) {
+                delete.execute(params![account_key, folder_key, uid])?;
             }
-            let digest = Sha256::digest(&serialized).to_vec();
-            let uid = i64::from(message.uid);
-            if existing.get(&uid).is_some_and(|stored| stored == &digest) {
-                continue;
-            }
-            let payload = crate::sync::protect_cache(&serialized)?;
-            if payload.len() > MAX_ENCRYPTED_ROW_BYTES {
-                return Err(anyhow!("encrypted indexed message cache row is too large"));
-            }
-            upsert.execute(params![account_key, folder_key, uid, digest, payload, now])?;
         }
-    }
-    transaction.commit()?;
+        {
+            let mut upsert = transaction.prepare(
+                "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
+                   payload_hash = excluded.payload_hash,
+                   payload = excluded.payload,
+                   updated_at = excluded.updated_at",
+            )?;
+            for message in &mailbox.messages {
+                if message.account_id != account_id
+                    || !message.folder.eq_ignore_ascii_case(&mailbox.folder)
+                {
+                    return Err(anyhow!("indexed message cache identity mismatch"));
+                }
+                let serialized = serde_json::to_vec(message)?;
+                if serialized.len() > MAX_ENCRYPTED_ROW_BYTES {
+                    return Err(anyhow!("indexed message cache row is too large"));
+                }
+                let digest = Sha256::digest(&serialized).to_vec();
+                let uid = i64::from(message.uid);
+                if existing.get(&uid).is_some_and(|stored| stored == &digest) {
+                    continue;
+                }
+                let payload = crate::sync::protect_cache(&serialized)?;
+                if payload.len() > MAX_ENCRYPTED_ROW_BYTES {
+                    return Err(anyhow!("encrypted indexed message cache row is too large"));
+                }
+                upsert.execute(params![account_key, folder_key, uid, digest, payload, now])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    })?;
     Ok(database_path(cache_root))
 }
 
@@ -431,117 +769,123 @@ pub fn save_message(cache_root: &Path, account_id: &str, message: &CachedMessage
     if message.account_id != account_id {
         return Err(anyhow!("indexed mail cache account mismatch"));
     }
-    let mut connection = open(cache_root)?;
-    let account_key = identity_key(account_id);
-    let folder_key = folder_identity_key(account_id, &message.folder);
-    let now = now_epoch_millis();
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let existing_metadata = read_metadata(&transaction, &account_key, &folder_key)?;
-    let mut metadata = existing_metadata
-        .as_ref()
-        .map(|(metadata, _)| metadata.clone())
-        .unwrap_or_else(|| MailboxMetadata {
-            schema_version: CACHE_SCHEMA_VERSION,
-            account_id: account_id.to_string(),
-            folder: message.folder.clone(),
-            uid_validity: None,
-            highest_mod_seq: None,
-            synced_at: String::new(),
-            oldest_uid: Some(message.uid),
-            has_more: false,
-        });
-    validate_identity(&metadata, account_id, &message.folder)?;
-    metadata.oldest_uid = Some(
-        metadata
-            .oldest_uid
-            .map_or(message.uid, |oldest| oldest.min(message.uid)),
-    );
-    metadata.synced_at = format!("unix:{}", now / 1000);
-    let (metadata_payload, _) = encrypt_json(&metadata)?;
-    transaction.execute(
-        "INSERT INTO mailbox_meta(account_key, folder_key, payload, revision, updated_at)
-         VALUES (?1, ?2, ?3, 1, ?4)
-         ON CONFLICT(account_key, folder_key) DO UPDATE SET
-           payload = excluded.payload,
-           revision = mailbox_meta.revision + 1,
-           updated_at = excluded.updated_at",
-        params![account_key, folder_key, metadata_payload, now],
-    )?;
-    let (payload, digest) = encrypt_json(message)?;
-    transaction.execute(
-        "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
-           payload_hash = excluded.payload_hash,
-           payload = excluded.payload,
-           updated_at = excluded.updated_at",
-        params![
-            account_key,
-            folder_key,
-            i64::from(message.uid),
-            digest,
-            payload,
-            now
-        ],
-    )?;
-    transaction.commit()?;
-    Ok(())
+    with_recovery(cache_root, |connection| {
+        let account_key = identity_key(account_id);
+        let folder_key = folder_identity_key(account_id, &message.folder);
+        let now = now_epoch_millis();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_metadata = read_metadata(&transaction, &account_key, &folder_key)?;
+        let mut metadata = existing_metadata
+            .as_ref()
+            .map(|(metadata, _)| metadata.clone())
+            .unwrap_or_else(|| MailboxMetadata {
+                schema_version: CACHE_SCHEMA_VERSION,
+                account_id: account_id.to_string(),
+                folder: message.folder.clone(),
+                uid_validity: None,
+                highest_mod_seq: None,
+                synced_at: String::new(),
+                oldest_uid: Some(message.uid),
+                has_more: false,
+            });
+        validate_identity(&metadata, account_id, &message.folder)?;
+        metadata.oldest_uid = Some(
+            metadata
+                .oldest_uid
+                .map_or(message.uid, |oldest| oldest.min(message.uid)),
+        );
+        metadata.synced_at = format!("unix:{}", now / 1000);
+        let (metadata_payload, _) = encrypt_json(&metadata)?;
+        transaction.execute(
+            "INSERT INTO mailbox_meta(account_key, folder_key, payload, revision, updated_at)
+             VALUES (?1, ?2, ?3, 1, ?4)
+             ON CONFLICT(account_key, folder_key) DO UPDATE SET
+               payload = excluded.payload,
+               revision = mailbox_meta.revision + 1,
+               updated_at = excluded.updated_at",
+            params![account_key, folder_key, metadata_payload, now],
+        )?;
+        let (payload, digest) = encrypt_json(message)?;
+        transaction.execute(
+            "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
+               payload_hash = excluded.payload_hash,
+               payload = excluded.payload,
+               updated_at = excluded.updated_at",
+            params![
+                account_key,
+                folder_key,
+                i64::from(message.uid),
+                digest,
+                payload,
+                now
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
 }
 
 pub fn remove_message(cache_root: &Path, account_id: &str, folder: &str, uid: u32) -> Result<()> {
-    let mut connection = open(cache_root)?;
-    let account_key = identity_key(account_id);
-    let folder_key = folder_identity_key(account_id, folder);
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let Some((mut metadata, _)) = read_metadata(&transaction, &account_key, &folder_key)? else {
-        return Ok(());
-    };
-    validate_identity(&metadata, account_id, folder)?;
-    let removed = transaction.execute(
-        "DELETE FROM messages
-         WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3",
-        params![account_key, folder_key, i64::from(uid)],
-    )?;
-    if removed == 0 {
+    with_recovery(cache_root, |connection| {
+        let account_key = identity_key(account_id);
+        let folder_key = folder_identity_key(account_id, folder);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some((mut metadata, _)) = read_metadata(&transaction, &account_key, &folder_key)?
+        else {
+            return Ok(());
+        };
+        validate_identity(&metadata, account_id, folder)?;
+        let removed = transaction.execute(
+            "DELETE FROM messages
+             WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3",
+            params![account_key, folder_key, i64::from(uid)],
+        )?;
+        if removed == 0 {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let oldest: Option<i64> = transaction.query_row(
+            "SELECT MIN(uid) FROM messages WHERE account_key = ?1 AND folder_key = ?2",
+            params![account_key, folder_key],
+            |row| row.get(0),
+        )?;
+        metadata.oldest_uid = oldest
+            .map(|value| u32::try_from(value).context("indexed message UID is out of range"))
+            .transpose()?;
+        metadata.synced_at = format!("unix:{}", now_epoch_millis() / 1000);
+        let (metadata_payload, _) = encrypt_json(&metadata)?;
+        transaction.execute(
+            "UPDATE mailbox_meta SET payload = ?3, revision = revision + 1, updated_at = ?4
+             WHERE account_key = ?1 AND folder_key = ?2",
+            params![
+                account_key,
+                folder_key,
+                metadata_payload,
+                now_epoch_millis()
+            ],
+        )?;
         transaction.commit()?;
-        return Ok(());
-    }
-    let oldest: Option<i64> = transaction.query_row(
-        "SELECT MIN(uid) FROM messages WHERE account_key = ?1 AND folder_key = ?2",
-        params![account_key, folder_key],
-        |row| row.get(0),
-    )?;
-    metadata.oldest_uid = oldest
-        .map(|value| u32::try_from(value).context("indexed message UID is out of range"))
-        .transpose()?;
-    metadata.synced_at = format!("unix:{}", now_epoch_millis() / 1000);
-    let (metadata_payload, _) = encrypt_json(&metadata)?;
-    transaction.execute(
-        "UPDATE mailbox_meta SET payload = ?3, revision = revision + 1, updated_at = ?4
-         WHERE account_key = ?1 AND folder_key = ?2",
-        params![
-            account_key,
-            folder_key,
-            metadata_payload,
-            now_epoch_millis()
-        ],
-    )?;
-    transaction.commit()?;
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn remove_account(cache_root: &Path, account_id: &str) -> Result<()> {
-    let path = database_path(cache_root);
-    if !path.exists() {
-        return Ok(());
-    }
-    let connection = open(cache_root)?;
-    let account_key = identity_key(account_id);
-    connection.execute(
-        "DELETE FROM mailbox_meta WHERE account_key = ?1",
-        params![account_key],
-    )?;
-    Ok(())
+    with_recovery(cache_root, |connection| {
+        let account_key = identity_key(account_id);
+        connection.execute(
+            "DELETE FROM mailbox_meta WHERE account_key = ?1",
+            params![account_key],
+        )?;
+        // A successful account removal must not leave a recovery copy that can resurrect the
+        // removed account's protected mail rows after a later database failure.
+        refresh_backup_with_connection(connection, cache_root, true)
+            .map_err(backup_maintenance_error)
+            .context("refresh indexed cache recovery copy after account removal")?;
+        remove_file_if_exists(&cache_root.join(DATABASE_BACKUP_PREVIOUS_FILE))?;
+        remove_file_if_exists(&cache_root.join(DATABASE_BACKUP_PENDING_FILE))
+    })
 }
 
 #[cfg(test)]
@@ -551,20 +895,21 @@ pub fn encrypted_payload_for_test(
     folder: &str,
     uid: u32,
 ) -> Result<Option<Vec<u8>>> {
-    let connection = open(cache_root)?;
-    connection
-        .query_row(
-            "SELECT payload FROM messages
-             WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3",
-            params![
-                identity_key(account_id),
-                folder_identity_key(account_id, folder),
-                i64::from(uid)
-            ],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(Into::into)
+    with_recovery(cache_root, |connection| {
+        connection
+            .query_row(
+                "SELECT payload FROM messages
+                 WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3",
+                params![
+                    identity_key(account_id),
+                    folder_identity_key(account_id, folder),
+                    i64::from(uid)
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    })
 }
 
 #[cfg(test)]
@@ -727,6 +1072,150 @@ mod tests {
         assert_eq!(mailbox.messages.len(), 12);
         assert_eq!(mailbox.messages.first().unwrap().uid, 12);
         assert_eq!(mailbox.messages.last().unwrap().uid, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn busy_and_locked_errors_are_not_classified_as_corruption() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let error = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ));
+            assert!(!is_sqlite_corruption(&error));
+        }
+        let corrupt = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            None,
+        ));
+        assert!(is_sqlite_corruption(&corrupt));
+        assert!(!is_sqlite_corruption(&backup_maintenance_error(corrupt)));
+    }
+
+    #[test]
+    fn online_backup_keeps_protected_rows_and_recovers_a_corrupt_primary() {
+        let root = temporary_root("backup-recovery");
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = vec![fixture_message(9), fixture_message(8)];
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        refresh_backup(&root).unwrap();
+
+        let backup = fs::read(backup_path(&root)).unwrap();
+        assert!(!String::from_utf8_lossy(&backup).contains("subject 9"));
+        fs::write(database_path(&root), b"damaged indexed cache").unwrap();
+
+        let recovered = load_mailbox(&root, "fixture-account", "INBOX")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.messages.len(), 2);
+        assert_eq!(recovered.messages[0].uid, 9);
+        assert!(fs::read_dir(&root).unwrap().flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("mail-index-v1.sqlite3.corrupt-")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_backup_is_preserved_while_the_rebuild_stays_usable() {
+        let root = temporary_root("invalid-backup");
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = vec![fixture_message(3)];
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        refresh_backup(&root).unwrap();
+        let damage = b"damaged recovery copy";
+        fs::write(database_path(&root), b"damaged indexed cache").unwrap();
+        fs::write(backup_path(&root), damage).unwrap();
+
+        assert!(load_mailbox(&root, "fixture-account", "INBOX")
+            .unwrap()
+            .is_none());
+        assert_eq!(fs::read(backup_path(&root)).unwrap(), damage);
+        assert!(validate_database_file(&database_path(&root)).unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_primary_is_restored_from_the_valid_backup() {
+        let root = temporary_root("missing-primary");
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = vec![fixture_message(6)];
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        refresh_backup(&root).unwrap();
+        fs::remove_file(database_path(&root)).unwrap();
+
+        let recovered = load_message(&root, "fixture-account", "INBOX", 6)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.uid, 6);
+        assert!(validate_database_file(&database_path(&root)).unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn account_removal_cannot_be_reversed_by_an_older_backup_generation() {
+        let root = temporary_root("account-removal");
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = vec![fixture_message(5)];
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        refresh_backup(&root).unwrap();
+        remove_account(&root, "fixture-account").unwrap();
+
+        assert!(!root.join(DATABASE_BACKUP_PREVIOUS_FILE).exists());
+        let backup = Connection::open_with_flags(
+            backup_path(&root),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        let cached_accounts: i64 = backup
+            .query_row("SELECT COUNT(*) FROM mailbox_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cached_accounts, 0);
+        drop(backup);
+
+        fs::write(database_path(&root), b"damaged indexed cache").unwrap();
+        assert!(load_mailbox(&root, "fixture-account", "INBOX")
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_readers_share_one_serialized_recovery() {
+        let root = temporary_root("concurrent-recovery");
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = vec![fixture_message(12)];
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        refresh_backup(&root).unwrap();
+        fs::write(database_path(&root), b"damaged indexed cache").unwrap();
+
+        let readers = (0..8)
+            .map(|_| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    load_message(&root, "fixture-account", "INBOX", 12)
+                        .unwrap()
+                        .unwrap()
+                        .uid
+                })
+            })
+            .collect::<Vec<_>>();
+        for reader in readers {
+            assert_eq!(reader.join().unwrap(), 12);
+        }
+        let quarantine_count = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("mail-index-v1.sqlite3.corrupt-")
+            })
+            .count();
+        assert_eq!(quarantine_count, 1);
         let _ = fs::remove_dir_all(root);
     }
 }

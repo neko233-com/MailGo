@@ -1223,6 +1223,12 @@ fn sync_account_once(
     }
 
     let folder_labels = folder_display_labels(&synced_folders);
+    if let Err(error) = crate::cache_db::refresh_backup(cache_root) {
+        tracing::warn!(
+            error = %error,
+            "could not refresh the indexed mail cache recovery copy"
+        );
+    }
     session.logout().ok();
     Ok(SyncResult {
         account_id: account_id.to_string(),
