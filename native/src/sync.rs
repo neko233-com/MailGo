@@ -3473,7 +3473,11 @@ mod tests {
 
     fn fixture_message(uid: u32, folder: &str) -> CachedMessage {
         CachedMessage {
-            id: format!("fixture-{uid}"),
+            id: format!("fixture-{uid}@example.invalid"),
+            message_id: Some(format!("fixture-{uid}@example.invalid")),
+            in_reply_to: None,
+            references: Vec::new(),
+            thread_id: format!("fixture-{uid}@example.invalid"),
             account_id: "fixture-account".into(),
             folder: folder.into(),
             uid,
@@ -3773,7 +3777,7 @@ mod tests {
     #[test]
     fn stale_mailbox_cache_is_reparsed_from_remote_on_next_successful_sync() {
         let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
-        mailbox.schema_version = 1;
+        mailbox.schema_version = 2;
         mailbox.highest_mod_seq = Some(42);
         mailbox.oldest_uid = Some(7);
         mailbox.has_more = true;

@@ -16,6 +16,10 @@ export interface MailAttachment {
 
 export interface MailMessage {
   id: string
+  messageId?: string
+  inReplyTo?: string
+  references?: string[]
+  threadId?: string
   accountId: string
   folder: FolderId
   category?: SmartCategory
@@ -26,6 +30,7 @@ export interface MailMessage {
   cc?: string[]
   preview: string
   timestamp: string
+  receivedAt?: string
   dateGroup: string
   unread: boolean
   starred: boolean
@@ -222,6 +227,10 @@ export interface NativeAuthStartResponse {
 
 export interface NativeCachedMessage {
   id: string
+  messageId?: string
+  inReplyTo?: string
+  references?: string[]
+  threadId: string
   accountId: string
   folder: string
   uid: number

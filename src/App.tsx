@@ -6,6 +6,7 @@ import { Icon, type IconName } from './components/Icon'
 import { sanitizeCustomCss } from './customCss'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
 import { invoke, readNativeState } from './lib/ipc'
+import { buildMailThreads, type MailThread } from './threading'
 import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeDraft, NativeMailboxResponse, NativeMessageResponse, NativeOutboxStatus, NativeQueueStatus, NativeSearchResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 type ToastTone = 'info' | 'success' | 'error'
@@ -17,7 +18,7 @@ type MobilePane = 'list' | 'reading'
 type MailMoveTarget = { folder: string; label: string; icon: IconName }
 type VirtualMailItem =
   | { type: 'group'; key: string; label: string }
-  | { type: 'mail'; key: string; mail: MailMessage }
+  | { type: 'thread'; key: string; thread: MailThread }
 const MAX_CUSTOM_CSS_LENGTH = 64 * 1024
 
 const smartCategories: { id: SmartCategory; label: string; icon: IconName; color: string }[] = [
@@ -201,6 +202,10 @@ function nativeMessageToUi(message: NativeCachedMessage, account: MailAccount): 
   const senderName = message.senderName || message.senderEmail || '未知发件人'
   return {
     id: `${message.accountId}:${message.folder}:${message.uid}`,
+    messageId: message.messageId,
+    inReplyTo: message.inReplyTo,
+    references: message.references,
+    threadId: message.threadId,
     accountId: message.accountId,
     folder: uiFolderForNative(message.folder),
     category: nativeCategory(message.category),
@@ -211,6 +216,7 @@ function nativeMessageToUi(message: NativeCachedMessage, account: MailAccount): 
     cc: message.cc,
     preview: message.preview || message.textBody.slice(0, 240),
     timestamp,
+    receivedAt: message.receivedAt,
     dateGroup,
     unread: message.unread,
     starred: message.starred,
@@ -404,6 +410,21 @@ function OfflineModeQuickSetting({ enabled, onToggle }: { enabled: boolean; onTo
 
 function Avatar({ message, size = 'md' }: { message: MailMessage; size?: 'sm' | 'md' | 'lg' }) {
   return <span className={`avatar avatar-${size}`} style={{ '--avatar-accent': message.accent } as React.CSSProperties}>{message.avatar}</span>
+}
+
+function ConversationStack({ thread, selectedId, loadingId, onSelect }: { thread?: MailThread; selectedId: string; loadingId: string | null; onSelect: (mail: MailMessage) => void }) {
+  if (!thread || thread.messages.length <= 1) return null
+  return (
+    <section className="conversation-stack" aria-label={`会话中的 ${thread.messages.length} 封邮件`}>
+      <div className="conversation-stack-heading"><span><Icon name="message" size={15} />会话</span><strong>{thread.messages.length} 封</strong></div>
+      <div className="conversation-stack-items">
+        {thread.messages.map((mail, index) => {
+          const selected = mail.id === selectedId
+          return <button type="button" key={mail.id} className={`conversation-message ${selected ? 'is-current' : ''} ${mail.unread ? 'is-unread' : ''}`} aria-current={selected ? 'true' : undefined} onClick={() => onSelect(mail)}><Avatar message={mail} size="sm" /><span className="conversation-message-copy"><span><strong>{mail.senderName}</strong><em>{index + 1} / {thread.messages.length}</em><time>{mail.timestamp}</time></span><small>{loadingId === mail.id ? '正在补全正文…' : mail.preview || mail.subject}</small></span><Icon name={selected ? 'checkCircle' : 'forward'} size={16} /></button>
+        })}
+      </div>
+    </section>
+  )
 }
 
 function App() {
@@ -1021,6 +1042,8 @@ function App() {
     })
   }, [accounts, allMails, filterUnread, hideAds, query, selectedAccountId, selectedCategory, selectedFolder, selectedNativeFolder])
 
+  const visibleThreads = useMemo(() => buildMailThreads(visibleMails), [visibleMails])
+
   const selectedMail = visibleMails.find((mail) => mail.id === selectedMailId) ?? visibleMails[0] ?? {
     id: 'empty-mail',
     accountId: '',
@@ -1038,6 +1061,7 @@ function App() {
     body: ['当前文件夹没有可显示的邮件。'],
   } satisfies MailMessage
   selectedMailRef.current = selectedMail
+  const selectedThread = visibleThreads.find((thread) => thread.messages.some((mail) => mail.id === selectedMail.id)) ?? visibleThreads[0]
   const selectedMailAccount = accounts.find((account) => account.id === selectedMail.accountId)
   const selectedMailMoveTargets = useMemo(() => {
     if (!isNativeRuntime || !selectedMailAccount || selectedMail.nativeUid == null) return []
@@ -1045,18 +1069,18 @@ function App() {
       .filter((target) => !selectedMail.nativeFolder || !isSameNativeFolder(target.folder, selectedMail.nativeFolder))
   }, [isNativeRuntime, nativeFolderLabels, nativeFolders, selectedMail.nativeFolder, selectedMail.nativeUid, selectedMailAccount])
 
-  const groupedMails = useMemo(() => {
-    return visibleMails.reduce<Record<string, MailMessage[]>>((groups, mail) => {
-      groups[mail.dateGroup] ??= []
-      groups[mail.dateGroup].push(mail)
+  const groupedThreads = useMemo(() => {
+    return visibleThreads.reduce<Record<string, MailThread[]>>((groups, thread) => {
+      groups[thread.latest.dateGroup] ??= []
+      groups[thread.latest.dateGroup].push(thread)
       return groups
     }, {})
-  }, [visibleMails])
+  }, [visibleThreads])
 
-  const virtualMailItems = useMemo<VirtualMailItem[]>(() => Object.entries(groupedMails).flatMap(([group, groupMails]) => [
+  const virtualMailItems = useMemo<VirtualMailItem[]>(() => Object.entries(groupedThreads).flatMap(([group, groupThreads]) => [
     { type: 'group' as const, key: `group:${group}`, label: group },
-    ...groupMails.map((mail) => ({ type: 'mail' as const, key: `mail:${mail.id}`, mail })),
-  ]), [groupedMails])
+    ...groupThreads.map((thread) => ({ type: 'thread' as const, key: `thread:${thread.key}`, thread })),
+  ]), [groupedThreads])
   const getVirtualMailKey = useCallback(
     (index: number) => virtualMailItems[index]?.key ?? `mail-index:${index}`,
     [virtualMailItems],
@@ -1135,10 +1159,12 @@ function App() {
     pushToast(nextStarred ? '已添加到星标' : '已移出星标', 'success')
   }
 
-  const toggleMailSelection = (mailId: string) => {
-    setSelectedMailIds((current) => current.includes(mailId)
-      ? current.filter((id) => id !== mailId)
-      : [...current, mailId])
+  const toggleThreadSelection = (thread: MailThread) => {
+    const threadIds = thread.messages.map((mail) => mail.id)
+    const threadIdSet = new Set(threadIds)
+    setSelectedMailIds((current) => threadIds.every((id) => current.includes(id))
+      ? current.filter((id) => !threadIdSet.has(id))
+      : Array.from(new Set([...current, ...threadIds])))
   }
 
   const toggleAllVisible = () => {
@@ -2306,10 +2332,10 @@ function App() {
                 return <div key={item.key} className={`virtual-mail-item virtual-mail-${item.type}`} style={{ height: virtualItem.size, transform: `translateY(${virtualItem.start}px)` }}>
                   {item.type === 'group'
                     ? <div className="mail-group-label">{item.label}</div>
-                    : <div className={`mail-row ${selectedMailId === item.mail.id ? 'is-selected' : ''} ${item.mail.unread ? 'is-unread' : ''}`} onClick={() => { void selectMail(item.mail) }}>
-                        <label className="checkbox-wrap row-checkbox" onClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`选择 ${item.mail.subject}`} checked={selectedMailIds.includes(item.mail.id)} onChange={() => toggleMailSelection(item.mail.id)} /><span /></label>
-                        <button type="button" className={`star-button ${item.mail.starred ? 'is-starred' : ''}`} aria-label={item.mail.starred ? '取消星标' : '添加星标'} onClick={(event) => { event.stopPropagation(); toggleStar(item.mail) }}><Icon name="star" size={18} weight={item.mail.starred ? 'Filled' : 'Outline'} /></button>
-                        <div className="mail-row-copy"><div className="mail-row-top"><strong>{item.mail.senderName}</strong><time>{item.mail.timestamp}</time></div><div className="mail-row-subject">{item.mail.subject}</div><p>{item.mail.preview}</p></div>
+                    : <div className={`mail-row ${item.thread.messages.some((mail) => mail.id === selectedMailId) ? 'is-selected' : ''} ${item.thread.unreadCount > 0 ? 'is-unread' : ''}`} onClick={() => { void selectMail(item.thread.latest) }}>
+                        <label className="checkbox-wrap row-checkbox" onClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`选择会话 ${item.thread.latest.subject}`} checked={item.thread.messages.every((mail) => selectedMailIds.includes(mail.id))} onChange={() => toggleThreadSelection(item.thread)} /><span /></label>
+                        <button type="button" className={`star-button ${item.thread.latest.starred ? 'is-starred' : ''}`} aria-label={item.thread.latest.starred ? '取消最新邮件星标' : '为最新邮件添加星标'} onClick={(event) => { event.stopPropagation(); toggleStar(item.thread.latest) }}><Icon name="star" size={18} weight={item.thread.latest.starred ? 'Filled' : 'Outline'} /></button>
+                        <div className="mail-row-copy"><div className="mail-row-top"><strong>{item.thread.participants.join('、') || item.thread.latest.senderName}{item.thread.messages.length > 1 && <span className="thread-count">{item.thread.messages.length}</span>}</strong><time>{item.thread.latest.timestamp}</time></div><div className="mail-row-subject">{item.thread.latest.subject}</div><p>{item.thread.latest.preview}</p></div>
                       </div>}
                 </div>
               })}
@@ -2317,7 +2343,7 @@ function App() {
             {visibleMails.length === 0 && <div className="empty-list"><span className="empty-icon"><Icon name={isNativeRuntime && !nativeStateReady ? 'rotate' : accounts.length === 0 ? 'user' : 'search'} size={24} /></span><strong>{isNativeRuntime && !nativeStateReady ? '正在读取本地邮箱' : accounts.length === 0 ? '还没有添加邮箱账户' : '没有找到邮件'}</strong><p>{isNativeRuntime && !nativeStateReady ? '正在加载本机账户与加密缓存，请稍候。' : accounts.length === 0 ? '添加 Google、QQ、Outlook 或自定义 IMAP/SMTP 账户后开始使用。' : '试试清除筛选或搜索其他关键词。'}</p>{isNativeRuntime && nativeStateReady && accounts.length === 0 && <button type="button" className="empty-list-action" onClick={openNewAccount}><Icon name="add" size={16} />添加第一个账户</button>}</div>}
             {isLoadingEarlier && <div className="mail-page-loading" role="status"><span className="loading-spinner" aria-hidden="true" />正在增量加载更早邮件…</div>}
           </div>
-          <div className="list-footer"><span>{visibleMails.length ? `1–${visibleMails.length} / ${visibleMails.length}` : '0 封邮件'}</span><div className="list-footer-actions">{canLoadEarlier && <button type="button" className="load-earlier-button" onClick={() => { void loadEarlier() }} disabled={isLoadingEarlier}>{isLoadingEarlier ? '加载中…' : '加载更早邮件'}</button>}<TooltipButton label="刷新邮件" onClick={handleSync}><Icon name="rotate" size={17} /></TooltipButton></div></div>
+          <div className="list-footer"><span>{visibleThreads.length ? `${visibleThreads.length} 个会话 · ${visibleMails.length} 封邮件` : '0 封邮件'}</span><div className="list-footer-actions">{canLoadEarlier && <button type="button" className="load-earlier-button" onClick={() => { void loadEarlier() }} disabled={isLoadingEarlier}>{isLoadingEarlier ? '加载中…' : '加载更早邮件'}</button>}<TooltipButton label="刷新邮件" onClick={handleSync}><Icon name="rotate" size={17} /></TooltipButton></div></div>
         </main>
 
         <section className="reading-panel" aria-label="邮件阅读区">
@@ -2335,7 +2361,8 @@ function App() {
             </div>
           </div>
           <div className="reading-scroll">
-            <div className="reading-heading"><div><h1>{selectedMail.subject}</h1><div className="message-tags"><span className="tag tag-account"><ProviderMark provider={accounts.find((account) => account.id === selectedMail.accountId)?.provider ?? 'google'} size="sm" /> {accounts.find((account) => account.id === selectedMail.accountId)?.label ?? 'Google'}</span>{selectedMail.hasHtml && <span className="tag">HTML 邮件</span>}</div></div><TooltipButton label={selectedMail.starred ? '取消星标' : '添加星标'} className={`reading-star ${selectedMail.starred ? 'is-starred' : ''}`} onClick={() => toggleStar(selectedMail)}><Icon name="star" size={24} weight={selectedMail.starred ? 'Filled' : 'Outline'} /></TooltipButton></div>
+            <div className="reading-heading"><div><h1>{selectedMail.subject}</h1><div className="message-tags"><span className="tag tag-account"><ProviderMark provider={accounts.find((account) => account.id === selectedMail.accountId)?.provider ?? 'google'} size="sm" /> {accounts.find((account) => account.id === selectedMail.accountId)?.label ?? 'Google'}</span>{selectedThread && selectedThread.messages.length > 1 && <span className="tag"><Icon name="message" size={13} />{selectedThread.messages.length} 封会话</span>}{selectedMail.hasHtml && <span className="tag">HTML 邮件</span>}</div></div><TooltipButton label={selectedMail.starred ? '取消星标' : '添加星标'} className={`reading-star ${selectedMail.starred ? 'is-starred' : ''}`} onClick={() => toggleStar(selectedMail)}><Icon name="star" size={24} weight={selectedMail.starred ? 'Filled' : 'Outline'} /></TooltipButton></div>
+            <ConversationStack thread={selectedThread} selectedId={selectedMail.id} loadingId={loadingMessageId} onSelect={(mail) => { void selectMail(mail) }} />
             <div className="sender-row"><Avatar message={selectedMail} size="lg" /><div className="sender-copy"><div><strong>{selectedMail.senderName}</strong> <span>&lt;{selectedMail.from}&gt;</span></div><div className="recipient">收件人： {selectedMailAccount?.label ?? '当前账户'} &lt;{selectedMailAccount?.email ?? '—'}&gt;</div></div><time>{selectedMail.timestamp}<br /><span>今天</span></time><TooltipButton label="发件人更多信息"><Icon name="more" size={19} /></TooltipButton></div>
             {loadingMessageId === selectedMail.id && <div className="reading-loading-strip" role="status"><span className="loading-spinner" aria-hidden="true" /><span><strong>正在补全邮件正文</strong>列表和已缓存摘要仍可继续浏览</span></div>}
             <div className="message-content">

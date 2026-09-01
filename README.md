@@ -13,6 +13,7 @@ The current foundation includes:
 - Local-first UI state with offline cache indicators and a Rust IPC boundary for durable state.
 - Native startup enters the mailbox as soon as local state is available; cache hydration, per-account synchronization, and queue telemetry continue independently in the background with local loading/error states instead of a full-window blocking spinner.
 - The message list is virtualized and renders only its visible window, while older cached or remote messages load in bounded pages from the list edge without rebuilding the whole mailbox view.
+- RFC `Message-ID`, `In-Reply-To`, and `References` metadata is parsed through bounded native fields and grouped with a folder/account-scoped reply graph. The virtual list renders one row per conversation with participant, unread, and message counts; selecting a conversation maps back to its individual messages, and the reading view navigates the oldest-to-newest chain while lazily fetching only the opened body.
 - The native shell starts from the real local account/cache state; demo messages are browser-preview-only, and first launch provides a direct add-account path.
 - Optional offline-only mode is enforced by the native boundary: cached mail remains readable, network sync/search are paused, outgoing mail is queued encrypted, and local flag/move mutations replay when online mode is restored.
 - Provider quick links and guided authorization-code onboarding.
@@ -41,7 +42,7 @@ The current foundation includes:
 - The desktop keyboard flow includes `C` for compose, `R` for replying to the selected message, `Ctrl/Cmd+K` for search, and `Esc` for closing transient UI.
 - Native mode automatically saves and restores the latest text draft per account in a DPAPI-protected local store; sending removes the draft, while attachments remain intentionally session-scoped.
 - Mailbox caches and MIME payloads have explicit byte/count limits; cached mutations are bound to UIDVALIDITY, and cache/outbox writes are serialized to avoid scheduler/IPC races.
-- MIME parsing enables the parser's complete legacy-charset support, including common GB2312/GBK/GB18030, Big5, and Japanese encodings. Cache schema v2 reparses derived header caches only after a successful remote sync, so failed migrations leave the prior offline snapshot intact.
+- MIME parsing enables the parser's complete legacy-charset support, including common GB2312/GBK/GB18030, Big5, and Japanese encodings. Cache schema v3 reparses derived header and conversation metadata only after a successful remote sync, so failed migrations leave the prior offline snapshot intact.
 - Native mode also surfaces those encrypted local drafts in the 草稿箱 list, with per-account counts, draft-specific continue-editing actions, and an explicit discard action.
 - Draft persistence is serialized across concurrent compose autosaves, preventing two windows from corrupting or losing each other's encrypted draft store.
 - Encrypted account imports validate the combined account count before touching Credential Manager, so replacing existing accounts cannot silently exceed the 64-account ceiling.

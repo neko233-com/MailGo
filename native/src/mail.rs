@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use ammonia::Builder;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use mail_parser::{Address, Message, MessageParser, MimeHeaders, PartType};
+use mail_parser::{Address, HeaderValue, Message, MessageParser, MimeHeaders, PartType};
 use serde::{Deserialize, Serialize};
 
 use crate::classifier::{classify, SmartCategory};
@@ -19,7 +19,9 @@ const MAX_ATTACHMENT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ATTACHMENT_NAME_CHARS: usize = 255;
 const MAX_RECIPIENTS_PER_MESSAGE: usize = 128;
 const MAX_RECIPIENT_CHARS: usize = 320;
-pub const CACHE_SCHEMA_VERSION: u32 = 2;
+const MAX_MESSAGE_ID_BYTES: usize = 512;
+const MAX_THREAD_REFERENCES: usize = 32;
+pub const CACHE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +46,14 @@ pub struct AttachmentPayload {
 #[serde(rename_all = "camelCase")]
 pub struct CachedMessage {
     pub id: String,
+    #[serde(default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    #[serde(default)]
+    pub references: Vec<String>,
+    #[serde(default)]
+    pub thread_id: String,
     pub account_id: String,
     pub folder: String,
     pub uid: u32,
@@ -191,13 +201,25 @@ fn build_message(
         })
         .collect();
 
-    let message_id = parsed
-        .message_id()
-        .map(str::to_string)
+    let message_id = parsed.message_id().and_then(safe_message_id);
+    let in_reply_to = message_ids(parsed.in_reply_to()).pop();
+    let references = message_ids(parsed.references());
+    let thread_id = references
+        .first()
+        .or(in_reply_to.as_ref())
+        .or(message_id.as_ref())
+        .cloned()
+        .unwrap_or_else(|| format!("local:{uid}"));
+    let id = message_id
+        .clone()
         .unwrap_or_else(|| format!("{account_id}-{folder}-{uid}"));
 
     let mut message = CachedMessage {
-        id: message_id,
+        id,
+        message_id,
+        in_reply_to,
+        references,
+        thread_id,
         account_id: account_id.to_string(),
         folder: folder.to_string(),
         uid,
@@ -224,6 +246,22 @@ fn build_message(
 }
 
 pub(crate) fn bound_cached_message(message: &mut CachedMessage) {
+    message.id = truncate_utf8(&message.id, MAX_MESSAGE_ID_BYTES);
+    message.message_id = message.message_id.as_deref().and_then(safe_message_id);
+    message.in_reply_to = message.in_reply_to.as_deref().and_then(safe_message_id);
+    message.references = message
+        .references
+        .iter()
+        .filter_map(|reference| safe_message_id(reference))
+        .take(MAX_THREAD_REFERENCES)
+        .collect();
+    message.thread_id = message
+        .references
+        .first()
+        .or(message.in_reply_to.as_ref())
+        .or(message.message_id.as_ref())
+        .cloned()
+        .unwrap_or_else(|| format!("local:{}", message.uid));
     message.subject = truncate_utf8(&message.subject, 998);
     message.sender_name = truncate_utf8(&message.sender_name, MAX_RECIPIENT_CHARS);
     message.sender_email = truncate_utf8(&message.sender_email, MAX_RECIPIENT_CHARS);
@@ -236,6 +274,71 @@ pub(crate) fn bound_cached_message(message: &mut CachedMessage) {
         .map(|html| truncate_utf8(html, MAX_CACHED_HTML_BYTES));
     message.preview = truncate_utf8(&message.preview, MAX_PREVIEW_CHARS);
     message.attachments.truncate(MAX_ATTACHMENTS_PER_MESSAGE);
+}
+
+fn message_ids(header: &HeaderValue<'_>) -> Vec<String> {
+    let mut ids = Vec::new();
+    for value in header.as_text_list().unwrap_or_default() {
+        collect_message_ids(value.as_ref(), &mut ids);
+        if ids.len() == MAX_THREAD_REFERENCES {
+            break;
+        }
+    }
+    ids
+}
+
+fn collect_message_ids(value: &str, ids: &mut Vec<String>) {
+    let mut remainder = value;
+    let mut found_bracketed = false;
+    while let Some(start) = remainder.find('<') {
+        let after_start = &remainder[start + 1..];
+        let Some(end) = after_start.find('>') else {
+            break;
+        };
+        found_bracketed = true;
+        if let Some(id) = safe_message_id(&after_start[..end]) {
+            if !ids.iter().any(|known| known == &id) {
+                ids.push(id);
+            }
+        }
+        if ids.len() == MAX_THREAD_REFERENCES {
+            return;
+        }
+        remainder = &after_start[end + 1..];
+    }
+    if found_bracketed {
+        return;
+    }
+    for candidate in value.split_ascii_whitespace() {
+        if let Some(id) = safe_message_id(candidate) {
+            if !ids.iter().any(|known| known == &id) {
+                ids.push(id);
+            }
+        }
+        if ids.len() == MAX_THREAD_REFERENCES {
+            return;
+        }
+    }
+}
+
+fn safe_message_id(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .trim_matches(|character| character == '<' || character == '>');
+    let has_valid_separator = value
+        .rsplit_once('@')
+        .is_some_and(|(left, right)| !left.is_empty() && !right.is_empty());
+    if value.is_empty()
+        || value.len() > MAX_MESSAGE_ID_BYTES
+        || !value.is_ascii()
+        || !has_valid_separator
+        || value
+            .bytes()
+            .any(|byte| byte <= b' ' || byte == 0x7f || matches!(byte, b'<' | b'>'))
+    {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 pub fn extract_attachment_payloads(raw: &[u8]) -> Result<Vec<AttachmentPayload>> {
@@ -505,6 +608,11 @@ mod tests {
     fn parses_and_sanitizes_full_message() {
         let message = parse_full("account", "INBOX", 7, true, false, RAW.as_bytes()).unwrap();
         assert_eq!(message.id, "mailgo-test@example.com");
+        assert_eq!(
+            message.message_id.as_deref(),
+            Some("mailgo-test@example.com")
+        );
+        assert_eq!(message.thread_id, "mailgo-test@example.com");
         assert_eq!(message.category, SmartCategory::AppleConnect);
         assert_eq!(message.sender_email, "no-reply@apple.com");
         assert_eq!(message.to, ["teammate@example.com", "owner@example.com"]);
@@ -512,6 +620,31 @@ mod tests {
         let html = message.html_body.unwrap();
         assert!(html.contains("<strong>notice</strong>"));
         assert!(!html.contains("script"));
+    }
+
+    #[test]
+    fn parses_bounded_reply_thread_metadata() {
+        let raw = "From: sender@example.com\r\nSubject: Re: Project\r\nMessage-ID: <reply@example.com>\r\nIn-Reply-To: <parent@example.com>\r\nReferences: <root@example.com> <parent@example.com>\r\n\r\n";
+        let message = parse_header("account", "INBOX", 14, true, false, raw.as_bytes()).unwrap();
+        assert_eq!(message.message_id.as_deref(), Some("reply@example.com"));
+        assert_eq!(message.in_reply_to.as_deref(), Some("parent@example.com"));
+        assert_eq!(
+            message.references,
+            ["root@example.com", "parent@example.com"]
+        );
+        assert_eq!(message.thread_id, "root@example.com");
+    }
+
+    #[test]
+    fn malformed_or_oversized_thread_headers_fail_closed() {
+        let oversized = "x".repeat(MAX_MESSAGE_ID_BYTES + 1);
+        let raw = format!(
+            "From: sender@example.com\r\nSubject: Re: Project\r\nMessage-ID: <reply@example.com>\r\nIn-Reply-To: <bad id>\r\nReferences: <root@example.com> <{oversized}>\r\n\r\n"
+        );
+        let message = parse_header("account", "INBOX", 15, true, false, raw.as_bytes()).unwrap();
+        assert_eq!(message.in_reply_to, None);
+        assert_eq!(message.references, ["root@example.com"]);
+        assert_eq!(message.thread_id, "root@example.com");
     }
 
     #[test]
