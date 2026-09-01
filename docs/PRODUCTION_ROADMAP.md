@@ -114,6 +114,11 @@ The repository is deliberately split into a real desktop UI foundation and provi
 105. Read-only IMAP retries now recognize bounded Gmail and Outlook throttling responses while preserving generic QQ/custom transport handling and explicit retry hints; SMTP outbox classification uses lettre's typed status plus RFC 5321 reply severity, retrying 4xx failures and pausing 5xx/authentication failures instead of replaying permanent 503/554 responses.
 106. Header, flag, size-probe, and full-message IMAP `FETCH` data-item lists now use the RFC-required parenthesized form, with executable regression coverage and a successful live QQ cold-cache synchronization on the packaged Windows Release build.
 107. Background and manual IMAP synchronization logs now emit stable privacy-safe error categories and transport fingerprints without persisting provider response text; rolling logs remain useful for distinguishing protocol, TLS, network, authentication, and provider failures.
+108. Native startup is local-first and non-blocking: the real account shell becomes interactive after local state hydration, while mailbox reads, queue telemetry, and account synchronization run independently with localized loading and failure states.
+109. The production message list uses a fixed-row virtualizer and bounded older-message pagination, so mailbox growth does not translate into an equivalent number of mounted React rows or an all-at-once remote fetch.
+110. MIME parsing now enables `mail-parser`'s complete legacy-charset feature set, with executable GB2312 sender/subject coverage and a cache-schema migration that reparses stale derived headers only on a successful remote sync.
+111. Native IMAP Modified UTF-7 decoding now supplies per-account Unicode display labels while preserving every original wire mailbox name for protocol commands; malformed or control-bearing segments fail closed to their original bounded representation.
+112. The packaged Windows Release has passed local tray acceptance for hide-without-exit, same-process single-instance restore, and completion of an in-flight synchronization while no MailGo window is visible; its release subsystem remains GUI-only with no companion console window.
 
 ## Remaining production acceptance work
 

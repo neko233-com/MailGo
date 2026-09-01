@@ -15,7 +15,7 @@ imap = { version = "3.0.0-alpha.15", default-features = true }
 image = { version = "0.25.0", default-features = false, features = ["png"] }
 keyring = "4.2"
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "native-tls"] }
-mail-parser = "0.11.8"
+mail-parser = { version = "0.11.8", features = ["full_encoding"] }
 native-tls = "0.2.18"
 rand = "0.8"
 rdesktop-core = { git = "https://github.com/neko233-com/rdesktop", version = "0.1.8" }

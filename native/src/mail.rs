@@ -19,6 +19,7 @@ const MAX_ATTACHMENT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ATTACHMENT_NAME_CHARS: usize = 255;
 const MAX_RECIPIENTS_PER_MESSAGE: usize = 128;
 const MAX_RECIPIENT_CHARS: usize = 320;
+pub const CACHE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -87,7 +88,7 @@ pub struct CachedMailbox {
 impl CachedMailbox {
     pub fn empty(account_id: impl Into<String>, folder: impl Into<String>) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: CACHE_SCHEMA_VERSION,
             account_id: account_id.into(),
             folder: folder.into(),
             uid_validity: None,
@@ -624,6 +625,14 @@ mod tests {
             payloads[0].bytes,
             b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n"
         );
+    }
+
+    #[test]
+    fn decodes_gb2312_encoded_sender_and_subject() {
+        let raw = "From: =?GB2312?B?t6K8/sjL?= <sender@example.invalid>\r\nSubject: =?GB2312?B?1tDOxNPKvP4=?=\r\n\r\n";
+        let message = parse_header("account", "INBOX", 13, true, false, raw.as_bytes()).unwrap();
+        assert_eq!(message.sender_name, "发件人");
+        assert_eq!(message.subject, "中文邮件");
     }
 
     #[test]

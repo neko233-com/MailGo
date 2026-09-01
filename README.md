@@ -11,6 +11,8 @@ The current foundation includes:
 - Multiple accounts, including multiple QQ accounts, account switching, and import/export with redacted credentials.
 - Windows desktop also supports password-protected account migration: encrypted export/import keeps provider credentials inside an Argon2id + ChaCha20-Poly1305 bundle and writes them back only to Windows Credential Manager.
 - Local-first UI state with offline cache indicators and a Rust IPC boundary for durable state.
+- Native startup enters the mailbox as soon as local state is available; cache hydration, per-account synchronization, and queue telemetry continue independently in the background with local loading/error states instead of a full-window blocking spinner.
+- The message list is virtualized and renders only its visible window, while older cached or remote messages load in bounded pages from the list edge without rebuilding the whole mailbox view.
 - The native shell starts from the real local account/cache state; demo messages are browser-preview-only, and first launch provides a direct add-account path.
 - Optional offline-only mode is enforced by the native boundary: cached mail remains readable, network sync/search are paused, outgoing mail is queued encrypted, and local flag/move mutations replay when online mode is restored.
 - Provider quick links and guided authorization-code onboarding.
@@ -24,6 +26,7 @@ The current foundation includes:
 - Native IMAP sync uses capability-driven `QRESYNC`/`CONDSTORE` deltas when a server exposes them (including `HIGHESTMODSEQ` cursors, `VANISHED` deletions, and UID-only new-mail discovery), with a UID-based incremental header fallback across provider folder mappings. Bounded `UID FLAGS` refreshes, lazy full-message retrieval, replayable offline flag mutations, local flag updates, and protected mailbox/attachment caches keep the offline view safe: Windows uses DPAPI, while non-Windows builds use an OS keyring-held XChaCha20-Poly1305 key. Attachment downloads use bounded start/chunk/cancel IPC with progress and cancellation support.
 - Every multi-item IMAP `FETCH` uses the RFC-required parenthesized data-item list. This is regression-tested and was verified with a live QQ mailbox on Windows, where the previously permissive-only query form was rejected with `BAD` before any headers could be cached.
 - Native sync discovers selectable IMAP mailboxes (including custom folders), persists a bounded per-account folder index, and exposes those folders in the desktop sidebar for offline browsing and UID pagination.
+- IMAP Modified UTF-7 mailbox names are decoded into Unicode display labels at the native boundary while their original wire names remain untouched for select, search, pagination, and move commands.
 - Search combines the local cache's immediate results with a debounced, bounded native IMAP search across all discovered folders and accounts; server hits are merged into the encrypted cache with their UIDVALIDITY context before they reach the renderer.
 - Network operations fail predictably: IMAP resolves/connects through bounded socket attempts with TLS/STARTTLS and read/write deadlines, OAuth HTTP calls use bounded connect/read/write timeouts and preserve bounded numeric `Retry-After` guidance for HTTP 429 responses, and SMTP sends have a bounded transport timeout so background sync and the offline outbox cannot hang indefinitely.
 - Rolling local logs retain 14 days of startup and synchronization lifecycle events. IMAP failures are persisted as privacy-safe categories and protocol variants such as `network`/`imap-bad`, never as provider response text, addresses, or credentials.
@@ -37,6 +40,7 @@ The current foundation includes:
 - The desktop keyboard flow includes `C` for compose, `R` for replying to the selected message, `Ctrl/Cmd+K` for search, and `Esc` for closing transient UI.
 - Native mode automatically saves and restores the latest text draft per account in a DPAPI-protected local store; sending removes the draft, while attachments remain intentionally session-scoped.
 - Mailbox caches and MIME payloads have explicit byte/count limits; cached mutations are bound to UIDVALIDITY, and cache/outbox writes are serialized to avoid scheduler/IPC races.
+- MIME parsing enables the parser's complete legacy-charset support, including common GB2312/GBK/GB18030, Big5, and Japanese encodings. Cache schema v2 reparses derived header caches only after a successful remote sync, so failed migrations leave the prior offline snapshot intact.
 - Native mode also surfaces those encrypted local drafts in the 草稿箱 list, with per-account counts, draft-specific continue-editing actions, and an explicit discard action.
 - Draft persistence is serialized across concurrent compose autosaves, preventing two windows from corrupting or losing each other's encrypted draft store.
 - Encrypted account imports validate the combined account count before touching Credential Manager, so replacing existing accounts cannot silently exceed the 64-account ceiling.
@@ -45,6 +49,7 @@ The current foundation includes:
 - Account reauthorization now commits the new credential and metadata as one recoverable operation; a persistence failure restores the previous account state and credential, and outbox-resume errors cannot falsely report the account as unsaved.
 - Account removal uses the same recovery boundary: cache, draft, outbox, and Credential Manager cleanup must finish before the account list is committed, and failures restore the prior credential/state snapshot.
 - Windows tray lifecycle is implemented with the generated `resources/icons/mailgo.ico`: close-to-tray, restore on click, deliberate quit, and a five-minute background sync scheduler.
+- The packaged Windows Release uses the GUI subsystem and does not open a companion console window. Close-to-tray, same-process single-instance restore, and completion of an in-flight sync while hidden have been accepted on the local Windows build.
 - The background scheduler performs a short delayed first sync after launch, then continues on its five-minute cadence; offline-only mode skips both paths.
 - The tray icon re-registers itself after Windows Explorer/taskbar restarts, so a hidden MailGo window remains recoverable without restarting the app.
 - Custom IMAP/SMTP onboarding accepts host, port, TLS mode, and password/app-password/OAuth2 settings without putting credentials in metadata.

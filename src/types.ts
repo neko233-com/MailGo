@@ -81,6 +81,7 @@ export interface ExportedAccount {
 export interface NativeState {
   accounts: MailAccount[]
   folders?: Record<string, string[]>
+  folderLabels?: Record<string, Record<string, string>>
   theme: ThemeMode
   minimizeToTray: boolean
   offlineMode: boolean
@@ -97,6 +98,7 @@ export interface NativeSyncItem {
   cachePath: string
   syncedAt: string
   folders?: string[]
+  folderLabels?: Record<string, string>
 }
 
 export interface NativeSyncResponse {

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -8,12 +8,17 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use base64::{
+    alphabet::IMAP_MUTF7,
+    engine::general_purpose::{GeneralPurpose, NO_PAD},
+    Engine as _,
+};
 use imap::types::{Flag, UnsolicitedResponse};
 use native_tls::{TlsConnector, TlsStream};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::mail::{parse_full, parse_header, CachedMailbox, CachedMessage};
+use crate::mail::{parse_full, parse_header, CachedMailbox, CachedMessage, CACHE_SCHEMA_VERSION};
 use crate::providers::{Authentication, ProviderKind, ProviderProfile, TransportSecurity};
 
 // RFC 3501 requires a parenthesized data-item list when FETCH requests more than one item.
@@ -92,6 +97,7 @@ pub struct SyncResult {
     pub cache_path: String,
     pub synced_at: String,
     pub folders: Vec<String>,
+    pub folder_labels: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -739,6 +745,7 @@ fn sync_account_once(
         return Err(anyhow!("INBOX is unavailable on the mail server"));
     }
 
+    let folder_labels = folder_display_labels(&synced_folders);
     session.logout().ok();
     Ok(SyncResult {
         account_id: account_id.to_string(),
@@ -748,6 +755,7 @@ fn sync_account_once(
         cache_path: cache_path.display().to_string(),
         synced_at,
         folders: synced_folders,
+        folder_labels,
     })
 }
 
@@ -765,12 +773,10 @@ fn sync_folder_latest(
     validate_mailbox_name(folder)?;
     let mut cached = load_mailbox_for_folder(cache_root, account_id, folder)?
         .unwrap_or_else(|| CachedMailbox::empty(account_id, folder));
+    let cache_reparse_required = upgrade_mailbox_cache(&mut cached);
     let uid_validity_changed = cached.uid_validity.is_some() && cached.uid_validity != uid_validity;
-    if uid_validity_changed {
-        cached.messages.clear();
-        cached.oldest_uid = None;
-        cached.has_more = false;
-        cached.highest_mod_seq = None;
+    if uid_validity_changed || cache_reparse_required {
+        reset_mailbox_sync_window(&mut cached);
     } else if let (Some(mode), Some(current), Some(previous)) =
         (incremental_mode, highest_mod_seq, cached.highest_mod_seq)
     {
@@ -1232,6 +1238,7 @@ fn sync_folder_page_once(
                     .to_string(),
                 synced_at: now_stamp(),
                 folders: vec![folder.to_string()],
+                folder_labels: folder_display_labels(&[folder.to_string()]),
             });
         }
         Some(uid) => format!("UID 1:{}", uid - 1),
@@ -1327,6 +1334,7 @@ fn sync_folder_page_once(
         cache_path: path.display().to_string(),
         synced_at: cached.synced_at,
         folders: vec![folder.to_string()],
+        folder_labels: folder_display_labels(&[folder.to_string()]),
     })
 }
 
@@ -2854,6 +2862,77 @@ fn discover_folders(
     folders
 }
 
+fn reset_mailbox_sync_window(mailbox: &mut CachedMailbox) {
+    mailbox.messages.clear();
+    mailbox.oldest_uid = None;
+    mailbox.has_more = false;
+    mailbox.highest_mod_seq = None;
+}
+
+fn upgrade_mailbox_cache(mailbox: &mut CachedMailbox) -> bool {
+    if mailbox.schema_version >= CACHE_SCHEMA_VERSION {
+        return false;
+    }
+    mailbox.schema_version = CACHE_SCHEMA_VERSION;
+    reset_mailbox_sync_window(mailbox);
+    true
+}
+
+pub(crate) fn folder_display_name(name: &str) -> String {
+    if !name.contains('&') {
+        return name.to_string();
+    }
+
+    let mut output = String::with_capacity(name.len());
+    let mut cursor = 0usize;
+    while cursor < name.len() {
+        let Some(relative_start) = name[cursor..].find('&') else {
+            output.push_str(&name[cursor..]);
+            break;
+        };
+        let start = cursor + relative_start;
+        output.push_str(&name[cursor..start]);
+        let encoded_start = start + 1;
+        let Some(relative_end) = name[encoded_start..].find('-') else {
+            output.push_str(&name[start..]);
+            break;
+        };
+        let end = encoded_start + relative_end;
+        if end == encoded_start {
+            output.push('&');
+            cursor = end + 1;
+            continue;
+        }
+
+        let original = &name[start..=end];
+        let encoded = &name[encoded_start..end];
+        let engine = GeneralPurpose::new(&IMAP_MUTF7, NO_PAD);
+        let decoded = engine.decode(encoded.as_bytes()).ok().and_then(|bytes| {
+            let (pairs, remainder) = bytes.as_chunks::<2>();
+            if !remainder.is_empty() {
+                return None;
+            }
+            let words = pairs
+                .iter()
+                .map(|pair| u16::from_be_bytes(*pair))
+                .collect::<Vec<_>>();
+            String::from_utf16(&words)
+                .ok()
+                .filter(|value| !value.chars().any(char::is_control))
+        });
+        output.push_str(decoded.as_deref().unwrap_or(original));
+        cursor = end + 1;
+    }
+    output
+}
+
+fn folder_display_labels(folders: &[String]) -> HashMap<String, String> {
+    folders
+        .iter()
+        .map(|folder| (folder.clone(), folder_display_name(folder)))
+        .collect()
+}
+
 fn is_safe_discovered_folder(name: &str) -> bool {
     name.trim().len() <= 512 && !name.trim().is_empty() && !name.chars().any(char::is_control)
 }
@@ -3233,6 +3312,36 @@ mod tests {
         assert!(!is_safe_discovered_folder("Contacts\r\nUID FETCH 1 ALL"));
         assert!(!is_safe_discovered_folder("Drafts\0shadow"));
         assert!(!is_safe_discovered_folder(""));
+    }
+
+    #[test]
+    fn modified_utf7_folder_names_are_decoded_without_changing_wire_names() {
+        assert_eq!(
+            folder_display_name("~peter/mail/&U,BTFw-/&ZeVnLIqe-"),
+            "~peter/mail/台北/日本語"
+        );
+        assert_eq!(folder_display_name("R&-D &- QA"), "R&D & QA");
+        assert_eq!(folder_display_name("INBOX"), "INBOX");
+        assert_eq!(folder_display_name("Broken &invalid"), "Broken &invalid");
+        assert_eq!(folder_display_name("Odd &QQ-"), "Odd &QQ-");
+    }
+
+    #[test]
+    fn stale_mailbox_cache_is_reparsed_from_remote_on_next_successful_sync() {
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.schema_version = 1;
+        mailbox.highest_mod_seq = Some(42);
+        mailbox.oldest_uid = Some(7);
+        mailbox.has_more = true;
+        mailbox.messages.push(fixture_message(7, "INBOX"));
+
+        assert!(upgrade_mailbox_cache(&mut mailbox));
+        assert_eq!(mailbox.schema_version, CACHE_SCHEMA_VERSION);
+        assert!(mailbox.messages.is_empty());
+        assert_eq!(mailbox.highest_mod_seq, None);
+        assert_eq!(mailbox.oldest_uid, None);
+        assert!(!mailbox.has_more);
+        assert!(!upgrade_mailbox_cache(&mut mailbox));
     }
 
     #[test]

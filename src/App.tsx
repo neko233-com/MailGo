@@ -123,9 +123,10 @@ function nativeFolderName(account: MailAccount, folder: FolderId): string {
   return account.provider === 'google' ? '[Gmail]/All Mail' : 'Archive'
 }
 
-function nativeFolderLabel(folder: string) {
-  const parts = folder.split(/[\\/]/).filter(Boolean)
-  return parts[parts.length - 1] || folder
+function nativeFolderLabel(folder: string, displayName?: string) {
+  const source = displayName?.trim() || folder
+  const parts = source.split(/[\\/]/).filter(Boolean)
+  return parts[parts.length - 1] || source
 }
 
 function isSameNativeFolder(left: string, right: string) {
@@ -145,7 +146,7 @@ function customNativeFolders(account: MailAccount, folders: string[] | undefined
   return result
 }
 
-function nativeMoveTargets(account: MailAccount, folders: string[] | undefined): MailMoveTarget[] {
+function nativeMoveTargets(account: MailAccount, folders: string[] | undefined, labels?: Record<string, string>): MailMoveTarget[] {
   const fixedTargets: Array<{ id: Extract<FolderId, 'inbox' | 'archive' | 'spam' | 'trash'>; label: string; icon: IconName }> = [
     { id: 'inbox', label: '收件箱', icon: 'inbox' },
     { id: 'archive', label: '归档', icon: 'archive' },
@@ -159,7 +160,7 @@ function nativeMoveTargets(account: MailAccount, folders: string[] | undefined):
   }))
   return targets.concat(customNativeFolders(account, folders).map((folder) => ({
     folder,
-    label: nativeFolderLabel(folder),
+    label: nativeFolderLabel(folder, labels?.[folder]),
     icon: 'folder' as const,
   })))
 }
@@ -430,6 +431,7 @@ function App() {
   const [loadingMessageId, setLoadingMessageId] = useState<string | null>(null)
   const [mailboxMeta, setMailboxMeta] = useState<Record<string, { oldestUid?: number; hasMore?: boolean }>>({})
   const [nativeFolders, setNativeFolders] = useState<Record<string, string[]>>({})
+  const [nativeFolderLabels, setNativeFolderLabels] = useState<Record<string, Record<string, string>>>({})
   const [selectedNativeFolder, setSelectedNativeFolder] = useState<{ accountId: string; name: string } | null>(null)
   const [isHtmlMode, setHtmlMode] = useState(false)
   const [isImporting, setImporting] = useState(false)
@@ -715,6 +717,7 @@ function App() {
       setNativeStateError(null)
       if (isNativeRuntime) setAccounts(nativeState.accounts)
       if (isNativeRuntime) setNativeFolders(nativeState.folders ?? {})
+      if (isNativeRuntime) setNativeFolderLabels(nativeState.folderLabels ?? {})
       if (isNativeRuntime) {
         setMails([])
         setServerSearchMails([])
@@ -769,6 +772,7 @@ function App() {
             : account
         }))
         setNativeFolders(nativeState.folders ?? {})
+        setNativeFolderLabels(nativeState.folderLabels ?? {})
         await Promise.all(nativeState.accounts.map(async (account) => {
           try {
             const result = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id })
@@ -990,9 +994,9 @@ function App() {
   const selectedMailAccount = accounts.find((account) => account.id === selectedMail.accountId)
   const selectedMailMoveTargets = useMemo(() => {
     if (!isNativeRuntime || !selectedMailAccount || selectedMail.nativeUid == null) return []
-    return nativeMoveTargets(selectedMailAccount, nativeFolders[selectedMailAccount.id])
+    return nativeMoveTargets(selectedMailAccount, nativeFolders[selectedMailAccount.id], nativeFolderLabels[selectedMailAccount.id])
       .filter((target) => !selectedMail.nativeFolder || !isSameNativeFolder(target.folder, selectedMail.nativeFolder))
-  }, [isNativeRuntime, nativeFolders, selectedMail.nativeFolder, selectedMail.nativeUid, selectedMailAccount])
+  }, [isNativeRuntime, nativeFolderLabels, nativeFolders, selectedMail.nativeFolder, selectedMail.nativeUid, selectedMailAccount])
 
   const groupedMails = useMemo(() => {
     return visibleMails.reduce<Record<string, MailMessage[]>>((groups, mail) => {
@@ -1458,7 +1462,7 @@ function App() {
       setMailboxMeta((current) => ({ ...current, [nativeMailboxKey(account.id, folder)]: { oldestUid: result.mailbox!.oldestUid, hasMore: result.mailbox!.hasMore } }))
       setMails((current) => [...current.filter((mail) => !(mail.accountId === account.id && mail.nativeFolder && isSameNativeFolder(mail.nativeFolder, folder))), ...converted])
       if (converted.length) setSelectedMailId((current) => !current || current === 'launch-plan' ? converted[0].id : current)
-    }).catch(() => pushToast(`${account.label} 的“${nativeFolderLabel(folder)}”暂时无法读取`, 'error'))
+    }).catch(() => pushToast(`${account.label} 的“${nativeFolderLabel(folder, nativeFolderLabels[account.id]?.[folder])}”暂时无法读取`, 'error'))
   }
 
   const loadEarlier = async () => {
@@ -1544,6 +1548,13 @@ function App() {
         }
         return next
       })
+      setNativeFolderLabels((current) => {
+        const next = { ...current }
+        for (const item of result.synced ?? []) {
+          if (item.folderLabels) next[item.accountId] = item.folderLabels
+        }
+        return next
+      })
       setAccounts((current) => current.map((account) => {
         const synced = result.synced?.find((item) => item.accountId === account.id)
         const failed = result.failed?.find((item) => item.accountId === account.id)
@@ -1603,6 +1614,7 @@ function App() {
     try {
       const result = await invoke<NativeSyncItem>('sync.account', { accountId: account.id }, 60_000)
       if (result.folders?.length) setNativeFolders((current) => ({ ...current, [account.id]: result.folders! }))
+      if (result.folderLabels) setNativeFolderLabels((current) => ({ ...current, [account.id]: result.folderLabels! }))
       setAccounts((current) => current.map((item) => item.id === account.id
         ? { ...item, unread: result.unread ?? 0, status: 'synced', lastSync: '刚刚同步' }
         : item))
@@ -1787,6 +1799,11 @@ function App() {
         delete next[id]
         return next
       })
+      setNativeFolderLabels((current) => {
+        const next = { ...current }
+        delete next[id]
+        return next
+      })
     }
     try {
       await invoke('accounts.add', {
@@ -1851,6 +1868,11 @@ function App() {
       setMails((current) => current.filter((mail) => mail.accountId !== account.id))
       setNativeDrafts((current) => current.filter((draft) => draft.accountId !== account.id))
       setNativeFolders((current) => {
+        const next = { ...current }
+        delete next[account.id]
+        return next
+      })
+      setNativeFolderLabels((current) => {
         const next = { ...current }
         delete next[account.id]
         return next
@@ -1944,6 +1966,7 @@ function App() {
         const nextAccounts = nativeState?.accounts ?? accounts.filter((account) => !importedIds.has(account.id)).concat(imported)
         setAccounts(nextAccounts)
         setNativeFolders(nativeState?.folders ?? {})
+        setNativeFolderLabels(nativeState?.folderLabels ?? {})
         setMails((current) => current.filter((mail) => !importedIds.has(mail.accountId)))
         void refreshPendingOperations(nextAccounts)
         void refreshOutbox(nextAccounts)
@@ -1952,6 +1975,7 @@ function App() {
       } else {
         setAccounts((current) => [...current.filter((account) => !importedIds.has(account.id)), ...imported])
         setNativeFolders((current) => Object.fromEntries(Object.entries(current).filter(([accountId]) => !importedIds.has(accountId))))
+        setNativeFolderLabels((current) => Object.fromEntries(Object.entries(current).filter(([accountId]) => !importedIds.has(accountId))))
         setMails((current) => current.filter((mail) => !importedIds.has(mail.accountId)))
         pushToast(`已导入 ${imported.length} 个账户，请逐一补充授权码`, 'success')
       }
@@ -2011,6 +2035,7 @@ function App() {
         if (nativeState) {
           setAccounts(nativeState.accounts)
           setNativeFolders(nativeState.folders ?? {})
+          setNativeFolderLabels(nativeState.folderLabels ?? {})
           setMails((current) => current.filter((mail) => nativeState.accounts.some((account) => account.id === mail.accountId)))
           void refreshNativeDrafts(nativeState.accounts)
         }
@@ -2046,7 +2071,7 @@ function App() {
   )
 
   const activeMailboxTitle = selectedNativeFolder
-    ? nativeFolderLabel(selectedNativeFolder.name)
+    ? nativeFolderLabel(selectedNativeFolder.name, nativeFolderLabels[selectedNativeFolder.accountId]?.[selectedNativeFolder.name])
     : selectedCategory
       ? (smartCategories.find((category) => category.id === selectedCategory)?.label ?? '智能分类')
       : (displayedFolderLabels.find((folder) => folder.id === selectedFolder)?.label ?? '收件箱')
@@ -2119,9 +2144,10 @@ function App() {
                 {nativeFolderGroups.flatMap(({ account, folders }) => folders.map((folder) => {
                   const selected = Boolean(selectedNativeFolder && selectedNativeFolder.accountId === account.id && isSameNativeFolder(selectedNativeFolder.name, folder))
                   const unread = allMails.filter((mail) => mail.accountId === account.id && mail.nativeFolder && isSameNativeFolder(mail.nativeFolder, folder) && mail.unread).length
-                  return <button key={`${account.id}::${folder}`} type="button" className={`nav-row server-folder-row ${selected ? 'is-selected' : ''}`} onClick={() => selectNativeFolder(account, folder)} title={`${account.label} · ${folder}`}>
+                  const folderLabel = nativeFolderLabel(folder, nativeFolderLabels[account.id]?.[folder])
+                  return <button key={`${account.id}::${folder}`} type="button" className={`nav-row server-folder-row ${selected ? 'is-selected' : ''}`} onClick={() => selectNativeFolder(account, folder)} title={`${account.label} · ${folderLabel}`}>
                     <span className="nav-icon"><Icon name="folder" size={17} weight={selected ? 'Filled' : 'Outline'} /></span>
-                    <span className="server-folder-copy"><span>{nativeFolderLabel(folder)}</span><small>{account.label}</small></span>
+                    <span className="server-folder-copy"><span>{folderLabel}</span><small>{account.label}</small></span>
                     {unread > 0 && <span className={`nav-count ${selected ? 'nav-count-selected' : ''}`}>{formatCount(unread)}</span>}
                   </button>
                 }))}

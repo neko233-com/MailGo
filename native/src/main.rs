@@ -379,9 +379,22 @@ impl MailGoState {
     }
 
     fn snapshot(&self) -> Value {
+        let folder_labels = self
+            .state
+            .folder_names
+            .iter()
+            .map(|(account_id, folders)| {
+                let labels = folders
+                    .iter()
+                    .map(|folder| (folder.clone(), sync::folder_display_name(folder)))
+                    .collect::<HashMap<_, _>>();
+                (account_id.clone(), labels)
+            })
+            .collect::<HashMap<_, _>>();
         json!({
             "accounts": self.state.accounts,
             "folders": self.state.folder_names,
+            "folderLabels": folder_labels,
             "theme": self.state.theme,
             "minimizeToTray": self.state.minimize_to_tray,
             "offlineMode": self.state.offline_mode,
