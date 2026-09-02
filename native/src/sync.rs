@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -50,6 +51,7 @@ const IMAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const IMAP_IO_TIMEOUT: Duration = Duration::from_secs(60);
 const INITIAL_SYNC_DELAY: Duration = Duration::from_secs(3);
 const BACKGROUND_SYNC_INTERVAL: Duration = Duration::from_secs(300);
+pub(crate) const ACCOUNT_SYNC_CONCURRENCY: usize = 3;
 const IDLE_STATE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const IDLE_PAUSED_RECHECK: Duration = Duration::from_secs(5);
 const IDLE_UNSUPPORTED_RECHECK: Duration = Duration::from_secs(30 * 60);
@@ -73,6 +75,39 @@ type BodySessionSlot = Arc<Mutex<Option<PooledBodySession>>>;
 type BodySessionRegistry = HashMap<String, BodySessionSlot>;
 
 static BODY_SESSIONS: OnceLock<Mutex<BodySessionRegistry>> = OnceLock::new();
+
+pub(crate) fn map_with_concurrency<T, R, F>(items: &[T], concurrency: usize, task: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    assert!(concurrency > 0, "concurrency must be positive");
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    let cursor = AtomicUsize::new(0);
+    let results = Mutex::new(Vec::with_capacity(items.len()));
+    thread::scope(|scope| {
+        for _ in 0..concurrency.min(items.len()) {
+            scope.spawn(|| loop {
+                let index = cursor.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(index) else { return };
+                let result = task(item);
+                results
+                    .lock()
+                    .expect("bounded worker result lock poisoned")
+                    .push((index, result));
+            });
+        }
+    });
+    let mut results = results
+        .into_inner()
+        .expect("bounded worker result lock poisoned");
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
 
 struct PooledBodySession {
     credential_fingerprint: [u8; 32],
@@ -999,9 +1034,9 @@ pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathB
                     tracing::debug!("background sync skipped because offline-only mode is enabled");
                     continue;
                 }
-                for account in accounts {
-                    run_background_sync(&shared, &cache_root, &account, "periodic");
-                }
+                map_with_concurrency(&accounts, ACCOUNT_SYNC_CONCURRENCY, |account| {
+                    run_background_sync(&shared, &cache_root, account, "periodic")
+                });
             }
         })
         .expect("start MailGo sync scheduler");
@@ -3618,6 +3653,26 @@ fn folders_for(provider: crate::providers::ProviderKind) -> Vec<&'static str> {
 mod tests {
     use super::*;
     use crate::classifier::SmartCategory;
+
+    #[test]
+    fn bounded_worker_pool_preserves_order_and_caps_parallelism() {
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let values = (0..24).collect::<Vec<_>>();
+        let results = map_with_concurrency(&values, 3, |value| {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(current, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(2));
+            active.fetch_sub(1, Ordering::SeqCst);
+            value * 2
+        });
+        assert_eq!(
+            results,
+            values.iter().map(|value| value * 2).collect::<Vec<_>>()
+        );
+        assert!(peak.load(Ordering::SeqCst) <= 3);
+        assert!(peak.load(Ordering::SeqCst) > 1);
+    }
 
     fn fixture_imap_session<F>(
         scenario: F,

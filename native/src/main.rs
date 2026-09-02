@@ -808,6 +808,120 @@ fn profile_for_account(account: &PersistedAccount) -> Result<providers::Provider
     })
 }
 
+enum ManualAccountSyncOutcome {
+    Synced(Value),
+    Failed(Value),
+}
+
+fn manual_sync_failure(account_id: &str, message: impl Into<String>) -> ManualAccountSyncOutcome {
+    ManualAccountSyncOutcome::Failed(json!({
+        "accountId": account_id,
+        "message": message.into(),
+    }))
+}
+
+fn run_manual_account_sync(
+    shared: &Arc<Mutex<MailGoState>>,
+    cache_root: &Path,
+    account: &PersistedAccount,
+) -> ManualAccountSyncOutcome {
+    let _sync_lease = match try_begin_account_sync(shared, &account.id) {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(account_id = %account.id, category = "concurrency", "account sync skipped");
+            return manual_sync_failure(&account.id, error.to_string());
+        }
+    };
+    let profile = match profile_for_account(account) {
+        Ok(profile) => profile,
+        Err(error) => {
+            record_account_sync_failure(shared, &account.id, sync::needs_reauthorization(&error));
+            tracing::warn!(account_id = %account.id, category = "configuration", "account sync skipped");
+            return manual_sync_failure(&account.id, error.to_string());
+        }
+    };
+    let credential = match load_credential(account) {
+        Ok(credential) => credential,
+        Err(error) => {
+            let needs_auth = sync::needs_reauthorization(&error);
+            record_account_sync_failure(shared, &account.id, needs_auth);
+            tracing::warn!(
+                account_id = %account.id,
+                category = if needs_auth { "authentication" } else { "credential-store" },
+                provider = profile.provider.as_str(),
+                "account sync credential unavailable"
+            );
+            return manual_sync_failure(
+                &account.id,
+                if needs_auth {
+                    "requires authorization"
+                } else {
+                    "credential store unavailable"
+                },
+            );
+        }
+    };
+    if let Err(error) = outbox::flush_due(
+        cache_root,
+        &account.id,
+        profile.clone(),
+        &account.email,
+        &credential,
+    ) {
+        tracing::warn!(account_id = %account.id, "all-account outbox flush failed: {error}");
+    }
+    let provider = profile.provider;
+    match sync::sync_account(
+        &account.id,
+        profile,
+        &account.email,
+        &credential,
+        cache_root,
+    ) {
+        Ok(result) => {
+            let serialized = match serde_json::to_value(&result) {
+                Ok(serialized) => serialized,
+                Err(error) => {
+                    tracing::warn!(account_id = %account.id, "serialize sync result failed: {error}");
+                    return manual_sync_failure(&account.id, "could not prepare sync result");
+                }
+            };
+            let state_result = (|| -> Result<()> {
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                record_account_sync_success(&mut app, &result);
+                app.save()
+            })();
+            if let Err(error) = state_result {
+                tracing::warn!(account_id = %account.id, "persist synchronized account state failed: {error}");
+                return manual_sync_failure(
+                    &account.id,
+                    "could not persist synchronized account state",
+                );
+            }
+            tracing::info!(
+                account_id = %account.id,
+                provider = provider.as_str(),
+                unread = result.unread,
+                "account sync completed"
+            );
+            ManualAccountSyncOutcome::Synced(serialized)
+        }
+        Err(error) => {
+            let category = sync::error_category(&error, provider);
+            let detail = sync::error_detail(&error);
+            record_account_sync_failure(shared, &account.id, sync::needs_reauthorization(&error));
+            tracing::warn!(
+                account_id = %account.id,
+                provider = provider.as_str(),
+                category,
+                detail,
+                "account sync failed"
+            );
+            manual_sync_failure(&account.id, error.to_string())
+        }
+    }
+}
+
 fn string_field(payload: &Value, name: &str) -> Result<String> {
     payload
         .get(name)
@@ -2215,101 +2329,16 @@ fn handle_ipc(
                 );
                 let mut synced = Vec::new();
                 let mut failed = Vec::new();
-                for account in accounts {
-                    let _sync_lease = match try_begin_account_sync(shared, &account.id) {
-                        Ok(lease) => lease,
-                        Err(error) => {
-                            failed.push(
-                                json!({ "accountId": account.id, "message": error.to_string() }),
-                            );
-                            tracing::warn!(category = "concurrency", "account sync skipped");
-                            continue;
-                        }
-                    };
-                    let profile = match profile_for_account(&account) {
-                        Ok(profile) => profile,
-                        Err(error) => {
-                            record_account_sync_failure(
-                                shared,
-                                &account.id,
-                                sync::needs_reauthorization(&error),
-                            );
-                            failed.push(
-                                json!({ "accountId": account.id, "message": error.to_string() }),
-                            );
-                            tracing::warn!(category = "configuration", "account sync skipped");
-                            continue;
-                        }
-                    };
-                    let credential = match load_credential(&account) {
-                        Ok(credential) => credential,
-                        Err(error) => {
-                            let needs_auth = sync::needs_reauthorization(&error);
-                            failed.push(json!({
-                                "accountId": account.id,
-                                "message": if needs_auth { "requires authorization" } else { "credential store unavailable" },
-                            }));
-                            record_account_sync_failure(shared, &account.id, needs_auth);
-                            tracing::warn!(
-                                category = if needs_auth {
-                                    "authentication"
-                                } else {
-                                    "credential-store"
-                                },
-                                provider = profile.provider.as_str(),
-                                "account sync credential unavailable"
-                            );
-                            continue;
-                        }
-                    };
-                    if let Err(error) = outbox::flush_due(
-                        &cache_dir(),
-                        &account.id,
-                        profile.clone(),
-                        &account.email,
-                        &credential,
-                    ) {
-                        tracing::warn!(account_id = %account.id, "all-account outbox flush failed: {error}");
-                    }
-                    let provider = profile.provider;
-                    match sync::sync_account(
-                        &account.id,
-                        profile,
-                        &account.email,
-                        &credential,
-                        &cache_dir(),
-                    ) {
-                        Ok(result) => {
-                            let mut app =
-                                shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-                            record_account_sync_success(&mut app, &result);
-                            app.save()?;
-                            tracing::info!(
-                                provider = provider.as_str(),
-                                unread = result.unread,
-                                "account sync completed"
-                            );
-                            synced.push(serde_json::to_value(result)?);
-                        }
-                        Err(error) => {
-                            let category = sync::error_category(&error, provider);
-                            let detail = sync::error_detail(&error);
-                            record_account_sync_failure(
-                                shared,
-                                &account.id,
-                                sync::needs_reauthorization(&error),
-                            );
-                            failed.push(json!({
-                                "accountId": account.id,
-                                "message": error.to_string(),
-                            }));
-                            tracing::warn!(
-                                provider = provider.as_str(),
-                                category,
-                                detail,
-                                "account sync failed"
-                            );
-                        }
+                let cache_root = cache_dir();
+                let outcomes = sync::map_with_concurrency(
+                    &accounts,
+                    sync::ACCOUNT_SYNC_CONCURRENCY,
+                    |account| run_manual_account_sync(shared, &cache_root, account),
+                );
+                for outcome in outcomes {
+                    match outcome {
+                        ManualAccountSyncOutcome::Synced(result) => synced.push(result),
+                        ManualAccountSyncOutcome::Failed(error) => failed.push(error),
                     }
                 }
                 tracing::info!(

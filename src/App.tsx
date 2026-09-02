@@ -6,6 +6,7 @@ import { Icon, type IconName } from './components/Icon'
 import { buildComposeThreadHeaders, type ComposeMode } from './compose-thread'
 import { sanitizeCustomCss } from './customCss'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
+import { mapWithConcurrency } from './lib/asyncPool'
 import { invoke, readNativeState } from './lib/ipc'
 import { buildMailThreads, type MailThread } from './threading'
 import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeDeviceStartResponse, NativeDraft, NativeDraftAttachment, NativeLocalSearchResponse, NativeMailboxResponse, NativeMessageResponse, NativeOutboxStatus, NativeQueueStatus, NativeSearchResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
@@ -22,6 +23,9 @@ type VirtualMailItem =
 const MAX_CUSTOM_CSS_LENGTH = 64 * 1024
 const INITIAL_MAILBOX_PAGE_SIZE = 48
 const EARLIER_MAILBOX_PAGE_SIZE = 50
+const ACCOUNT_IPC_CONCURRENCY = 4
+const BULK_ACTION_IPC_CONCURRENCY = 6
+const ATTACHMENT_DOWNLOAD_CONCURRENCY = 3
 const MOBILE_LAYOUT_QUERY = '(max-width: 900px)'
 const COMPACT_DENSITY_QUERY = '(max-height: 820px), (max-width: 1366px)'
 const AUTO_COLLAPSE_SIDEBAR_QUERY = '(max-width: 1366px) and (min-width: 901px)'
@@ -675,7 +679,7 @@ function App() {
       return
     }
     try {
-      const statuses = await Promise.all(accountList.map((account) => invoke<NativeQueueStatus>('sync.queue_status', { accountId: account.id })))
+      const statuses = await mapWithConcurrency(accountList, ACCOUNT_IPC_CONCURRENCY, (account) => invoke<NativeQueueStatus>('sync.queue_status', { accountId: account.id }))
       setPendingOperations(statuses.reduce((total, status) => total + status.total, 0))
     } catch {
       // Queue status is telemetry for the local UI; a transient read failure must not interrupt mail actions.
@@ -689,7 +693,7 @@ function App() {
       return
     }
     try {
-      const statuses = await Promise.all(accountList.map((account) => invoke<NativeOutboxStatus>('mail.outbox.status', { accountId: account.id })))
+      const statuses = await mapWithConcurrency(accountList, ACCOUNT_IPC_CONCURRENCY, (account) => invoke<NativeOutboxStatus>('mail.outbox.status', { accountId: account.id }))
       setOutboxTotal(statuses.reduce((total, status) => total + status.total, 0))
       setOutboxPaused(statuses.reduce((total, status) => total + status.paused, 0))
     } catch {
@@ -703,7 +707,7 @@ function App() {
       return
     }
     try {
-      const drafts = await Promise.all(accountList.map((account) => invoke<NativeDraft[]>('drafts.list', { accountId: account.id }, 30_000)))
+      const drafts = await mapWithConcurrency(accountList, ACCOUNT_IPC_CONCURRENCY, (account) => invoke<NativeDraft[]>('drafts.list', { accountId: account.id }, 30_000))
       setNativeDrafts(drafts.flat().sort((left, right) => right.updatedAt - left.updatedAt))
     } catch {
       // A missing or unreadable draft cache must not make the inbox unavailable.
@@ -877,7 +881,9 @@ function App() {
       void refreshOutbox(nativeState.accounts)
       void refreshNativeDrafts(nativeState.accounts)
       if (!isNativeRuntime) return
-      await Promise.all(nativeState.accounts.map(async (account) => {
+      let firstMailboxSettled = false
+      if (!nativeState.accounts.length) setMailboxHydrating(false)
+      await mapWithConcurrency(nativeState.accounts, ACCOUNT_IPC_CONCURRENCY, async (account) => {
         try {
           const result = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, limit: INITIAL_MAILBOX_PAGE_SIZE })
           const converted = (result.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, account))
@@ -887,8 +893,13 @@ function App() {
           if (converted.length) setSelectedMailId((current) => !current || current === 'launch-plan' ? converted[0].id : current)
         } catch {
           // An empty cache is a valid first-run state; sync will populate it later.
+        } finally {
+          if (!cancelled && !firstMailboxSettled) {
+            firstMailboxSettled = true
+            setMailboxHydrating(false)
+          }
         }
-      }))
+      })
       if (!cancelled) setMailboxHydrating(false)
     }).catch((error) => {
       if (cancelled) return
@@ -916,7 +927,7 @@ function App() {
         }))
         setNativeFolders(nativeState.folders ?? {})
         setNativeFolderLabels(nativeState.folderLabels ?? {})
-        await Promise.all(nativeState.accounts.map(async (account) => {
+        await mapWithConcurrency(nativeState.accounts, ACCOUNT_IPC_CONCURRENCY, async (account) => {
           try {
             const result = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, limit: INITIAL_MAILBOX_PAGE_SIZE })
             if (cancelled || !result.mailbox) return
@@ -927,7 +938,7 @@ function App() {
           } catch {
             // The background scheduler may still be committing this mailbox snapshot; retry on the next local refresh.
           }
-        }))
+        })
       } catch (error) {
         if (!cancelled) setNativeStateError(error instanceof Error ? error.message : '无法连接本地邮件服务')
       }
@@ -1429,7 +1440,7 @@ function App() {
     }))
     let failed = 0
     if (isNativeRuntime) {
-      const results = await Promise.all(selected.map(async (mail) => {
+      const results = await mapWithConcurrency(selected, BULK_ACTION_IPC_CONCURRENCY, async (mail) => {
         if (!mail.nativeUid) return { mail, ok: true }
         try {
           await invoke('mail.mark_read', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: unread })
@@ -1438,7 +1449,7 @@ function App() {
           markAccountNeedsReauth(mail.accountId, error)
           return { mail, ok: false }
         }
-      }))
+      })
       const failedMails = results.filter((result) => !result.ok).map((result) => result.mail)
       failed = failedMails.length
       if (failedMails.length) {
@@ -1472,7 +1483,7 @@ function App() {
     mapMailSources((mail) => selectedIds.has(mail.id) ? { ...mail, starred } : mail)
     let failed = 0
     if (isNativeRuntime) {
-      const results = await Promise.all(selected.map(async (mail) => {
+      const results = await mapWithConcurrency(selected, BULK_ACTION_IPC_CONCURRENCY, async (mail) => {
         if (!mail.nativeUid) return { mail, ok: true }
         try {
           await invoke('mail.star', { accountId: mail.accountId, folder: mail.nativeFolder ?? 'INBOX', uid: mail.nativeUid, enabled: starred })
@@ -1481,7 +1492,7 @@ function App() {
           markAccountNeedsReauth(mail.accountId, error)
           return { mail, ok: false }
         }
-      }))
+      })
       const failedMails = results.filter((result) => !result.ok).map((result) => result.mail)
       failed = failedMails.length
       if (failedMails.length) {
@@ -1720,7 +1731,7 @@ function App() {
     if (first) setSelectedMailId(first.id)
     if (isNativeRuntime && folder !== 'starred') {
       setMailboxHydrating(true)
-      void Promise.all(accounts.map(async (account) => {
+      void mapWithConcurrency(accounts, ACCOUNT_IPC_CONCURRENCY, async (account) => {
         try {
           const serverFolder = nativeFolderName(account, folder)
           const result = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, folder: serverFolder, limit: INITIAL_MAILBOX_PAGE_SIZE })
@@ -1730,7 +1741,7 @@ function App() {
         } catch {
           // A provider may not expose every optional folder; its cached copy remains untouched.
         }
-      })).finally(() => setMailboxHydrating(false))
+      }).finally(() => setMailboxHydrating(false))
     }
   }
 
@@ -1772,7 +1783,7 @@ function App() {
     setLoadingEarlier(true)
     try {
       let loaded = 0
-      await Promise.all(pendingAccounts.map(async (account) => {
+      await mapWithConcurrency(pendingAccounts, ACCOUNT_IPC_CONCURRENCY, async (account) => {
         const serverFolder = selectedNativeFolder?.name ?? nativeFolderName(account, selectedFolder)
         const meta = mailboxMeta[nativeMailboxKey(account.id, serverFolder)]
         try {
@@ -1813,7 +1824,7 @@ function App() {
         } catch {
           pushToast(`${account.label} 的更早邮件加载失败，可稍后重试`, 'error')
         }
-      }))
+      })
       if (loaded) pushToast(`已更新 ${loaded} 封本地邮件`, 'success')
     } finally {
       setLoadingEarlier(false)
@@ -1881,7 +1892,7 @@ function App() {
       if (result.failed?.length) pushToast(`${result.synced?.length ?? 0} 个账户已同步，${result.failed.length} 个需要处理`, 'info')
       else pushToast('所有账户已完成同步', 'success')
       if (isNativeRuntime) {
-        await Promise.all(accounts.map(async (account) => {
+        await mapWithConcurrency(accounts, ACCOUNT_IPC_CONCURRENCY, async (account) => {
           try {
             const mailbox = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, limit: INITIAL_MAILBOX_PAGE_SIZE })
             const converted = (mailbox.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, account))
@@ -1892,7 +1903,7 @@ function App() {
           } catch {
             // Preserve the previous offline copy if one account has a transient cache error.
           }
-        }))
+        })
         await refreshPendingOperations(accounts)
         await refreshOutbox(accounts)
       }
@@ -1961,7 +1972,7 @@ function App() {
       return
     }
     try {
-      const results = await Promise.all(accounts.map((account) => invoke<{ reset: number }>('mail.outbox.retry_all', { accountId: account.id })))
+      const results = await mapWithConcurrency(accounts, ACCOUNT_IPC_CONCURRENCY, (account) => invoke<{ reset: number }>('mail.outbox.retry_all', { accountId: account.id }))
       const reset = results.reduce((total, result) => total + result.reset, 0)
       await refreshOutbox()
       if (reset > 0) {
@@ -2565,7 +2576,7 @@ function App() {
               {selectedMail.hasHtml && <div className="content-mode-row"><span>此邮件包含富文本内容{(!remoteImagesEnabled || offlineMode) && ` · ${offlineMode ? '仅离线模式，远程图片已屏蔽' : '远程图片已屏蔽'}`}</span><button type="button" className="text-action" onClick={() => setHtmlMode((value) => !value)}>{isHtmlMode ? '查看纯文本' : '渲染 HTML'} <Icon name="grid" size={14} /></button></div>}
               {isHtmlMode && selectedMail.hasHtml ? <div className="html-rendered" onClick={handleRenderedLinkClick} dangerouslySetInnerHTML={{ __html: sanitizeHtml(selectedMail.htmlBody ?? initialHtml, remoteImagesEnabled && !offlineMode) }} /> : selectedMail.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
             </div>
-            {selectedMail.attachments && selectedMail.attachments.length > 0 && <div className="attachments"><div className="attachments-heading"><span><Icon name="paperclip" size={20} /> {selectedMail.attachments.length} 个附件</span><div><button type="button" onClick={() => { void Promise.all(selectedMail.attachments?.map(downloadAttachment) ?? []) }}><Icon name="download" size={17} /> 全部下载</button></div></div><div className="attachment-grid">{selectedMail.attachments.map((attachment) => { const progress = attachmentProgress[attachment.id]; return <button type="button" className="attachment-card" key={attachment.id} onClick={() => { if (progress != null) cancelAttachment(attachment.id); else void downloadAttachment(attachment) }}><span className={`file-glyph file-${attachment.kind}`}>{attachment.kind === 'pdf' ? 'PDF' : attachment.kind === 'sheet' ? 'X' : 'FILE'}</span><span className="attachment-copy"><strong>{attachment.name}</strong><small>{progress != null ? `${progress}% · 点击取消` : attachment.size}</small></span><Icon name={progress != null ? 'close' : 'download'} size={17} /></button> })}</div></div>}
+            {selectedMail.attachments && selectedMail.attachments.length > 0 && <div className="attachments"><div className="attachments-heading"><span><Icon name="paperclip" size={20} /> {selectedMail.attachments.length} 个附件</span><div><button type="button" onClick={() => { void mapWithConcurrency(selectedMail.attachments ?? [], ATTACHMENT_DOWNLOAD_CONCURRENCY, downloadAttachment) }}><Icon name="download" size={17} /> 全部下载</button></div></div><div className="attachment-grid">{selectedMail.attachments.map((attachment) => { const progress = attachmentProgress[attachment.id]; return <button type="button" className="attachment-card" key={attachment.id} onClick={() => { if (progress != null) cancelAttachment(attachment.id); else void downloadAttachment(attachment) }}><span className={`file-glyph file-${attachment.kind}`}>{attachment.kind === 'pdf' ? 'PDF' : attachment.kind === 'sheet' ? 'X' : 'FILE'}</span><span className="attachment-copy"><strong>{attachment.name}</strong><small>{progress != null ? `${progress}% · 点击取消` : attachment.size}</small></span><Icon name={progress != null ? 'close' : 'download'} size={17} /></button> })}</div></div>}
             <div className="reply-composer"><Avatar message={{ ...selectedMail, avatar: 'OC', accent: '#2a5596' }} size="sm" /><div className="reply-input" onClick={() => openCompose(undefined, 'reply', selectedMail)}>点击回复，或按 R 快速回复<div className="reply-tools"><span><Icon name="paperclip" size={19} /></span><span><Icon name="image" size={19} /></span><span className="reply-emoji">☺</span><span className="reply-a">A</span><button type="button" onClick={(event) => { event.stopPropagation(); openCompose(undefined, 'reply', selectedMail) }}>回复 <span>⌄</span></button></div></div></div>
           </div>
         </section>
@@ -3264,7 +3275,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
       }
       onSent(Boolean(isNativeRuntime && queued))
     } catch (error) {
-      await Promise.all(uploadIds.map((uploadId) => invoke('mail.attachment.upload.cancel', { uploadId }).catch(() => undefined)))
+      await mapWithConcurrency(uploadIds, ACCOUNT_IPC_CONCURRENCY, (uploadId) => invoke('mail.attachment.upload.cancel', { uploadId }).catch(() => undefined))
       onError(error instanceof Error ? error.message : '邮件发送失败，请稍后重试')
     } finally {
       setUploadingName('')

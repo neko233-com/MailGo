@@ -11,6 +11,7 @@
     "native:build": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1",
     "native:run": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-native.ps1 -Run -Release",
     "test:custom-css": "node scripts/test-custom-css.mjs",
+    "test:async-pool": "node scripts/test-async-pool.mjs",
     "test:ipc-capability": "node scripts/test-ipc-capability.mjs",
     "test:security-policy": "node scripts/test-security-policy.mjs",
     "test:threading": "node scripts/test-threading.mjs",
