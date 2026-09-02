@@ -10,6 +10,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'windows-icon-assets.ps1')
 $OutputDirectory = if ($OutputDirectory) {
     [System.IO.Path]::GetFullPath($OutputDirectory)
 } else {
@@ -55,10 +56,7 @@ Copy-Item -LiteralPath $portableStage -Destination $stageRoot -Recurse -Force
 
 $manifestPath = Join-Path $stageRoot 'AppxManifest.xml'
 $assetsPath = Join-Path $stageRoot 'Assets'
-New-Item -ItemType Directory -Force -Path $assetsPath | Out-Null
-Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\icons\mailgo-256.png') -Destination (Join-Path $assetsPath 'StoreLogo.png') -Force
-Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\icons\mailgo-256.png') -Destination (Join-Path $assetsPath 'Square150x150Logo.png') -Force
-Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\icons\mailgo-48.png') -Destination (Join-Path $assetsPath 'Square44x44Logo.png') -Force
+New-MailGoMsixAssets -SourcePath (Join-Path $projectRoot 'resources\icons\mailgo-source.png') -DestinationDirectory $assetsPath
 $escapedPublisher = [System.Security.SecurityElement]::Escape($Publisher)
 $manifest = @"
 <?xml version="1.0" encoding="utf-8"?>
@@ -75,7 +73,7 @@ $manifest = @"
   </Resources>
   <Applications>
     <Application Id="MailGo" Executable="MailGo.exe" EntryPoint="Windows.FullTrustApplication">
-      <uap:VisualElements AppListEntry="default" DisplayName="MailGo" Description="Local-first Windows mail workspace" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" BackgroundColor="#101522" />
+      <uap:VisualElements AppListEntry="default" DisplayName="MailGo" Description="Local-first Windows mail workspace" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" BackgroundColor="transparent" />
     </Application>
   </Applications>
   <Capabilities>

@@ -13,18 +13,20 @@ mod windows_tray {
         GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW,
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
     use windows_sys::Win32::UI::Shell::{
         Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD,
         NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-        DestroyMenu, DestroyWindow, DispatchMessageW, EnumWindows, GetCursorPos, GetWindowTextW,
-        GetWindowThreadProcessId, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
-        RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TrackPopupMenu,
-        TranslateMessage, GWLP_WNDPROC, HWND_MESSAGE, IMAGE_ICON, LR_LOADFROMFILE, MF_STRING,
-        PM_REMOVE, SW_HIDE, SW_RESTORE, SW_SHOW, TPM_RIGHTALIGN, WM_APP, WM_CLOSE, WM_COMMAND,
-        WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WNDPROC,
+        DestroyMenu, DestroyWindow, DispatchMessageW, EnumWindows, GetCursorPos, GetSystemMetrics,
+        GetWindowTextW, GetWindowThreadProcessId, PeekMessageW, PostMessageW, PostQuitMessage,
+        RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow,
+        TrackPopupMenu, TranslateMessage, GWLP_WNDPROC, HWND_MESSAGE, IMAGE_ICON, LR_LOADFROMFILE,
+        MF_STRING, PM_REMOVE, SM_CXSMICON, SM_CYSMICON, SW_HIDE, SW_RESTORE, SW_SHOW,
+        TPM_RIGHTALIGN, WM_APP, WM_CLOSE, WM_COMMAND, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP,
+        WNDCLASSW, WNDPROC,
     };
 
     const TRAY_CALLBACK: u32 = WM_APP + 73;
@@ -127,7 +129,7 @@ mod windows_tray {
         }
         TRAY_WINDOW.store(tray_window, Ordering::Release);
 
-        let icon = load_icon();
+        let icon = load_icon(tray_window);
         TRAY_ICON.store(icon as isize, Ordering::Release);
         let notification = tray_notification(tray_window);
         if Shell_NotifyIconW(NIM_ADD, &notification) == 0 {
@@ -186,7 +188,20 @@ mod windows_tray {
         notification
     }
 
-    unsafe fn load_icon() -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
+    unsafe fn load_icon(hwnd: HWND) -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
+        let dpi = GetDpiForWindow(hwnd);
+        let icon_width = if dpi == 0 {
+            GetSystemMetrics(SM_CXSMICON)
+        } else {
+            GetSystemMetricsForDpi(SM_CXSMICON, dpi)
+        }
+        .max(16);
+        let icon_height = if dpi == 0 {
+            GetSystemMetrics(SM_CYSMICON)
+        } else {
+            GetSystemMetricsForDpi(SM_CYSMICON, dpi)
+        }
+        .max(16);
         let mut candidates = Vec::<PathBuf>::new();
         if let Ok(executable) = std::env::current_exe() {
             if let Some(parent) = executable.parent() {
@@ -214,8 +229,8 @@ mod windows_tray {
                 0,
                 path.as_ptr(),
                 IMAGE_ICON,
-                32,
-                32,
+                icon_width,
+                icon_height,
                 LR_LOADFROMFILE,
             ) as _;
             if icon != 0 {

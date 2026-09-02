@@ -19,7 +19,7 @@ function Assert-MailGoIcon([string]$Path) {
         throw 'MailGo icon is not a valid Windows ICO file'
     }
     $count = [System.BitConverter]::ToUInt16($bytes, 4)
-    if ($count -lt 7 -or 6 + (16 * $count) -gt $bytes.Length) {
+    if ($count -lt 15 -or 6 + (16 * $count) -gt $bytes.Length) {
         throw 'MailGo icon does not contain the required multi-size image directory'
     }
     $sizes = [System.Collections.Generic.HashSet[int]]::new()
@@ -30,12 +30,17 @@ function Assert-MailGoIcon([string]$Path) {
         $bitDepth = [System.BitConverter]::ToUInt16($bytes, $entryOffset + 6)
         $dataSize = [System.BitConverter]::ToUInt32($bytes, $entryOffset + 8)
         $dataOffset = [System.BitConverter]::ToUInt32($bytes, $entryOffset + 12)
-        if ($width -ne $height -or $bitDepth -ne 32 -or $dataSize -eq 0 -or [uint64]$dataOffset + [uint64]$dataSize -gt [uint64]$bytes.Length) {
+        $payloadInBounds = $dataSize -ge 8 -and
+            [uint64]$dataOffset + [uint64]$dataSize -le [uint64]$bytes.Length
+        $isPng = $payloadInBounds -and
+            $bytes[$dataOffset] -eq 0x89 -and $bytes[$dataOffset + 1] -eq 0x50 -and
+            $bytes[$dataOffset + 2] -eq 0x4e -and $bytes[$dataOffset + 3] -eq 0x47
+        if ($width -ne $height -or $bitDepth -ne 32 -or !$isPng) {
             throw "MailGo icon contains an invalid ${width}x${height} entry"
         }
         [void]$sizes.Add($width)
     }
-    foreach ($requiredSize in 16, 24, 32, 48, 64, 128, 256) {
+    foreach ($requiredSize in 16, 20, 24, 30, 32, 36, 40, 48, 60, 64, 72, 80, 96, 128, 256) {
         if (!$sizes.Contains($requiredSize)) { throw "MailGo icon is missing the required ${requiredSize}x${requiredSize} image" }
     }
 }
@@ -102,6 +107,18 @@ if ($subsystem -ne 2) {
 $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($stagedExecutable)
 if ($versionInfo.ProductName -ne 'MailGo') {
     throw 'staged MailGo.exe is missing the embedded MailGo Windows resource metadata and application icon'
+}
+Add-Type -AssemblyName System.Drawing
+$embeddedIcon = [System.Drawing.Icon]::ExtractAssociatedIcon($stagedExecutable)
+if ($null -eq $embeddedIcon) {
+    throw 'staged MailGo.exe does not expose an embedded Windows application icon'
+}
+try {
+    if ($embeddedIcon.Width -lt 16 -or $embeddedIcon.Height -lt 16) {
+        throw "staged MailGo.exe exposes an invalid $($embeddedIcon.Width)x$($embeddedIcon.Height) application icon"
+    }
+} finally {
+    $embeddedIcon.Dispose()
 }
 if (-not (Test-Path -LiteralPath (Join-Path $distDestination 'index.html'))) {
     throw 'staged renderer is missing dist\index.html'

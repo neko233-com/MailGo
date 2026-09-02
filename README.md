@@ -131,6 +131,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-portable.ps1
 
 Build a signed MSIX on a Windows release host with the Windows SDK (`makeappx.exe` and `signtool.exe`) and a trusted production certificate. Its package signature covers the executable and renderer resources. The command fails closed without those tools and a certificate; it does not create an unsigned production installer:
 
+The MSIX packaging path generates exact 50px Store, 44px app-list, and 150px Start assets, 100%/200%/400% scale variants, and unplated light/dark target-size variants from the checked-in transparent source icon. The Win32 ICO also includes exact Windows 11 title-bar, tray, taskbar, search, and Start sizes from 16px through 256px so Windows does not need to blur a neighboring size.
+
 ```powershell
 $env:MAILGO_SIGNING_PFX_PASSWORD = "use-a-secret-manager-value"
 npm run package:msix -- -Publisher "CN=MailGo Release" -CertificatePath C:\secure\MailGo.pfx

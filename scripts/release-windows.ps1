@@ -52,6 +52,9 @@ try {
     & npm run test:async-pool
     if ($LASTEXITCODE -ne 0) { throw "bounded async pool checks failed with exit code $LASTEXITCODE" }
 
+    & npm run test:windows-icons
+    if ($LASTEXITCODE -ne 0) { throw "Windows icon checks failed with exit code $LASTEXITCODE" }
+
     & npm run test:ipc-capability
     if ($LASTEXITCODE -ne 0) { throw "packaged IPC capability checks failed with exit code $LASTEXITCODE" }
 
