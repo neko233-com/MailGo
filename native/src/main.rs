@@ -2655,6 +2655,14 @@ fn handle_ipc(
                     .get("beforeUid")
                     .and_then(Value::as_u64)
                     .and_then(|value| u32::try_from(value).ok());
+                let known_revision = match message.payload.get("knownRevision") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(
+                        value
+                            .as_u64()
+                            .ok_or_else(|| anyhow!("knownRevision must be an unsigned integer"))?,
+                    ),
+                };
                 let limit = message
                     .payload
                     .get("limit")
@@ -2662,6 +2670,20 @@ fn handle_ipc(
                     .and_then(|value| usize::try_from(value).ok())
                     .unwrap_or(48)
                     .clamp(1, 500);
+                if before_uid.is_none() {
+                    if let Some(known_revision) = known_revision {
+                        if sync::mailbox_revision(&cache_dir(), &account_id, &folder)?
+                            == Some(known_revision)
+                        {
+                            return Ok(json!({
+                                "offline": true,
+                                "mailbox": null,
+                                "unchanged": true,
+                                "revision": known_revision,
+                            }));
+                        }
+                    }
+                }
                 let page =
                     sync::load_mailbox_page(&cache_dir(), &account_id, &folder, before_uid, limit)?;
                 match page {

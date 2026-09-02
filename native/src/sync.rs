@@ -2966,6 +2966,11 @@ pub fn load_mailbox_page(
     crate::cache_db::load_mailbox_page(cache_root, account_id, folder, before_uid, limit)
 }
 
+pub fn mailbox_revision(cache_root: &Path, account_id: &str, folder: &str) -> Result<Option<u64>> {
+    validate_mailbox_name(folder)?;
+    crate::cache_db::mailbox_revision(cache_root, account_id, folder)
+}
+
 pub fn save_cached_message(
     cache_root: &Path,
     account_id: &str,

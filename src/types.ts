@@ -380,6 +380,7 @@ export interface NativeMailbox {
 export interface NativeMailboxResponse {
   offline: boolean
   mailbox?: NativeMailbox
+  unchanged?: boolean
   localHasMore?: boolean
   remoteHasMore?: boolean
   totalCached?: number

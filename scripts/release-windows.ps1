@@ -79,6 +79,15 @@ try {
     & npm run test:recipients
     if ($LASTEXITCODE -ne 0) { throw "recipient autocomplete checks failed with exit code $LASTEXITCODE" }
 
+    & npm run test:undo-send
+    if ($LASTEXITCODE -ne 0) { throw "undo-send checks failed with exit code $LASTEXITCODE" }
+
+    & npm run test:outbox
+    if ($LASTEXITCODE -ne 0) { throw "local outbox checks failed with exit code $LASTEXITCODE" }
+
+    & npm run test:conditional-refresh
+    if ($LASTEXITCODE -ne 0) { throw "conditional mailbox refresh checks failed with exit code $LASTEXITCODE" }
+
     & cargo fmt --manifest-path 'native\Cargo.toml' -- --check
     if ($LASTEXITCODE -ne 0) { throw "cargo fmt check failed with exit code $LASTEXITCODE" }
 

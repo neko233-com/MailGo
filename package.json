@@ -23,6 +23,7 @@
     "test:recipients": "node scripts/test-recipients.mjs",
     "test:undo-send": "node scripts/test-undo-send.mjs",
     "test:outbox": "node scripts/test-outbox.mjs",
+    "test:conditional-refresh": "node scripts/test-conditional-refresh.mjs",
     "package:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1",
     "package:msix": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-msix.ps1",
     "release:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1"

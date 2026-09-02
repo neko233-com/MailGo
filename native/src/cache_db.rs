@@ -2440,6 +2440,22 @@ pub fn mailbox_exists(cache_root: &Path, account_id: &str, folder: &str) -> Resu
     })
 }
 
+/// Read only the encrypted mailbox metadata row so renderer polling can avoid decrypting and
+/// serializing an unchanged page of message summaries. Identity validation is deliberately kept
+/// on this fast path rather than trusting only the keyed database lookup.
+pub fn mailbox_revision(cache_root: &Path, account_id: &str, folder: &str) -> Result<Option<u64>> {
+    with_recovery(cache_root, |connection| {
+        let account_key = identity_key(account_id);
+        let folder_key = folder_identity_key(account_id, folder);
+        let Some((metadata, revision)) = read_metadata(connection, &account_key, &folder_key)?
+        else {
+            return Ok(None);
+        };
+        validate_identity(&metadata, account_id, folder)?;
+        Ok(Some(revision))
+    })
+}
+
 pub fn load_mailbox_page(
     cache_root: &Path,
     account_id: &str,
@@ -4582,6 +4598,45 @@ mod tests {
                 .unwrap()
                 .text_body,
             "downloaded body"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mailbox_revision_tracks_page_changes_without_loading_messages() {
+        let root = temporary_root("mailbox-revision");
+        assert_eq!(
+            mailbox_revision(&root, "fixture-account", "INBOX").unwrap(),
+            None
+        );
+        save_mailbox(
+            &root,
+            "fixture-account",
+            &CachedMailbox::empty("fixture-account", "INBOX"),
+        )
+        .unwrap();
+        let initial = mailbox_revision(&root, "fixture-account", "INBOX")
+            .unwrap()
+            .unwrap();
+
+        save_message(&root, "fixture-account", &fixture_message(1)).unwrap();
+        let changed = mailbox_revision(&root, "fixture-account", "INBOX")
+            .unwrap()
+            .unwrap();
+        assert!(changed > initial);
+        let connection = Connection::open(database_path(&root)).unwrap();
+        connection
+            .execute("UPDATE messages SET payload = X'00'", [])
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            mailbox_revision(&root, "fixture-account", "INBOX").unwrap(),
+            Some(changed),
+            "revision polling must not touch encrypted message payloads"
+        );
+        assert_eq!(
+            mailbox_revision(&root, "fixture-account", "Archive").unwrap(),
+            None
         );
         let _ = fs::remove_dir_all(root);
     }

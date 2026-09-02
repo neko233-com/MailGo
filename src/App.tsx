@@ -250,6 +250,33 @@ function nativeMailboxKey(accountId: string, folder: string) {
   return `${accountId}::${folder}`
 }
 
+function sameStringArrayRecord(left: Record<string, string[]>, right: Record<string, string[]>) {
+  const leftKeys = Object.keys(left)
+  const rightKeys = Object.keys(right)
+  if (leftKeys.length !== rightKeys.length) return false
+  return leftKeys.every((key) => {
+    const leftValues = left[key]
+    const rightValues = right[key]
+    return Boolean(rightValues)
+      && leftValues.length === rightValues.length
+      && leftValues.every((value, index) => value === rightValues[index])
+  })
+}
+
+function sameNestedStringRecord(left: Record<string, Record<string, string>>, right: Record<string, Record<string, string>>) {
+  const leftKeys = Object.keys(left)
+  const rightKeys = Object.keys(right)
+  if (leftKeys.length !== rightKeys.length) return false
+  return leftKeys.every((key) => {
+    const leftValues = left[key]
+    const rightValues = right[key]
+    if (!rightValues) return false
+    const valueKeys = Object.keys(leftValues)
+    return valueKeys.length === Object.keys(rightValues).length
+      && valueKeys.every((valueKey) => leftValues[valueKey] === rightValues[valueKey])
+  })
+}
+
 function attachmentExtension(fileName: string) {
   const match = /\.([a-z0-9]{1,12})$/i.exec(fileName.trim())
   return match?.[1].toLocaleLowerCase('en-US') ?? ''
@@ -701,6 +728,8 @@ function App() {
   const [isMailboxHydrating, setMailboxHydrating] = useState(isNativeRuntime)
   const [loadingMessageId, setLoadingMessageId] = useState<string | null>(null)
   const [mailboxMeta, setMailboxMeta] = useState<Record<string, MailboxPagingMeta>>({})
+  const mailboxMetaRef = useRef<Record<string, MailboxPagingMeta>>({})
+  const backgroundStatusRefreshRunningRef = useRef(false)
   const [nativeFolders, setNativeFolders] = useState<Record<string, string[]>>({})
   const [nativeFolderLabels, setNativeFolderLabels] = useState<Record<string, Record<string, string>>>({})
   const [selectedNativeFolder, setSelectedNativeFolder] = useState<{ accountId: string; name: string } | null>(null)
@@ -742,6 +771,10 @@ function App() {
   const [customAuthentication, setCustomAuthentication] = useState('password')
   const [connectionDiagnostics, setConnectionDiagnostics] = useState<Record<string, ConnectionDiagnosticViewState>>({})
   const [attachmentProgress, setAttachmentProgress] = useState<Record<string, number>>({})
+
+  useEffect(() => {
+    mailboxMetaRef.current = mailboxMeta
+  }, [mailboxMeta])
 
   const rememberMailboxPage = useCallback((result: NativeMailboxResponse, preserveOlderCursor = false) => {
     const next = pagingMetaFromResponse(result)
@@ -1106,22 +1139,39 @@ function App() {
     if (!isNativeRuntime) return
     let cancelled = false
     const refreshBackgroundStatuses = async () => {
+      if (backgroundStatusRefreshRunningRef.current) return
+      backgroundStatusRefreshRunningRef.current = true
       try {
         const nativeState = await readNativeState()
         if (cancelled || !nativeState) return
         setNativeStateError(null)
-        setAccounts((current) => current.map((account) => {
-          const refreshed = nativeState.accounts.find((item) => item.id === account.id)
-          return refreshed
-            ? { ...account, unread: refreshed.unread, status: refreshed.status, lastSync: refreshed.lastSync }
-            : account
-        }))
-        setNativeFolders(nativeState.folders ?? {})
-        setNativeFolderLabels(nativeState.folderLabels ?? {})
+        const refreshedAccounts = new Map(nativeState.accounts.map((account) => [account.id, account]))
+        setAccounts((current) => {
+          let changed = false
+          const next = current.map((account) => {
+            const refreshed = refreshedAccounts.get(account.id)
+            if (!refreshed
+              || (account.unread === refreshed.unread && account.status === refreshed.status && account.lastSync === refreshed.lastSync)) return account
+            changed = true
+            return { ...account, unread: refreshed.unread, status: refreshed.status, lastSync: refreshed.lastSync }
+          })
+          return changed ? next : current
+        })
+        const refreshedFolders = nativeState.folders ?? {}
+        const refreshedFolderLabels = nativeState.folderLabels ?? {}
+        setNativeFolders((current) => sameStringArrayRecord(current, refreshedFolders) ? current : refreshedFolders)
+        setNativeFolderLabels((current) => sameNestedStringRecord(current, refreshedFolderLabels) ? current : refreshedFolderLabels)
         await mapWithConcurrency(nativeState.accounts, ACCOUNT_IPC_CONCURRENCY, async (account) => {
           try {
-            const result = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, limit: INITIAL_MAILBOX_PAGE_SIZE })
-            if (cancelled || !result.mailbox) return
+            const folder = nativeFolderName(account, 'inbox')
+            const knownRevision = mailboxMetaRef.current[nativeMailboxKey(account.id, folder)]?.revision
+            const result = await invoke<NativeMailboxResponse>('mail.list', {
+              accountId: account.id,
+              folder,
+              limit: INITIAL_MAILBOX_PAGE_SIZE,
+              ...(knownRevision == null ? {} : { knownRevision }),
+            })
+            if (cancelled || result.unchanged || !result.mailbox) return
             const converted = result.mailbox.messages.map((message) => nativeMessageToUi(message, account))
             rememberMailboxPage(result, true)
             startTransition(() => setMails((current) => mergeMailboxPage(current, converted, account.id, result.mailbox!.folder, 'latest')))
@@ -1132,6 +1182,8 @@ function App() {
         })
       } catch (error) {
         if (!cancelled) setNativeStateError(error instanceof Error ? error.message : '无法连接本地邮件服务')
+      } finally {
+        backgroundStatusRefreshRunningRef.current = false
       }
     }
     const initialTimer = window.setTimeout(() => { void refreshBackgroundStatuses() }, 4_000)
