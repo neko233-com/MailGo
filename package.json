@@ -25,6 +25,7 @@
     "test:undo-send": "node scripts/test-undo-send.mjs",
     "test:schedule-send": "node scripts/test-schedule-send.mjs",
     "test:snooze": "node scripts/test-snooze.mjs",
+    "test:mail-rules": "node scripts/test-mail-rules.mjs",
     "test:outbox": "node scripts/test-outbox.mjs",
     "test:conditional-refresh": "node scripts/test-conditional-refresh.mjs",
     "test:message-hydration": "node scripts/test-message-hydration.mjs",

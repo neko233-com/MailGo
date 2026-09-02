@@ -90,6 +90,10 @@ pub struct CachedMessage {
     pub starred: bool,
     pub category: SmartCategory,
     pub is_ad: bool,
+    #[serde(default)]
+    pub blocked: bool,
+    #[serde(default)]
+    pub blocked_rule_id: Option<String>,
     pub preview: String,
     pub text_body: String,
     pub html_body: Option<String>,
@@ -265,6 +269,8 @@ fn build_message(
         starred,
         category: classification.category,
         is_ad: classification.is_ad,
+        blocked: false,
+        blocked_rule_id: None,
         preview,
         text_body,
         html_body,

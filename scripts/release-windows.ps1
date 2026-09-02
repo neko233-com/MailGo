@@ -91,6 +91,9 @@ try {
     & npm run test:snooze
     if ($LASTEXITCODE -ne 0) { throw "snooze checks failed with exit code $LASTEXITCODE" }
 
+    & npm run test:mail-rules
+    if ($LASTEXITCODE -ne 0) { throw "mail rule checks failed with exit code $LASTEXITCODE" }
+
     & npm run test:outbox
     if ($LASTEXITCODE -ne 0) { throw "local outbox checks failed with exit code $LASTEXITCODE" }
 

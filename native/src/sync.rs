@@ -5234,6 +5234,8 @@ mod tests {
             starred: false,
             category: SmartCategory::Inbox,
             is_ad: false,
+            blocked: false,
+            blocked_rule_id: None,
             preview: "Offline preview".into(),
             text_body: "Offline body".into(),
             html_body: None,

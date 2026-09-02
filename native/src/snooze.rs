@@ -449,6 +449,8 @@ mod tests {
             starred: false,
             category: SmartCategory::Inbox,
             is_ad: false,
+            blocked: false,
+            blocked_rule_id: None,
             preview: "Safe preview".into(),
             text_body: "body must not be copied".into(),
             html_body: Some("<p>body must not be copied</p>".into()),

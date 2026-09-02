@@ -69,7 +69,7 @@ assert.match(app, /const preferred = existing && !mailNeedsBodyHydration\(existi
 assert.match(app, /setSnoozedMails\(\(current\) => current\.map\(\(mail\) => mail\.id === candidate\.id/)
 assert.match(app, /mail\.snoozedUntil != null\) continue/)
 assert.match(app, /displayedAccountUnreadCounts/)
-assert.match(app, /account\.unread - \(snoozedUnread\.get\(account\.id\) \?\? 0\)/)
+assert.match(app, /account\.unread - \(hiddenUnread\.get\(account\.id\) \?\? 0\)/)
 assert.match(app, /SNOOZE_TIMER_RECHECK_MS = 5 \* 60 \* 1_000/)
 assert.match(app, /window\.setTimeout\(scheduleCheck, SNOOZE_TIMER_RECHECK_MS\)/)
 assert.match(app, /selectedMail\.id === 'empty-mail' \? <div className="reading-empty-state">/)

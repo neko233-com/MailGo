@@ -6,6 +6,22 @@ export type FolderId = 'inbox' | 'starred' | 'snoozed' | 'outbox' | 'sent' | 'dr
 
 export type SmartCategory = 'apple-connect' | 'apple-ads' | 'social' | 'ads' | 'finance'
 
+export type MailRuleKind = 'sender' | 'domain'
+
+export interface NativeMailRule {
+  id: string
+  accountId?: string
+  kind: MailRuleKind
+  value: string
+  createdAt: number
+}
+
+export interface NativeMailRuleSnapshot {
+  rules: NativeMailRule[]
+  removed?: boolean
+  added?: NativeMailRule
+}
+
 export interface MailAttachment {
   id: string
   name: string
@@ -35,6 +51,8 @@ export interface MailMessage {
   unread: boolean
   starred: boolean
   isAd?: boolean
+  blocked?: boolean
+  blockedRuleId?: string
   accent: string
   avatar: string
   body: string[]
@@ -367,6 +385,8 @@ export interface NativeCachedMessage {
   starred: boolean
   category: 'apple-connect' | 'apple-ads' | 'social' | 'ads' | 'inbox'
   isAd: boolean
+  blocked: boolean
+  blockedRuleId?: string
   preview: string
   textBody: string
   htmlBody?: string

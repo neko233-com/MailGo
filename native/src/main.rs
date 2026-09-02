@@ -32,6 +32,7 @@ mod mail;
 mod oauth;
 mod outbox;
 mod providers;
+mod rules;
 mod send;
 mod snooze;
 mod storage;
@@ -112,6 +113,8 @@ const MAX_SUBJECT_BYTES: usize = 998;
 const MAX_MESSAGE_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SEARCH_QUERY_BYTES: usize = 256;
 const MAX_SEARCH_RESULTS: usize = 240;
+const MAX_MAIL_RULE_VALUE_BYTES: usize = 320;
+const MAX_MAIL_RULE_ID_BYTES: usize = 128;
 const IPC_CAPABILITY_FIELD: &str = "__mailgoCapability";
 const IPC_CAPABILITY_LENGTH: usize = 48;
 const MAX_EXTERNAL_URL_BYTES: usize = 4096;
@@ -1060,6 +1063,16 @@ fn optional_string_field(payload: &Value, name: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn active_mail_rules(cache_root: &Path) -> rules::RuleSnapshot {
+    match rules::snapshot(cache_root) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!("mail rule store unavailable; continuing without rule overlay: {error}");
+            rules::empty_snapshot()
+        }
+    }
+}
+
 fn optional_bounded_string_field(
     payload: &Value,
     name: &str,
@@ -1972,6 +1985,7 @@ fn handle_ipc(
                         outbox::remove_account(&cache_dir(), &account.id)?;
                         drafts::remove_account(&cache_dir(), &account.id)?;
                         snooze::remove_account(&cache_dir(), &account.id)?;
+                        rules::remove_account(&cache_dir(), &account.id)?;
                         sync::remove_account_cache(&cache_dir(), &account.id)?;
                         delete_credential_if_present(&account.id).with_context(|| {
                             format!("remove credential for account {}", account.id)
@@ -2023,6 +2037,7 @@ fn handle_ipc(
                     outbox::remove_account(&cache_dir(), &id)?;
                     drafts::remove_account(&cache_dir(), &id)?;
                     snooze::remove_account(&cache_dir(), &id)?;
+                    rules::remove_account(&cache_dir(), &id)?;
                     sync::remove_account_cache(&cache_dir(), &id)?;
                     delete_credential_if_present(&id)?;
                     Ok(())
@@ -2581,6 +2596,7 @@ fn handle_ipc(
                     }
                 }
                 messages.sort_by(|left, right| right.received_at.cmp(&left.received_at));
+                rules::apply_to_messages(&active_mail_rules(&cache_dir()), &mut messages);
                 Ok(json!({
                     "messages": messages,
                     "truncated": truncated,
@@ -2610,7 +2626,9 @@ fn handle_ipc(
                         .map(|account| account.id.clone())
                         .collect::<Vec<_>>()
                 };
-                let result = cache_db::search_messages(&cache_dir(), &account_ids, &query, limit)?;
+                let mut result =
+                    cache_db::search_messages(&cache_dir(), &account_ids, &query, limit)?;
+                rules::apply_to_messages(&active_mail_rules(&cache_dir()), &mut result.messages);
                 Ok(json!({
                     "messages": result.messages,
                     "truncated": result.truncated,
@@ -2722,14 +2740,20 @@ fn handle_ipc(
                 let page =
                     sync::load_mailbox_page(&cache_dir(), &account_id, &folder, before_uid, limit)?;
                 match page {
-                    Some(page) => Ok(json!({
-                        "offline": true,
-                        "mailbox": page.mailbox,
-                        "localHasMore": page.local_has_more,
-                        "remoteHasMore": page.remote_has_more,
-                        "totalCached": page.total_cached,
-                        "revision": page.revision,
-                    })),
+                    Some(mut page) => {
+                        rules::apply_to_messages(
+                            &active_mail_rules(&cache_dir()),
+                            &mut page.mailbox.messages,
+                        );
+                        Ok(json!({
+                            "offline": true,
+                            "mailbox": page.mailbox,
+                            "localHasMore": page.local_has_more,
+                            "remoteHasMore": page.remote_has_more,
+                            "totalCached": page.total_cached,
+                            "revision": page.revision,
+                        }))
+                    }
                     None => Ok(json!({ "offline": false, "mailbox": null })),
                 }
             }
@@ -2741,8 +2765,9 @@ fn handle_ipc(
                 let account = account_for(shared, &account_id)?;
                 let cached_message =
                     sync::load_cached_message(&cache_dir(), &account_id, &folder, uid)?;
-                if let Some(message) = cached_message.as_ref() {
+                if let Some(mut message) = cached_message {
                     if !message.text_body.is_empty() || message.html_body.is_some() {
+                        rules::apply_to_message(&active_mail_rules(&cache_dir()), &mut message);
                         return Ok(json!({ "offline": true, "message": message }));
                     }
                 }
@@ -2753,7 +2778,7 @@ fn handle_ipc(
                 }
                 let profile = profile_for_account(&account)?;
                 let credential = load_credential(&account)?;
-                let detail = sync::fetch_message(
+                let mut detail = sync::fetch_message(
                     &account.id,
                     profile,
                     &account.email,
@@ -2767,9 +2792,38 @@ fn handle_ipc(
                 {
                     tracing::warn!(account_id = %account_id, uid, "save full message cache failed: {error}");
                 }
+                rules::apply_to_message(&active_mail_rules(&cache_dir()), &mut detail.message);
                 Ok(json!({ "offline": false, "message": detail.message }))
             }
-            "mail.snooze.snapshot" => Ok(serde_json::to_value(snooze::snapshot(&cache_dir())?)?),
+            "mail.rules.list" => Ok(serde_json::to_value(rules::snapshot(&cache_dir())?)?),
+            "mail.rules.add" => {
+                let account_id = optional_string_field(&message.payload, "accountId");
+                if let Some(account_id) = account_id.as_deref() {
+                    account_for(shared, account_id)?;
+                }
+                let kind = rules::MailRuleKind::parse(&bounded_string_field(
+                    &message.payload,
+                    "kind",
+                    16,
+                )?)?;
+                let value =
+                    bounded_string_field(&message.payload, "value", MAX_MAIL_RULE_VALUE_BYTES)?;
+                let (added, snapshot) = rules::add(&cache_dir(), account_id, kind, &value)?;
+                Ok(json!({ "added": added, "rules": snapshot.rules }))
+            }
+            "mail.rules.remove" => {
+                let id = bounded_string_field(&message.payload, "id", MAX_MAIL_RULE_ID_BYTES)?;
+                let (removed, snapshot) = rules::remove(&cache_dir(), &id)?;
+                Ok(json!({ "removed": removed, "rules": snapshot.rules }))
+            }
+            "mail.snooze.snapshot" => {
+                let mut snapshot = snooze::snapshot(&cache_dir())?;
+                let active_rules = active_mail_rules(&cache_dir());
+                for item in &mut snapshot.items {
+                    rules::apply_to_message(&active_rules, &mut item.message);
+                }
+                Ok(serde_json::to_value(snapshot)?)
+            }
             "mail.snooze" => {
                 let account_id = string_field(&message.payload, "accountId")?;
                 account_for(shared, &account_id)?;
@@ -2781,11 +2835,12 @@ fn handle_ipc(
                     / 1_000;
                 let cached = sync::load_cached_message(&cache_dir(), &account_id, &folder, uid)?
                     .ok_or_else(|| anyhow!("message is not available in the local cache"))?;
-                Ok(serde_json::to_value(snooze::schedule(
-                    &cache_dir(),
-                    cached,
-                    wake_at,
-                )?)?)
+                let mut snapshot = snooze::schedule(&cache_dir(), cached, wake_at)?;
+                let active_rules = active_mail_rules(&cache_dir());
+                for item in &mut snapshot.items {
+                    rules::apply_to_message(&active_rules, &mut item.message);
+                }
+                Ok(serde_json::to_value(snapshot)?)
             }
             "mail.unsnooze" => {
                 let account_id = string_field(&message.payload, "accountId")?;
@@ -2793,8 +2848,12 @@ fn handle_ipc(
                 let uid = u32_field(&message.payload, "uid")?;
                 let folder = optional_string_field(&message.payload, "folder")
                     .unwrap_or_else(|| "INBOX".to_string());
-                let (removed, snapshot) =
+                let (removed, mut snapshot) =
                     snooze::unsnooze(&cache_dir(), &account_id, &folder, uid)?;
+                let active_rules = active_mail_rules(&cache_dir());
+                for item in &mut snapshot.items {
+                    rules::apply_to_message(&active_rules, &mut item.message);
+                }
                 Ok(json!({
                     "removed": removed,
                     "items": snapshot.items,

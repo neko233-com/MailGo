@@ -6,6 +6,7 @@ import { AccountSignatureSettings } from './components/AccountSignatureSettings'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { ExternalLinkDialog } from './components/ExternalLinkDialog'
 import { Icon, type IconName } from './components/Icon'
+import { MailRuleManager } from './components/MailRuleManager'
 import { OutboxDetail } from './components/OutboxDetail'
 import { RecipientInput } from './components/RecipientInput'
 import { RichTextEditor } from './components/RichTextEditor'
@@ -17,6 +18,7 @@ import { folderLabels, providerDefinitions, sampleAccounts, sampleMails, sampleO
 import { mapWithConcurrency } from './lib/asyncPool'
 import { invoke, readNativeState } from './lib/ipc'
 import { inspectExternalLink, type ExternalLinkInspection } from './linkSafety'
+import { applyMailRules, domainFromSender } from './mailRules'
 import { mailNeedsBodyHydration, selectBodyHydrationCandidates } from './messageHydration'
 import { appendSignatureToComposeHtml, plainTextToComposeHtml, sanitizeComposeHtml } from './richText'
 import { appendAccountSignature, normalizeAccountSignature } from './signature'
@@ -24,7 +26,7 @@ import { formatScheduledAt } from './scheduleSend'
 import { formatSnoozeTime } from './snooze'
 import { buildMailThreads, type MailThread } from './threading'
 import { sanitizeHtml } from './htmlSafety'
-import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeConnectionDiagnostic, NativeConnectionDiagnosticChannel, NativeDeviceStartResponse, NativeDraft, NativeDraftAttachment, NativeLocalSearchResponse, NativeMailboxResponse, NativeMessageResponse, NativeOutboxActionResponse, NativeOutboxItem, NativeOutboxRecallResponse, NativeOutboxSnapshot, NativeQueueStatus, NativeSearchResponse, NativeSendResponse, NativeSnoozeSnapshot, NativeSyncItem, NativeSyncResponse, NativeUndoSendResponse, Provider, SmartCategory, ThemeMode } from './types'
+import type { FolderId, MailAccount, MailAttachment, MailMessage, MailRuleKind, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeConnectionDiagnostic, NativeConnectionDiagnosticChannel, NativeDeviceStartResponse, NativeDraft, NativeDraftAttachment, NativeLocalSearchResponse, NativeMailboxResponse, NativeMailRule, NativeMailRuleSnapshot, NativeMessageResponse, NativeOutboxActionResponse, NativeOutboxItem, NativeOutboxRecallResponse, NativeOutboxSnapshot, NativeQueueStatus, NativeSearchResponse, NativeSendResponse, NativeSnoozeSnapshot, NativeSyncItem, NativeSyncResponse, NativeUndoSendResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 type ToastTone = 'info' | 'success' | 'error'
 type UndoSendSeconds = 0 | 5 | 10 | 20 | 30
@@ -362,6 +364,8 @@ function nativeMessageToUi(message: NativeCachedMessage, account: MailAccount): 
     unread: message.unread,
     starred: message.starred,
     isAd: message.isAd,
+    blocked: message.blocked,
+    blockedRuleId: message.blockedRuleId,
     accent: account.accent,
     avatar: senderName.split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase() || '?',
     body: message.textBody
@@ -721,6 +725,10 @@ function App() {
   const [composeMode, setComposeMode] = useState<ComposeMode>('new')
   const [composeSource, setComposeSource] = useState<MailMessage | undefined>()
   const [isAccountModalOpen, setAccountModalOpen] = useState(false)
+  const [isMailRulesOpen, setMailRulesOpen] = useState(false)
+  const [mailRules, setMailRules] = useState<NativeMailRule[]>([])
+  const [mailRuleBusyKey, setMailRuleBusyKey] = useState<string | null>(null)
+  const [mailRuleError, setMailRuleError] = useState('')
   const [isAddingAccount, setAddingAccount] = useState(false)
   const [isAuthPanelOpen, setAuthPanelOpen] = useState(false)
   const [isSettingsOpen, setSettingsOpen] = useState(false)
@@ -1000,6 +1008,7 @@ function App() {
 
   const mapMailSources = (updater: (mail: MailMessage) => MailMessage) => {
     setMails((current) => current.map(updater))
+    setLocalSearchMails((current) => current.map(updater))
     setServerSearchMails((current) => current.map(updater))
     setSnoozedMails((current) => current.map((mail) => {
       const updated = updater(mail)
@@ -1012,6 +1021,83 @@ function App() {
   const filterMailSources = (predicate: (mail: MailMessage) => boolean) => {
     setMails((current) => current.filter(predicate))
     setServerSearchMails((current) => current.filter(predicate))
+  }
+
+  const applyRuleSnapshot = (nextRules: NativeMailRule[]) => {
+    setMailRules(nextRules)
+    mapMailSources((mail) => applyMailRules(mail, nextRules))
+  }
+
+  const refreshMailRules = async () => {
+    if (!isNativeRuntime) return
+    try {
+      const snapshot = await invoke<NativeMailRuleSnapshot>('mail.rules.list', {}, 15_000)
+      applyRuleSnapshot(snapshot.rules ?? [])
+      setMailRuleError('')
+    } catch (error) {
+      setMailRuleError(error instanceof Error ? error.message : '本机屏蔽规则暂时无法读取')
+    }
+  }
+
+  const addMailRule = async (accountId: string | undefined, kind: MailRuleKind, value: string) => {
+    if (mailRuleBusyKey) throw new Error('请等待当前规则操作完成')
+    setMailRuleBusyKey('add')
+    setMailRuleError('')
+    try {
+      if (isNativeRuntime) {
+        const snapshot = await invoke<NativeMailRuleSnapshot>('mail.rules.add', {
+          ...(accountId ? { accountId } : {}),
+          kind,
+          value,
+        }, 15_000)
+        applyRuleSnapshot(snapshot.rules ?? [])
+      } else {
+        const duplicate = mailRules.find((rule) => rule.accountId === accountId && rule.kind === kind && rule.value === value)
+        const nextRules = duplicate ? mailRules : [{ id: `demo-rule-${Date.now()}`, accountId, kind, value, createdAt: Date.now() }, ...mailRules]
+        applyRuleSnapshot(nextRules)
+      }
+      pushToast(kind === 'sender' ? '已屏蔽该发件人' : '已屏蔽该域名及其子域名', 'success')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '屏蔽规则保存失败'
+      setMailRuleError(message)
+      throw error
+    } finally {
+      setMailRuleBusyKey(null)
+    }
+  }
+
+  const removeMailRule = async (rule: NativeMailRule) => {
+    if (mailRuleBusyKey) return
+    setMailRuleBusyKey(rule.id)
+    setMailRuleError('')
+    try {
+      if (isNativeRuntime) {
+        const snapshot = await invoke<NativeMailRuleSnapshot>('mail.rules.remove', { id: rule.id }, 15_000)
+        applyRuleSnapshot(snapshot.rules ?? [])
+      } else {
+        applyRuleSnapshot(mailRules.filter((item) => item.id !== rule.id))
+      }
+      pushToast('屏蔽规则已移除', 'success')
+    } catch (error) {
+      setMailRuleError(error instanceof Error ? error.message : '屏蔽规则移除失败')
+    } finally {
+      setMailRuleBusyKey(null)
+    }
+  }
+
+  const blockMail = async (mail: MailMessage, kind: MailRuleKind) => {
+    if (mail.id === 'empty-mail') return
+    const value = kind === 'sender' ? mail.from : domainFromSender(mail.from)
+    setOpenMenu(null)
+    if (!value) {
+      pushToast('这封邮件没有可用于屏蔽的有效发件地址', 'error')
+      return
+    }
+    try {
+      await addMailRule(mail.accountId, kind, value)
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : '屏蔽规则保存失败', 'error')
+    }
   }
 
   const handleDraftChanged = useCallback((draft: NativeDraft) => {
@@ -1173,6 +1259,7 @@ function App() {
       void refreshOutbox(nativeState.accounts)
       void refreshSnoozed(nativeState.accounts)
       void refreshNativeDrafts(nativeState.accounts)
+      void refreshMailRules()
       if (!isNativeRuntime) return
       let firstMailboxSettled = false
       if (!nativeState.accounts.length) setMailboxHydrating(false)
@@ -1461,6 +1548,7 @@ function App() {
         }
         return
       }
+      if (document.querySelector('.mail-rule-modal')) return
       const eventTarget = event.target instanceof HTMLElement ? event.target : null
       const isEditableTarget = Boolean(eventTarget?.matches('input, textarea, select, [contenteditable="true"]'))
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
@@ -1523,7 +1611,7 @@ function App() {
   const unreadNativeFolderCounts = useMemo(() => {
     const counts = new Map<string, number>()
     for (const mail of allMails) {
-      if (!mail.unread || !mail.nativeFolder || mail.snoozedUntil != null) continue
+      if (!mail.unread || mail.blocked || !mail.nativeFolder || mail.snoozedUntil != null) continue
       const key = nativeFolderCountKey(mail.accountId, mail.nativeFolder)
       counts.set(key, (counts.get(key) ?? 0) + 1)
     }
@@ -1554,16 +1642,18 @@ function App() {
           ? snoozedMails.length
         : folder.id === 'drafts'
           ? visibleNativeDrafts.length
-        : allMails.filter((mail) => mail.snoozedUntil == null && matchesFixedFolder(mail, folder.id) && mail.unread).length,
+        : allMails.filter((mail) => !mail.blocked && mail.snoozedUntil == null && matchesFixedFolder(mail, folder.id) && mail.unread).length,
     }))
   }, [accountsById, allMails, isNativeRuntime, nativeOutboxItems.length, snoozedMails.length, visibleNativeDrafts.length])
   const displayedAccountUnreadCounts = useMemo(() => {
-    const snoozedUnread = new Map<string, number>()
-    for (const mail of snoozedMails) {
-      if (mail.unread) snoozedUnread.set(mail.accountId, (snoozedUnread.get(mail.accountId) ?? 0) + 1)
+    const hiddenUnread = new Map<string, number>()
+    for (const mail of allMails) {
+      if (mail.unread && (mail.blocked || mail.snoozedUntil != null)) {
+        hiddenUnread.set(mail.accountId, (hiddenUnread.get(mail.accountId) ?? 0) + 1)
+      }
     }
-    return new Map(accounts.map((account) => [account.id, Math.max(0, account.unread - (snoozedUnread.get(account.id) ?? 0))]))
-  }, [accounts, snoozedMails])
+    return new Map(accounts.map((account) => [account.id, Math.max(0, account.unread - (hiddenUnread.get(account.id) ?? 0))]))
+  }, [accounts, allMails])
   const visibleMails = useMemo(() => {
     const lowerQuery = deferredQuery.trim().toLowerCase()
     return allMails.filter((mail) => {
@@ -1585,15 +1675,16 @@ function App() {
             })()
       const accountMatch = selectedNativeFolder ? true : !selectedAccountId || mail.accountId === selectedAccountId
       const categoryMatch = !selectedCategory || (selectedCategory === 'ads'
-        ? mail.category === 'ads' || mail.category === 'apple-ads'
+        ? mail.blocked || mail.category === 'ads' || mail.category === 'apple-ads'
         : mail.category === selectedCategory)
       const adMatch = !hideAds || !mail.isAd || Boolean(selectedCategory)
+      const blockMatch = !mail.blocked || selectedCategory === 'ads'
       const unreadMatch = !filterUnread || mail.unread
       const queryMatch = !lowerQuery
         || nativeSearchResultIds.has(mail.id)
         || `${mail.senderName} ${mail.subject} ${mail.preview}`.toLowerCase().includes(lowerQuery)
       const snoozeMatch = selectedFolder === 'snoozed' ? snoozed : !snoozed
-      return folderMatch && snoozeMatch && accountMatch && categoryMatch && adMatch && unreadMatch && queryMatch
+      return folderMatch && snoozeMatch && accountMatch && categoryMatch && adMatch && blockMatch && unreadMatch && queryMatch
     })
   }, [accountsById, allMails, deferredQuery, filterUnread, hideAds, nativeSearchResultIds, selectedAccountId, selectedCategory, selectedFolder, selectedNativeFolder])
 
@@ -2879,6 +2970,7 @@ function App() {
       setMailboxMeta((current) => Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${account.id}::`))))
       setConnectionDiagnostics((current) => Object.fromEntries(Object.entries(current).filter(([accountId]) => accountId !== account.id)))
       setSelectedAccountId((current) => current === account.id ? null : current)
+      applyRuleSnapshot(mailRules.filter((rule) => rule.accountId !== account.id))
       setEditingAccountId(null)
       closeAccountModal()
       pushToast(`${account.label} 已移除，本机凭据与缓存已清理`, 'success')
@@ -2979,12 +3071,14 @@ function App() {
         void refreshOutbox(nextAccounts)
         void refreshSnoozed(nextAccounts)
         void refreshNativeDrafts(nextAccounts)
+        void refreshMailRules()
         pushToast(`已导入 ${result.imported} 个账户，请逐一补充授权码`, 'success')
       } else {
         setAccounts((current) => [...current.filter((account) => !importedIds.has(account.id)), ...imported])
         setNativeFolders((current) => Object.fromEntries(Object.entries(current).filter(([accountId]) => !importedIds.has(accountId))))
         setNativeFolderLabels((current) => Object.fromEntries(Object.entries(current).filter(([accountId]) => !importedIds.has(accountId))))
         setMails((current) => current.filter((mail) => !importedIds.has(mail.accountId)))
+        applyRuleSnapshot(mailRules.filter((rule) => !rule.accountId || !importedIds.has(rule.accountId)))
         pushToast(`已导入 ${imported.length} 个账户，请逐一补充授权码`, 'success')
       }
     } catch (error) {
@@ -3284,6 +3378,7 @@ function App() {
                   {selectedMail.snoozedUntil && <button type="button" role="menuitem" disabled={snoozeActionId === selectedMail.id} onClick={() => { setOpenMenu(null); void unsnoozeMail(selectedMail) }}><Icon name="clock" size={16} />取消稍后处理</button>}
                   {selectedMail.folder !== 'inbox' && <button type="button" role="menuitem" onClick={() => { setOpenMenu(null); void runMove(selectedMail, 'inbox') }}><Icon name="inbox" size={16} />移回收件箱</button>}
                   {selectedMailMoveTargets.length > 0 && <div className="action-menu-section"><span className="action-menu-label">移动到</span>{selectedMailMoveTargets.map((target) => <button key={target.folder} type="button" role="menuitem" onClick={() => { setOpenMenu(null); void runMoveToFolder(selectedMail, target) }}><Icon name={target.icon} size={16} />{target.label}</button>)}</div>}
+                  <div className="action-menu-section"><span className="action-menu-label">智能屏蔽</span>{selectedMail.blocked ? <button type="button" role="menuitem" onClick={() => { setOpenMenu(null); setMailRuleError(''); setMailRulesOpen(true) }}><Icon name="shieldCheck" size={16} />管理命中的屏蔽规则</button> : <><button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail' || Boolean(mailRuleBusyKey)} onClick={() => { void blockMail(selectedMail, 'sender') }}><Icon name="user" size={16} />屏蔽此发件人</button><button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail' || !domainFromSender(selectedMail.from) || Boolean(mailRuleBusyKey)} onClick={() => { void blockMail(selectedMail, 'domain') }}><Icon name="link" size={16} />屏蔽该发件域名</button></>}</div>
                   <button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail'} onClick={() => { void copySelectedMessage() }}><Icon name="copy" size={16} />复制邮件正文</button>
                   <button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail'} onClick={() => { setOpenMenu(null); window.print() }}><Icon name="document" size={16} />打印邮件</button>
                 </div>}
@@ -3291,7 +3386,7 @@ function App() {
             </div>
           </div>
           <div className="reading-scroll">
-            <div className="reading-heading"><div><h1>{selectedMail.subject}</h1><div className="message-tags"><span className="tag tag-account"><ProviderMark provider={selectedMailAccount?.provider ?? 'google'} size="sm" /> {selectedMailAccount?.label ?? 'Google'}</span>{selectedThread && selectedThread.messages.length > 1 && <span className="tag"><Icon name="message" size={13} />{selectedThread.messages.length} 封会话</span>}{selectedMail.snoozedUntil && <span className="tag tag-snoozed"><Icon name="clock" size={13} />{formatSnoozeTime(selectedMail.snoozedUntil * 1_000)} 提醒</span>}{selectedMail.hasHtml && <span className="tag">HTML 邮件</span>}</div></div><TooltipButton label={selectedMail.starred ? '取消星标' : '添加星标'} className={`reading-star ${selectedMail.starred ? 'is-starred' : ''}`} onClick={() => toggleStar(selectedMail)}><Icon name="star" size={24} weight={selectedMail.starred ? 'Filled' : 'Outline'} /></TooltipButton></div>
+            <div className="reading-heading"><div><h1>{selectedMail.subject}</h1><div className="message-tags"><span className="tag tag-account"><ProviderMark provider={selectedMailAccount?.provider ?? 'google'} size="sm" /> {selectedMailAccount?.label ?? 'Google'}</span>{selectedThread && selectedThread.messages.length > 1 && <span className="tag"><Icon name="message" size={13} />{selectedThread.messages.length} 封会话</span>}{selectedMail.snoozedUntil && <span className="tag tag-snoozed"><Icon name="clock" size={13} />{formatSnoozeTime(selectedMail.snoozedUntil * 1_000)} 提醒</span>}{selectedMail.blocked && <span className="tag tag-blocked"><Icon name="shieldCheck" size={13} />已按本机规则屏蔽</span>}{selectedMail.hasHtml && <span className="tag">HTML 邮件</span>}</div></div><TooltipButton label={selectedMail.starred ? '取消星标' : '添加星标'} className={`reading-star ${selectedMail.starred ? 'is-starred' : ''}`} onClick={() => toggleStar(selectedMail)}><Icon name="star" size={24} weight={selectedMail.starred ? 'Filled' : 'Outline'} /></TooltipButton></div>
             <ConversationStack thread={selectedThread} selectedId={selectedMail.id} loadingId={loadingMessageId} onSelect={(mail) => { void selectMail(mail) }} />
             <div className="sender-row"><Avatar message={selectedMail} size="lg" /><div className="sender-copy"><div><strong>{selectedMail.senderName}</strong> <span>&lt;{selectedMail.from}&gt;</span></div><div className="recipient">收件人： {selectedMailAccount?.label ?? '当前账户'} &lt;{selectedMailAccount?.email ?? '—'}&gt;</div></div><time>{selectedMail.timestamp}<br /><span>今天</span></time><TooltipButton label="发件人更多信息"><Icon name="more" size={19} /></TooltipButton></div>
             {loadingMessageId === selectedMail.id && <div className="reading-loading-strip" role="status"><span className="loading-spinner" aria-hidden="true" /><span><strong>正在补全邮件正文</strong>列表和已缓存摘要仍可继续浏览</span></div>}
@@ -3326,6 +3421,7 @@ function App() {
           <label className="settings-row settings-select-row"><span><Icon name="clock" size={17} /><span>撤销发送<small>{undoSendSeconds === 0 ? '关闭后立即连接邮件服务器发送' : `发送后保留 ${undoSendSeconds} 秒撤销窗口`}</small></span></span><select aria-label="撤销发送等待时间" value={undoSendSeconds} onChange={(event) => handleUndoSendSecondsChange(asUndoSendSeconds(Number(event.target.value)))}><option value={0}>关闭</option><option value={5}>5 秒</option><option value={10}>10 秒</option><option value={20}>20 秒</option><option value={30}>30 秒</option></select></label>
           <label className="settings-row css-row"><span><Icon name="brush" size={17} /><span>用户 CSS<small>{sanitizedCustomCss.removedUnsafeSyntax ? '已过滤外部资源与危险语法' : '可覆盖 MailGo 视觉变量；不加载外部资源'}</small></span></span><textarea value={customCss} onChange={(event) => setCustomCss(event.target.value)} placeholder="例如：:root { --accent: #ff6b8a; }" /></label>
           <AccountSignatureSettings accounts={accounts} initialAccountId={selectedAccountId} onSave={saveAccountSignature} />
+          <div className="settings-row"><span><Icon name="shieldCheck" size={17} /><span>屏蔽规则<small>{mailRules.length ? `${mailRules.length} 条 · 加密保存在本机` : '按发件人或域名过滤，不上传云端'}</small></span></span><button type="button" className="settings-text-button" onClick={() => { setSettingsOpen(false); setMailRuleError(''); setMailRulesOpen(true) }}>管理</button></div>
           <div className="settings-row"><span><Icon name="cloud" size={17} /><span>关闭时后台运行<small>最小化到系统托盘并继续同步</small></span></span><button type="button" className={`toggle-switch ${minimizeToTray ? 'is-on' : ''}`} onClick={() => { const next = !minimizeToTray; setMinimizeToTray(next); void invoke('app.set_minimize_to_tray', { enabled: next }).catch(() => undefined) }}><span /></button></div>
           <div className="settings-row"><span><Icon name="image" size={17} /><span>加载远程图片<small>{remoteImagesEnabled ? '已允许 HTTPS 图片，可能包含追踪像素' : '默认屏蔽，保护隐私；CID 内嵌图片不受影响'}</small></span></span><button type="button" aria-label="加载远程图片" className={`toggle-switch ${remoteImagesEnabled ? 'is-on' : ''}`} onClick={() => { const next = !remoteImagesEnabled; setRemoteImagesEnabled(next); void invoke('app.set_remote_images', { enabled: next }).catch(() => undefined) }}><span /></button></div>
           <div className="settings-row"><span><Icon name="bell" size={17} /><span>后台新邮件提醒<small>窗口隐藏时发送 Windows 托盘通知</small></span></span><button type="button" aria-label="后台新邮件提醒" className={`toggle-switch ${notificationsEnabled ? 'is-on' : ''}`} onClick={() => { const next = !notificationsEnabled; setNotificationsEnabled(next); void invoke('app.set_notifications', { enabled: next }).catch(() => undefined) }}><span /></button></div>
@@ -3336,6 +3432,7 @@ function App() {
       </AnimatePresence>
 
       <AnimatePresence>{isHelpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}</AnimatePresence>
+      <AnimatePresence>{isMailRulesOpen && <MailRuleManager accounts={accounts} rules={mailRules} initialAccountId={selectedAccountId} busyKey={mailRuleBusyKey} externalError={mailRuleError} onAdd={addMailRule} onRemove={removeMailRule} onClose={() => { if (!mailRuleBusyKey) setMailRulesOpen(false) }} />}</AnimatePresence>
       <AnimatePresence>{pendingExternalLink && <ExternalLinkDialog inspection={pendingExternalLink} onClose={() => setPendingExternalLink(null)} onOpen={openExternalUrl} onError={(message) => pushToast(message, 'error')} />}</AnimatePresence>
       <AnimatePresence>{pendingOutboxDiscard && <ConfirmDialog
         title="删除这封待发送邮件？"

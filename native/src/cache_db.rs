@@ -3530,6 +3530,8 @@ mod tests {
             starred: false,
             category: SmartCategory::Inbox,
             is_ad: false,
+            blocked: false,
+            blocked_rule_id: None,
             preview: "preview".into(),
             text_body: String::new(),
             html_body: None,
