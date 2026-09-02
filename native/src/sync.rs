@@ -46,10 +46,17 @@ const MAX_SEARCH_RESULTS_PER_FOLDER: usize = 40;
 const MAX_SEARCH_RESULTS_PER_ACCOUNT: usize = 240;
 const MAX_MUTATIONS: usize = 1_000;
 const MAX_MUTATION_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ACCOUNT_ATTACHMENT_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_GLOBAL_ATTACHMENT_CACHE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_ATTACHMENT_CACHE_SCAN_ENTRIES: usize = 1_000_000;
 const MAX_DELTA_HEADER_UIDS: usize = MAX_HEADER_MESSAGES;
 const MAX_DELTA_VANISHED_RANGES: usize = MAX_CACHED_MESSAGES_PER_FOLDER;
 const IMAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const IMAP_IO_TIMEOUT: Duration = Duration::from_secs(60);
+const IMAP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+const IMAP_IDLE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(29 * 60);
+const MAX_IMAP_RESPONSE_BYTES: usize = 80 * 1024 * 1024;
+const MAX_IMAP_IDLE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const STARTTLS_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_STARTTLS_LINE_BYTES: usize = 64 * 1024;
 const MAX_STARTTLS_RESPONSE_BYTES: usize = 256 * 1024;
@@ -77,10 +84,18 @@ const CACHE_ENCRYPTION_KEY_BYTES: usize = 32;
 static CACHE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CACHE_ENCRYPTION_KEY: OnceLock<Mutex<Option<[u8; CACHE_ENCRYPTION_KEY_BYTES]>>> =
     OnceLock::new();
+static ATTACHMENT_CACHE_USAGE: OnceLock<Mutex<HashMap<PathBuf, AttachmentCacheUsage>>> =
+    OnceLock::new();
 type BodySessionSlot = Arc<Mutex<Option<PooledBodySession>>>;
 type BodySessionRegistry = HashMap<String, BodySessionSlot>;
 
 static BODY_SESSIONS: OnceLock<Mutex<BodySessionRegistry>> = OnceLock::new();
+
+#[derive(Debug, Clone, Default)]
+struct AttachmentCacheUsage {
+    global_bytes: u64,
+    account_bytes: HashMap<String, u64>,
+}
 
 pub(crate) fn map_with_concurrency<T, R, F>(items: &[T], concurrency: usize, task: F) -> Vec<R>
 where
@@ -245,22 +260,83 @@ enum IncrementalMode {
 
 struct BoundedImapStream<T> {
     inner: T,
+    response_bytes: usize,
+    response_byte_limit: usize,
+    response_deadline: Instant,
+    requested_read_timeout: Duration,
 }
 
 impl<T> BoundedImapStream<T> {
     fn new(inner: T) -> Self {
-        Self { inner }
+        Self::with_limits(inner, MAX_IMAP_RESPONSE_BYTES, IMAP_RESPONSE_TIMEOUT)
+    }
+
+    fn with_limits(inner: T, response_byte_limit: usize, response_timeout: Duration) -> Self {
+        Self {
+            inner,
+            response_bytes: 0,
+            response_byte_limit,
+            response_deadline: Instant::now() + response_timeout,
+            requested_read_timeout: IMAP_IO_TIMEOUT,
+        }
+    }
+
+    fn reset_response_budget(&mut self, idle: bool) {
+        self.response_bytes = 0;
+        self.response_byte_limit = if idle {
+            MAX_IMAP_IDLE_RESPONSE_BYTES
+        } else {
+            MAX_IMAP_RESPONSE_BYTES
+        };
+        self.response_deadline = Instant::now()
+            + if idle {
+                IMAP_IDLE_RESPONSE_TIMEOUT
+            } else {
+                IMAP_RESPONSE_TIMEOUT
+            };
+    }
+
+    fn remaining_response_time(&self) -> std::io::Result<Duration> {
+        self.response_deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "IMAP response exceeded the absolute time limit",
+                )
+            })
     }
 }
 
-impl<T: Read> Read for BoundedImapStream<T> {
+impl<T: Read + SetReadTimeout> Read for BoundedImapStream<T> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.inner.read(buffer)
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let remaining_bytes = self.response_byte_limit.saturating_sub(self.response_bytes);
+        if remaining_bytes == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "IMAP response exceeded the byte limit",
+            ));
+        }
+        let remaining_time = self.remaining_response_time()?;
+        self.inner
+            .set_read_timeout(Some(self.requested_read_timeout.min(remaining_time)))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let bounded_length = buffer.len().min(remaining_bytes);
+        let read = self.inner.read(&mut buffer[..bounded_length])?;
+        self.response_bytes = self.response_bytes.saturating_add(read);
+        Ok(read)
     }
 }
 
 impl<T: Write> Write for BoundedImapStream<T> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if let Some(idle) = starts_tagged_imap_command(buffer) {
+            self.reset_response_budget(idle);
+        }
         self.inner.write(buffer)
     }
 
@@ -271,9 +347,66 @@ impl<T: Write> Write for BoundedImapStream<T> {
 
 impl<T: SetReadTimeout> SetReadTimeout for BoundedImapStream<T> {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> imap::error::Result<()> {
+        self.requested_read_timeout = timeout.unwrap_or(IMAP_IO_TIMEOUT).min(IMAP_IO_TIMEOUT);
+        let remaining = self
+            .remaining_response_time()
+            .map_err(imap::error::Error::Io)?;
         self.inner
-            .set_read_timeout(timeout.or(Some(IMAP_IO_TIMEOUT)))
+            .set_read_timeout(Some(self.requested_read_timeout.min(remaining)))
     }
+}
+
+fn starts_tagged_imap_command(buffer: &[u8]) -> Option<bool> {
+    let line = buffer.split(|byte| matches!(byte, b'\r' | b'\n')).next()?;
+    if !line.is_ascii() {
+        return None;
+    }
+    let mut words = line.split(|byte| byte.is_ascii_whitespace());
+    let tag = words.find(|word| !word.is_empty())?;
+    let command = words.find(|word| !word.is_empty())?;
+    if tag.is_empty()
+        || tag.len() > 32
+        || !tag[0].is_ascii_alphanumeric()
+        || !tag
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    const COMMANDS: &[&[u8]] = &[
+        b"APPEND",
+        b"AUTHENTICATE",
+        b"CAPABILITY",
+        b"CHECK",
+        b"CLOSE",
+        b"COPY",
+        b"CREATE",
+        b"DELETE",
+        b"ENABLE",
+        b"EXAMINE",
+        b"EXPUNGE",
+        b"FETCH",
+        b"IDLE",
+        b"LIST",
+        b"LOGIN",
+        b"LOGOUT",
+        b"LSUB",
+        b"MOVE",
+        b"NOOP",
+        b"RENAME",
+        b"SEARCH",
+        b"SELECT",
+        b"SORT",
+        b"STATUS",
+        b"STORE",
+        b"SUBSCRIBE",
+        b"UID",
+        b"UNSUBSCRIBE",
+    ];
+    COMMANDS
+        .iter()
+        .any(|candidate| command.eq_ignore_ascii_case(candidate))
+        .then(|| command.eq_ignore_ascii_case(b"IDLE"))
 }
 
 fn connect(profile: &ProviderProfile) -> Result<imap::Client<imap::Connection>> {
@@ -2788,23 +2921,90 @@ fn store_attachment_payloads(
     message: &mut CachedMessage,
     payloads: &[crate::mail::AttachmentPayload],
 ) -> Result<()> {
+    let _write_guard = cache_write_guard();
+    let account_component = safe_component(account_id);
+    let mut usage = attachment_usage_snapshot(cache_root)?;
+    let existing = attachment_artifacts_for_uid(cache_root, account_id, folder, uid)?;
+    let existing_bytes = artifact_bytes(&existing);
+    let encrypted_payloads = payloads
+        .iter()
+        .map(|payload| protect_cache(&payload.bytes))
+        .collect::<Result<Vec<_>>>()?;
+    let replacement_bytes = encrypted_payloads.iter().fold(0_u64, |total, payload| {
+        total.saturating_add(payload.len() as u64)
+    });
+    ensure_attachment_quota(
+        &usage,
+        &account_component,
+        existing_bytes,
+        replacement_bytes,
+    )?;
+
     if payloads.is_empty() {
+        let removed = remove_attachment_artifacts(&existing)?;
+        apply_attachment_usage_delta(&mut usage, &account_component, removed, 0);
+        store_attachment_usage(cache_root, usage)?;
         return Ok(());
     }
-    let directory = cache_root
-        .join(safe_component(account_id))
-        .join("attachments")
-        .join(cache_folder_component(folder));
+
+    let directory = attachment_directory(cache_root, account_id, folder);
     fs::create_dir_all(&directory).with_context(|| format!("create {}", directory.display()))?;
-    for (index, payload) in payloads.iter().enumerate() {
-        let path = directory.join(format!("{uid}-{index}.bin"));
-        let temporary = directory.join(format!("{uid}-{index}.bin.tmp"));
-        let encrypted = protect_cache(&payload.bytes)?;
-        fs::write(&temporary, encrypted).context("write cached attachment")?;
-        if path.exists() {
-            fs::remove_file(&path).context("replace cached attachment")?;
+    let transaction = rand::random::<u64>();
+    let mut staged = Vec::with_capacity(encrypted_payloads.len());
+    for (index, encrypted) in encrypted_payloads.iter().enumerate() {
+        let temporary = directory.join(format!("{uid}-{index}.bin.stage-{transaction:016x}"));
+        if let Err(error) = fs::write(&temporary, encrypted).context("write cached attachment") {
+            remove_attachment_artifacts(&staged).ok();
+            return Err(error);
         }
-        fs::rename(&temporary, &path).context("commit cached attachment")?;
+        staged.push(temporary);
+    }
+
+    let mut backups = Vec::new();
+    for index in 0..encrypted_payloads.len() {
+        let final_path = directory.join(format!("{uid}-{index}.bin"));
+        if final_path.exists() {
+            let backup = directory.join(format!("{uid}-{index}.bin.backup-{transaction:016x}"));
+            if let Err(error) = fs::rename(&final_path, &backup) {
+                rollback_attachment_transaction(&staged, &backups);
+                return Err(error).context("stage previous cached attachment");
+            }
+            backups.push((backup, final_path));
+        }
+    }
+
+    let mut committed = Vec::new();
+    for (index, temporary) in staged.iter().enumerate() {
+        let final_path = directory.join(format!("{uid}-{index}.bin"));
+        if let Err(error) = fs::rename(temporary, &final_path) {
+            remove_attachment_artifacts(&committed).ok();
+            rollback_attachment_transaction(&staged, &backups);
+            invalidate_attachment_usage(cache_root);
+            return Err(error).context("commit cached attachment");
+        }
+        committed.push(final_path);
+    }
+
+    let committed_set = committed.iter().collect::<HashSet<_>>();
+    let stale = existing
+        .iter()
+        .filter(|path| !committed_set.contains(path))
+        .cloned()
+        .chain(backups.iter().map(|(backup, _)| backup.clone()))
+        .collect::<Vec<_>>();
+    if let Err(error) = remove_attachment_artifacts(&stale) {
+        invalidate_attachment_usage(cache_root);
+        return Err(error);
+    }
+    apply_attachment_usage_delta(
+        &mut usage,
+        &account_component,
+        existing_bytes,
+        replacement_bytes,
+    );
+    store_attachment_usage(cache_root, usage)?;
+
+    for (index, path) in committed.into_iter().enumerate() {
         if let Some(attachment) = message
             .attachments
             .iter_mut()
@@ -2814,6 +3014,228 @@ fn store_attachment_payloads(
         }
     }
     Ok(())
+}
+
+fn attachment_directory(cache_root: &Path, account_id: &str, folder: &str) -> PathBuf {
+    cache_root
+        .join(safe_component(account_id))
+        .join("attachments")
+        .join(cache_folder_component(folder))
+}
+
+fn attachment_directories(cache_root: &Path, account_id: &str, folder: &str) -> Vec<PathBuf> {
+    let current = attachment_directory(cache_root, account_id, folder);
+    let legacy = cache_root
+        .join(safe_component(account_id))
+        .join("attachments")
+        .join(legacy_folder_component(folder));
+    if legacy == current {
+        vec![current]
+    } else {
+        vec![current, legacy]
+    }
+}
+
+fn attachment_artifacts_for_uid(
+    cache_root: &Path,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+) -> Result<Vec<PathBuf>> {
+    let prefix = format!("{uid}-");
+    let mut artifacts = Vec::new();
+    for directory in attachment_directories(cache_root, account_id, folder) {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read attachment cache {}", directory.display()))
+            }
+        };
+        for entry in entries {
+            let entry = entry.context("read attachment cache entry")?;
+            let file_type = entry
+                .file_type()
+                .context("inspect attachment cache entry")?;
+            let name = entry.file_name();
+            if (file_type.is_file() || file_type.is_symlink())
+                && name.to_string_lossy().starts_with(&prefix)
+            {
+                artifacts.push(entry.path());
+            }
+        }
+    }
+    Ok(artifacts)
+}
+
+fn artifact_bytes(paths: &[PathBuf]) -> u64 {
+    paths.iter().fold(0_u64, |total, path| {
+        total.saturating_add(fs::symlink_metadata(path).map_or(0, |metadata| metadata.len()))
+    })
+}
+
+fn remove_attachment_artifacts(paths: &[PathBuf]) -> Result<u64> {
+    let mut removed = 0_u64;
+    for path in paths {
+        let bytes = fs::symlink_metadata(path).map_or(0, |metadata| metadata.len());
+        match fs::remove_file(path) {
+            Ok(()) => removed = removed.saturating_add(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("remove cached attachment {}", path.display()))
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn rollback_attachment_transaction(staged: &[PathBuf], backups: &[(PathBuf, PathBuf)]) {
+    remove_attachment_artifacts(staged).ok();
+    for (backup, original) in backups.iter().rev() {
+        if !original.exists() {
+            fs::rename(backup, original).ok();
+        }
+    }
+}
+
+fn ensure_attachment_quota(
+    usage: &AttachmentCacheUsage,
+    account_component: &str,
+    replaced_bytes: u64,
+    replacement_bytes: u64,
+) -> Result<()> {
+    let current_account = usage
+        .account_bytes
+        .get(account_component)
+        .copied()
+        .unwrap_or_default();
+    let next_account = current_account
+        .saturating_sub(replaced_bytes)
+        .saturating_add(replacement_bytes);
+    let next_global = usage
+        .global_bytes
+        .saturating_sub(replaced_bytes)
+        .saturating_add(replacement_bytes);
+    if next_account > MAX_ACCOUNT_ATTACHMENT_CACHE_BYTES {
+        return Err(anyhow!("account attachment cache quota exceeded"));
+    }
+    if next_global > MAX_GLOBAL_ATTACHMENT_CACHE_BYTES {
+        return Err(anyhow!("global attachment cache quota exceeded"));
+    }
+    Ok(())
+}
+
+fn apply_attachment_usage_delta(
+    usage: &mut AttachmentCacheUsage,
+    account_component: &str,
+    removed_bytes: u64,
+    added_bytes: u64,
+) {
+    usage.global_bytes = usage
+        .global_bytes
+        .saturating_sub(removed_bytes)
+        .saturating_add(added_bytes);
+    let account = usage
+        .account_bytes
+        .entry(account_component.to_string())
+        .or_default();
+    *account = account
+        .saturating_sub(removed_bytes)
+        .saturating_add(added_bytes);
+}
+
+fn attachment_usage_snapshot(cache_root: &Path) -> Result<AttachmentCacheUsage> {
+    let cache = ATTACHMENT_CACHE_USAGE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(usage) = cache
+        .lock()
+        .map_err(|_| anyhow!("attachment cache usage lock poisoned"))?
+        .get(cache_root)
+        .cloned()
+    {
+        return Ok(usage);
+    }
+    let scanned = scan_attachment_usage(cache_root)?;
+    let mut cache = cache
+        .lock()
+        .map_err(|_| anyhow!("attachment cache usage lock poisoned"))?;
+    Ok(cache
+        .entry(cache_root.to_path_buf())
+        .or_insert(scanned)
+        .clone())
+}
+
+fn store_attachment_usage(cache_root: &Path, usage: AttachmentCacheUsage) -> Result<()> {
+    ATTACHMENT_CACHE_USAGE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| anyhow!("attachment cache usage lock poisoned"))?
+        .insert(cache_root.to_path_buf(), usage);
+    Ok(())
+}
+
+fn invalidate_attachment_usage(cache_root: &Path) {
+    if let Some(cache) = ATTACHMENT_CACHE_USAGE.get() {
+        if let Ok(mut cache) = cache.lock() {
+            cache.remove(cache_root);
+        }
+    }
+}
+
+fn scan_attachment_usage(cache_root: &Path) -> Result<AttachmentCacheUsage> {
+    let mut usage = AttachmentCacheUsage::default();
+    let accounts = match fs::read_dir(cache_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(usage),
+        Err(error) => return Err(error).context("read attachment cache root"),
+    };
+    let mut scanned_entries = 0usize;
+    for account in accounts {
+        let account = account.context("read attachment account cache")?;
+        if !account
+            .file_type()
+            .context("inspect attachment account cache")?
+            .is_dir()
+        {
+            continue;
+        }
+        let account_component = account.file_name().to_string_lossy().to_string();
+        let attachments = account.path().join("attachments");
+        let mut pending = vec![attachments];
+        let mut account_bytes = 0_u64;
+        while let Some(directory) = pending.pop() {
+            let entries = match fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("read attachment cache {}", directory.display()))
+                }
+            };
+            for entry in entries {
+                scanned_entries = scanned_entries.saturating_add(1);
+                if scanned_entries > MAX_ATTACHMENT_CACHE_SCAN_ENTRIES {
+                    usage.global_bytes = MAX_GLOBAL_ATTACHMENT_CACHE_BYTES.saturating_add(1);
+                    return Ok(usage);
+                }
+                let entry = entry.context("read attachment cache entry")?;
+                let file_type = entry
+                    .file_type()
+                    .context("inspect attachment cache entry")?;
+                if file_type.is_dir() {
+                    pending.push(entry.path());
+                } else if file_type.is_file() || file_type.is_symlink() {
+                    account_bytes = account_bytes.saturating_add(
+                        fs::symlink_metadata(entry.path()).map_or(0, |metadata| metadata.len()),
+                    );
+                }
+            }
+        }
+        usage.global_bytes = usage.global_bytes.saturating_add(account_bytes);
+        usage.account_bytes.insert(account_component, account_bytes);
+    }
+    Ok(usage)
 }
 
 pub fn load_attachment_data(
@@ -2973,16 +3395,19 @@ fn load_mailbox_file(
 }
 
 pub fn remove_account_cache(cache_root: &Path, account_id: &str) -> Result<()> {
+    let _write_guard = cache_write_guard();
     clear_body_session(account_id);
     crate::cache_db::remove_account(cache_root, account_id)?;
     let directory = cache_root.join(safe_component(account_id));
-    match fs::remove_dir_all(&directory) {
+    let result = match fs::remove_dir_all(&directory) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => {
             Err(error).with_context(|| format!("remove account cache {}", directory.display()))
         }
-    }
+    };
+    invalidate_attachment_usage(cache_root);
+    result
 }
 
 pub fn load_cached_message(
@@ -3059,7 +3484,9 @@ fn save_search_messages(
         &now_stamp(),
         messages,
         MAX_CACHED_MESSAGES_PER_FOLDER,
-    )
+    )?;
+    reconcile_attachment_folder_from_db_unlocked(cache_root, account_id, folder)?;
+    Ok(())
 }
 
 pub fn update_cached_flags(
@@ -3114,6 +3541,8 @@ fn update_cached_move_unlocked(
         MAX_CACHED_MESSAGES_PER_FOLDER,
     )?;
     if moved {
+        move_attachment_files_unlocked(cache_root, account_id, folder, uid, target_folder)?;
+        reconcile_attachment_folder_from_db_unlocked(cache_root, account_id, target_folder)?;
         crate::cache_db::spawn_search_indexer(cache_root.to_path_buf());
         return Ok(());
     }
@@ -3133,6 +3562,8 @@ fn update_cached_move_unlocked(
             MAX_CACHED_MESSAGES_PER_FOLDER,
         )?;
         if moved {
+            move_attachment_files_unlocked(cache_root, account_id, folder, uid, target_folder)?;
+            reconcile_attachment_folder_from_db_unlocked(cache_root, account_id, target_folder)?;
             crate::cache_db::spawn_search_indexer(cache_root.to_path_buf());
         }
     }
@@ -3155,7 +3586,205 @@ fn remove_cached_message_unlocked(
     folder: &str,
     uid: u32,
 ) -> Result<()> {
-    crate::cache_db::remove_message(cache_root, account_id, folder, uid)
+    crate::cache_db::remove_message(cache_root, account_id, folder, uid)?;
+    remove_attachment_files_for_uid_unlocked(cache_root, account_id, folder, uid)
+}
+
+fn remove_attachment_files_for_uid_unlocked(
+    cache_root: &Path,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+) -> Result<()> {
+    let account_component = safe_component(account_id);
+    let mut usage = attachment_usage_snapshot(cache_root)?;
+    let artifacts = attachment_artifacts_for_uid(cache_root, account_id, folder, uid)?;
+    let removed = remove_attachment_artifacts(&artifacts)?;
+    apply_attachment_usage_delta(&mut usage, &account_component, removed, 0);
+    store_attachment_usage(cache_root, usage)
+}
+
+fn move_attachment_files_unlocked(
+    cache_root: &Path,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    target_folder: &str,
+) -> Result<()> {
+    let mut sources_by_index = HashMap::new();
+    let source_artifacts = attachment_artifacts_for_uid(cache_root, account_id, folder, uid)?;
+    for path in &source_artifacts {
+        if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file()) {
+            continue;
+        }
+        let Some((file_uid, index)) = attachment_file_identity(path) else {
+            continue;
+        };
+        if file_uid == uid {
+            sources_by_index
+                .entry(index)
+                .or_insert_with(|| path.clone());
+        }
+    }
+    if sources_by_index.is_empty() {
+        return Ok(());
+    }
+
+    let account_component = safe_component(account_id);
+    let mut usage = attachment_usage_snapshot(cache_root)?;
+    let target_artifacts =
+        attachment_artifacts_for_uid(cache_root, account_id, target_folder, uid)?;
+    let source_bytes = artifact_bytes(&source_artifacts);
+    let target_bytes = artifact_bytes(&target_artifacts);
+    let target = attachment_directory(cache_root, account_id, target_folder);
+    fs::create_dir_all(&target)
+        .with_context(|| format!("create attachment cache {}", target.display()))?;
+    let transaction = rand::random::<u64>();
+    let mut staged: Vec<(usize, PathBuf)> = Vec::with_capacity(sources_by_index.len());
+    let mut copied_bytes = 0_u64;
+    for (index, source) in &sources_by_index {
+        let temporary = target.join(format!("{uid}-{index}.bin.stage-{transaction:016x}"));
+        match fs::copy(source, &temporary) {
+            Ok(bytes) => copied_bytes = copied_bytes.saturating_add(bytes),
+            Err(error) => {
+                let staged_paths = staged
+                    .iter()
+                    .map(|(_, path)| path.clone())
+                    .collect::<Vec<_>>();
+                remove_attachment_artifacts(&staged_paths).ok();
+                return Err(error).context("stage moved cached attachment");
+            }
+        }
+        staged.push((*index, temporary));
+    }
+
+    let mut backups = Vec::new();
+    for (index, _) in &staged {
+        let final_path = target.join(format!("{uid}-{index}.bin"));
+        if final_path.exists() {
+            let backup = target.join(format!("{uid}-{index}.bin.backup-{transaction:016x}"));
+            if let Err(error) = fs::rename(&final_path, &backup) {
+                let staged_paths = staged
+                    .iter()
+                    .map(|(_, path)| path.clone())
+                    .collect::<Vec<_>>();
+                rollback_attachment_transaction(&staged_paths, &backups);
+                return Err(error).context("stage target cached attachment");
+            }
+            backups.push((backup, final_path));
+        }
+    }
+
+    let mut committed = Vec::new();
+    for (index, temporary) in &staged {
+        let final_path = target.join(format!("{uid}-{index}.bin"));
+        if let Err(error) = fs::rename(temporary, &final_path) {
+            remove_attachment_artifacts(&committed).ok();
+            let staged_paths = staged
+                .iter()
+                .map(|(_, path)| path.clone())
+                .collect::<Vec<_>>();
+            rollback_attachment_transaction(&staged_paths, &backups);
+            invalidate_attachment_usage(cache_root);
+            return Err(error).context("commit moved cached attachment");
+        }
+        committed.push(final_path);
+    }
+
+    let committed_set = committed.iter().cloned().collect::<HashSet<_>>();
+    let stale_targets = target_artifacts
+        .iter()
+        .filter(|path| !committed_set.contains(*path))
+        .cloned()
+        .chain(backups.iter().map(|(backup, _)| backup.clone()))
+        .collect::<Vec<_>>();
+    if let Err(error) = remove_attachment_artifacts(&source_artifacts)
+        .and_then(|_| remove_attachment_artifacts(&stale_targets))
+    {
+        invalidate_attachment_usage(cache_root);
+        return Err(error);
+    }
+    apply_attachment_usage_delta(
+        &mut usage,
+        &account_component,
+        source_bytes.saturating_add(target_bytes),
+        copied_bytes,
+    );
+    store_attachment_usage(cache_root, usage)
+}
+
+fn attachment_file_identity(path: &Path) -> Option<(u32, usize)> {
+    let name = path.file_name()?.to_str()?.strip_suffix(".bin")?;
+    let (uid, index) = name.split_once('-')?;
+    Some((uid.parse().ok()?, index.parse().ok()?))
+}
+
+fn reconcile_attachment_folder_unlocked(
+    cache_root: &Path,
+    account_id: &str,
+    folder: &str,
+    live_uids: &HashSet<u32>,
+) -> Result<()> {
+    let account_component = safe_component(account_id);
+    let mut usage = attachment_usage_snapshot(cache_root)?;
+    let mut retained = HashSet::new();
+    let mut stale = Vec::new();
+    let mut scanned = 0usize;
+    for directory in attachment_directories(cache_root, account_id, folder) {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read attachment cache {}", directory.display()))
+            }
+        };
+        for entry in entries {
+            scanned = scanned.saturating_add(1);
+            if scanned > MAX_ATTACHMENT_CACHE_SCAN_ENTRIES {
+                return Err(anyhow!("attachment folder contains too many cache entries"));
+            }
+            let entry = entry.context("read attachment cache entry")?;
+            let file_type = entry
+                .file_type()
+                .context("inspect attachment cache entry")?;
+            if !file_type.is_file() && !file_type.is_symlink() {
+                continue;
+            }
+            let identity = attachment_file_identity(&entry.path());
+            if identity.is_some_and(|identity| {
+                live_uids.contains(&identity.0) && retained.insert(identity)
+            }) {
+                continue;
+            }
+            stale.push(entry.path());
+        }
+    }
+    let removed = remove_attachment_artifacts(&stale)?;
+    apply_attachment_usage_delta(&mut usage, &account_component, removed, 0);
+    store_attachment_usage(cache_root, usage)
+}
+
+fn reconcile_attachment_folder_from_db_unlocked(
+    cache_root: &Path,
+    account_id: &str,
+    folder: &str,
+) -> Result<()> {
+    let live_uids = crate::cache_db::load_mailbox_summaries(
+        cache_root,
+        account_id,
+        folder,
+        MAX_CACHED_MESSAGES_PER_FOLDER,
+    )?
+    .map(|mailbox| {
+        mailbox
+            .messages
+            .into_iter()
+            .map(|message| message.uid)
+            .collect::<HashSet<_>>()
+    })
+    .unwrap_or_default();
+    reconcile_attachment_folder_unlocked(cache_root, account_id, folder, &live_uids)
 }
 
 fn validate_mailbox_name(name: &str) -> Result<()> {
@@ -3725,7 +4354,7 @@ fn save_mailbox_delta(
     delta: &MailboxSyncDelta,
 ) -> Result<PathBuf> {
     let _write_guard = cache_write_guard();
-    crate::cache_db::apply_mailbox_sync_delta(
+    let path = crate::cache_db::apply_mailbox_sync_delta(
         cache_root,
         account_id,
         mailbox,
@@ -3733,7 +4362,11 @@ fn save_mailbox_delta(
         &delta.flag_updates,
         &delta.removed_uids,
         MAX_CACHED_MESSAGES_PER_FOLDER,
-    )
+    )?;
+    if !delta.new_messages.is_empty() || !delta.removed_uids.is_empty() {
+        reconcile_attachment_folder_from_db_unlocked(cache_root, account_id, &mailbox.folder)?;
+    }
+    Ok(path)
 }
 
 fn save_mailbox_unlocked(
@@ -3753,7 +4386,19 @@ fn save_mailbox_unlocked(
             .map(|message| message.uid)
             .min();
     }
-    crate::cache_db::save_mailbox(cache_root, account_id, &bounded_mailbox)
+    let path = crate::cache_db::save_mailbox(cache_root, account_id, &bounded_mailbox)?;
+    let live_uids = bounded_mailbox
+        .messages
+        .iter()
+        .map(|message| message.uid)
+        .collect::<HashSet<_>>();
+    reconcile_attachment_folder_unlocked(
+        cache_root,
+        account_id,
+        &bounded_mailbox.folder,
+        &live_uids,
+    )?;
+    Ok(path)
 }
 
 fn cache_encryption_key() -> Result<[u8; CACHE_ENCRYPTION_KEY_BYTES]> {
@@ -4173,6 +4818,37 @@ mod tests {
     use super::*;
     use crate::classifier::SmartCategory;
 
+    #[derive(Default)]
+    struct MemoryImapStream {
+        reader: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+        read_timeout: Option<Duration>,
+    }
+
+    impl Read for MemoryImapStream {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.reader.read(buffer)
+        }
+    }
+
+    impl Write for MemoryImapStream {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SetReadTimeout for MemoryImapStream {
+        fn set_read_timeout(&mut self, timeout: Option<Duration>) -> imap::error::Result<()> {
+            self.read_timeout = timeout;
+            Ok(())
+        }
+    }
+
     #[test]
     fn starttls_plaintext_line_is_rejected_before_unbounded_allocation() {
         let mut reader = BufReader::new(std::io::Cursor::new(vec![
@@ -4332,6 +5008,53 @@ mod tests {
         let shorter = Duration::from_secs(2);
         SetReadTimeout::set_read_timeout(&mut bounded, Some(shorter)).expect("set shorter timeout");
         assert_eq!(bounded.inner.read_timeout().unwrap(), Some(shorter));
+    }
+
+    #[test]
+    fn bounded_imap_stream_caps_each_response_before_parser_allocation() {
+        let inner = MemoryImapStream {
+            reader: std::io::Cursor::new(vec![b'x'; 16]),
+            ..MemoryImapStream::default()
+        };
+        let mut bounded = BoundedImapStream::with_limits(inner, 4, Duration::from_secs(10));
+        let mut buffer = [0_u8; 16];
+        assert_eq!(bounded.read(&mut buffer).unwrap(), 4);
+        let error = bounded
+            .read(&mut buffer)
+            .expect_err("the response byte budget must be enforced");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn bounded_imap_stream_resets_only_for_tagged_commands() {
+        let inner = MemoryImapStream::default();
+        let mut bounded = BoundedImapStream::with_limits(inner, 4, Duration::from_secs(10));
+        bounded.response_bytes = 3;
+        bounded
+            .write_all(b"credential-challenge-response\r\n")
+            .unwrap();
+        assert_eq!(bounded.response_bytes, 3);
+        bounded.write_all(b"A12 UID FETCH 1:* (FLAGS)\r\n").unwrap();
+        assert_eq!(bounded.response_bytes, 0);
+        assert_eq!(bounded.response_byte_limit, MAX_IMAP_RESPONSE_BYTES);
+        bounded.response_bytes = 1;
+        bounded.write_all(b"A13 IDLE\r\n").unwrap();
+        assert_eq!(bounded.response_bytes, 0);
+        assert_eq!(bounded.response_byte_limit, MAX_IMAP_IDLE_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn bounded_imap_stream_enforces_an_absolute_deadline() {
+        let inner = MemoryImapStream {
+            reader: std::io::Cursor::new(b"response".to_vec()),
+            ..MemoryImapStream::default()
+        };
+        let mut bounded = BoundedImapStream::with_limits(inner, 64, Duration::from_secs(10));
+        bounded.response_deadline = Instant::now() - Duration::from_millis(1);
+        let error = bounded
+            .read(&mut [0_u8; 8])
+            .expect_err("the absolute response deadline must be enforced");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[test]
@@ -4518,6 +5241,68 @@ mod tests {
             raw_path: None,
         }
     }
+
+    #[test]
+    fn attachment_quota_accounts_for_atomic_replacement() {
+        let account = safe_component("fixture-account");
+        let mut usage = AttachmentCacheUsage {
+            global_bytes: MAX_GLOBAL_ATTACHMENT_CACHE_BYTES - 8,
+            account_bytes: HashMap::from([(
+                account.clone(),
+                MAX_ACCOUNT_ATTACHMENT_CACHE_BYTES - 8,
+            )]),
+        };
+        assert!(ensure_attachment_quota(&usage, &account, 16, 16).is_ok());
+        assert!(ensure_attachment_quota(&usage, &account, 0, 16).is_err());
+
+        usage.global_bytes = MAX_GLOBAL_ATTACHMENT_CACHE_BYTES;
+        usage.account_bytes.insert(account.clone(), 0);
+        assert!(ensure_attachment_quota(&usage, &account, 0, 1).is_err());
+    }
+
+    #[test]
+    fn attachment_cache_reconciles_moves_and_removals() {
+        let root = std::env::temp_dir().join(format!(
+            "mailgo-attachment-lifecycle-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let inbox = attachment_directory(&root, "fixture-account", "INBOX");
+        let archive = attachment_directory(&root, "fixture-account", "Archive");
+        fs::create_dir_all(&inbox).unwrap();
+        fs::create_dir_all(&archive).unwrap();
+        fs::write(inbox.join("8-0.bin"), b"message-eight").unwrap();
+        fs::write(inbox.join("9-0.bin"), b"message-nine").unwrap();
+        fs::write(inbox.join("777-0.bin"), b"orphan").unwrap();
+        fs::write(inbox.join("8-1.bin.stage-crashed"), b"temporary").unwrap();
+        fs::write(archive.join("8-0.bin"), b"stale-target").unwrap();
+
+        let mailbox = CachedMailbox {
+            schema_version: CACHE_SCHEMA_VERSION,
+            account_id: "fixture-account".into(),
+            folder: "INBOX".into(),
+            uid_validity: Some(1),
+            highest_mod_seq: None,
+            synced_at: now_stamp(),
+            messages: vec![fixture_message(8, "INBOX"), fixture_message(9, "INBOX")],
+            oldest_uid: Some(8),
+            has_more: false,
+        };
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        assert!(!inbox.join("777-0.bin").exists());
+        assert!(!inbox.join("8-1.bin.stage-crashed").exists());
+
+        update_cached_move(&root, "fixture-account", "INBOX", 8, "Archive").unwrap();
+        assert!(!inbox.join("8-0.bin").exists());
+        assert_eq!(fs::read(archive.join("8-0.bin")).unwrap(), b"message-eight");
+
+        remove_cached_message(&root, "fixture-account", "INBOX", 9).unwrap();
+        assert!(!inbox.join("9-0.bin").exists());
+
+        invalidate_attachment_usage(&root);
+        let _ = fs::remove_dir_all(root);
+    }
+
     use imap::Authenticator;
 
     #[test]

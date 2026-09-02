@@ -23,6 +23,7 @@ import { appendAccountSignature, normalizeAccountSignature } from './signature'
 import { formatScheduledAt } from './scheduleSend'
 import { formatSnoozeTime } from './snooze'
 import { buildMailThreads, type MailThread } from './threading'
+import { sanitizeHtml } from './htmlSafety'
 import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeConnectionDiagnostic, NativeConnectionDiagnosticChannel, NativeDeviceStartResponse, NativeDraft, NativeDraftAttachment, NativeLocalSearchResponse, NativeMailboxResponse, NativeMessageResponse, NativeOutboxActionResponse, NativeOutboxItem, NativeOutboxRecallResponse, NativeOutboxSnapshot, NativeQueueStatus, NativeSearchResponse, NativeSendResponse, NativeSnoozeSnapshot, NativeSyncItem, NativeSyncResponse, NativeUndoSendResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 type ToastTone = 'info' | 'success' | 'error'
@@ -63,9 +64,6 @@ const COMFORTABLE_MAIL_ROW_HEIGHT = 48
 const MOBILE_MAIL_GROUP_HEIGHT = 18
 const MOBILE_MAIL_ROW_HEIGHT = 44
 const SNOOZE_TIMER_RECHECK_MS = 5 * 60 * 1_000
-const HTML_PRESENTATIONAL_SIZING_ATTRIBUTES = new Set([
-  'border', 'cellpadding', 'cellspacing', 'face', 'height', 'nowrap', 'size', 'width',
-])
 const DANGEROUS_ATTACHMENT_EXTENSIONS = new Set([
   'ade', 'adp', 'app', 'application', 'appinstaller', 'appref-ms', 'appx', 'appxbundle', 'bat',
   'bin', 'cab', 'chm', 'cmd', 'com', 'command', 'cpl', 'desktop', 'dll', 'dmg', 'docm', 'drv',
@@ -143,34 +141,6 @@ const diagnosticStatusLabels = {
 
 function formatCount(value: number) {
   return value > 99 ? '99+' : String(value)
-}
-
-function sanitizeHtml(input: string, allowRemoteImages = false) {
-  const documentParser = new DOMParser().parseFromString(input, 'text/html')
-  documentParser.querySelectorAll('script, iframe, object, embed, form, link, meta, style').forEach((node) => node.remove())
-  documentParser.querySelectorAll('*').forEach((node) => {
-    Array.from(node.attributes).forEach((attribute) => {
-      const name = attribute.name.toLowerCase()
-      const value = attribute.value.trim().replace(/[\u0000-\u0020]+/g, '')
-      const isSafeUrl = name === 'href'
-        ? /^(https:\/\/|mailto:|#)/i.test(value)
-        : name === 'src'
-          ? /^(cid:|data:image\/(?:png|gif|jpe?g|webp);base64,)/i.test(value) || (allowRemoteImages && /^https:\/\//i.test(value))
-          : false
-      if (name.startsWith('on') || ['style', 'srcdoc', 'srcset', 'ping', 'formaction', 'xlink:href'].includes(name) || HTML_PRESENTATIONAL_SIZING_ATTRIBUTES.has(name)) node.removeAttribute(attribute.name)
-      if (['href', 'src', 'action'].includes(name) && !isSafeUrl) {
-        node.removeAttribute(attribute.name)
-      }
-    })
-  })
-  documentParser.querySelectorAll('a').forEach((node) => {
-    if (node.getAttribute('target') === '_blank') {
-      node.setAttribute('rel', 'noreferrer noopener')
-    } else {
-      node.removeAttribute('target')
-    }
-  })
-  return documentParser.body.innerHTML
 }
 
 function escapeHtml(input: string) {

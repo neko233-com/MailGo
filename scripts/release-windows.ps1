@@ -76,6 +76,9 @@ try {
     & npm run test:link-safety
     if ($LASTEXITCODE -ne 0) { throw "external link safety checks failed with exit code $LASTEXITCODE" }
 
+    & npm run test:html-safety
+    if ($LASTEXITCODE -ne 0) { throw "HTML safety checks failed with exit code $LASTEXITCODE" }
+
     & npm run test:recipients
     if ($LASTEXITCODE -ne 0) { throw "recipient autocomplete checks failed with exit code $LASTEXITCODE" }
 

@@ -8,6 +8,7 @@ const assert = (condition, message) => {
 }
 
 const app = read('src/App.tsx')
+const htmlSafety = read('src/htmlSafety.ts')
 const styles = read('src/styles.css')
 const nativeMain = read('native/src/main.rs')
 const rdesktopConfig = read('rdesktop.toml')
@@ -32,7 +33,7 @@ assert(styles.includes('.workspace, .app-shell.is-compact-density .workspace { p
 assert(styles.includes('.mobile-overlay { position: fixed; inset: 38px 0 0;'), 'narrow navigation overlay must start below the dense title bar')
 assert(styles.includes('.html-rendered :where(*) { max-width: 100%; font-size: inherit !important;'), 'HTML descendants must not escape the reading-pane typography budget')
 assert(styles.includes('.html-rendered :where(table) { width: auto !important; max-width: 100% !important;'), 'nested HTML email tables must fit without every table expanding to the pane width')
-assert(app.includes("'border', 'cellpadding', 'cellspacing', 'face', 'height', 'nowrap', 'size', 'width'"), 'renderer sanitizer must remove presentational sizing attributes')
+assert(htmlSafety.includes("'border', 'cellpadding', 'cellspacing', 'face', 'height', 'nowrap', 'size', 'width'"), 'renderer sanitizer must remove presentational sizing attributes')
 assert(app.includes("const MOBILE_LAYOUT_QUERY = '(max-width: 720px)'"), 'resizable desktop windows must keep the three-pane layout above 720px')
 assert(app.includes("const AUTO_COLLAPSE_SIDEBAR_QUERY = '(max-width: 1366px) and (min-width: 721px)'"), 'narrow desktop windows must collapse only the sidebar instead of switching to a mobile layout')
 assert(styles.includes('@media (max-width: 720px)'), 'single-pane layout must be reserved for genuinely narrow windows')

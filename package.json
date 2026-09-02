@@ -20,6 +20,7 @@
     "test:desktop-density": "node scripts/test-desktop-density.mjs",
     "test:signatures": "node scripts/test-signatures.mjs",
     "test:link-safety": "node scripts/test-link-safety.mjs",
+    "test:html-safety": "node scripts/test-html-safety.mjs",
     "test:recipients": "node scripts/test-recipients.mjs",
     "test:undo-send": "node scripts/test-undo-send.mjs",
     "test:schedule-send": "node scripts/test-schedule-send.mjs",

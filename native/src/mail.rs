@@ -1,11 +1,15 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use ammonia::Builder;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use mail_parser::{Address, HeaderValue, Message, MessageParser, MimeHeaders, PartType};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::classifier::{classify, SmartCategory};
 
@@ -22,9 +26,20 @@ const MAX_RECIPIENT_CHARS: usize = 320;
 const MAX_MIME_BOUNDARY_LINES: usize = 2_048;
 const MAX_MIME_HEADER_FIELDS: usize = 8_192;
 const MAX_MIME_HEADER_BYTES: usize = 2 * 1024 * 1024;
-const MAX_MIME_HEADER_LINE_BYTES: usize = 256 * 1024;
+const MAX_MIME_HEADER_LINE_BYTES: usize = 64 * 1024;
+const MAX_MIME_LOGICAL_HEADER_BYTES: usize = 128 * 1024;
+const MAX_MIME_HEADER_FOLDS: usize = 128;
+const MAX_MIME_PARAMETERS_PER_HEADER: usize = 128;
+const MAX_MIME_BOUNDARY_BYTES: usize = 70;
 const MAX_INLINE_IMAGE_REFERENCES: usize = 64;
 const MAX_INLINE_IMAGE_BYTES: usize = 1024 * 1024;
+const MAX_HTML_SANITIZER_INPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_HTML_ELEMENTS: usize = 20_000;
+const MAX_HTML_ATTRIBUTES: usize = 80_000;
+const MAX_HTML_ATTRIBUTE_BYTES: usize = 1024 * 1024;
+const MAX_HTML_NESTING_DEPTH: usize = 128;
+const MAX_HTML_TAG_BYTES: usize = 64 * 1024;
+const MAX_REMOTE_IMAGES_PER_MESSAGE: usize = 32;
 pub(crate) const MAX_MESSAGE_ID_BYTES: usize = 512;
 pub(crate) const MAX_THREAD_REFERENCES: usize = 32;
 pub const CACHE_SCHEMA_VERSION: u32 = 3;
@@ -127,6 +142,7 @@ pub fn parse_header(
     starred: bool,
     header: &[u8],
 ) -> Result<CachedMessage> {
+    validate_header_structure(header)?;
     let parsed = MessageParser::default()
         .parse_headers(header)
         .ok_or_else(|| anyhow!("message headers could not be parsed"))?;
@@ -394,41 +410,283 @@ fn validate_mime_structure(raw: &[u8]) -> Result<()> {
     if raw.len() > MAX_FULL_MESSAGE_BYTES {
         return Err(anyhow!("message exceeds the safe MIME size limit"));
     }
+    validate_header_blocks(raw, true)
+}
+
+fn validate_header_structure(header: &[u8]) -> Result<()> {
+    if header.len() > MAX_MIME_HEADER_BYTES {
+        return Err(anyhow!(
+            "message MIME headers exceed the safe complexity limit"
+        ));
+    }
+    validate_header_blocks(header, false)
+}
+
+fn validate_header_blocks(input: &[u8], count_boundaries: bool) -> Result<()> {
     let mut boundary_lines = 0usize;
     let mut header_fields = 0usize;
     let mut header_bytes = 0usize;
-    for line in raw.split(|byte| *byte == b'\n') {
+    let mut in_headers = true;
+    let mut logical_header = Vec::new();
+    let mut logical_folds = 0usize;
+    let mut declared_boundaries = Vec::new();
+
+    for line in input.split(|byte| *byte == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.starts_with(b"--") {
+        if count_boundaries && line.starts_with(b"--") {
             boundary_lines = boundary_lines.saturating_add(1);
             if boundary_lines > MAX_MIME_BOUNDARY_LINES {
                 return Err(anyhow!("message MIME structure is too complex"));
             }
+            if let Some(closing) = declared_boundary_line(line, &declared_boundaries) {
+                validate_logical_header(&logical_header, &mut declared_boundaries)?;
+                logical_header.clear();
+                logical_folds = 0;
+                in_headers = !closing;
+                continue;
+            }
         }
-        let looks_like_header =
-            line.iter()
-                .position(|byte| *byte == b':')
-                .is_some_and(|separator| {
-                    separator > 0
-                        && separator <= 128
-                        && line[..separator]
-                            .iter()
-                            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
-                });
-        if looks_like_header {
-            if line.len() > MAX_MIME_HEADER_LINE_BYTES {
-                return Err(anyhow!("message contains an oversized MIME header"));
+
+        if !in_headers {
+            continue;
+        }
+        if line.is_empty() {
+            validate_logical_header(&logical_header, &mut declared_boundaries)?;
+            logical_header.clear();
+            logical_folds = 0;
+            in_headers = false;
+            continue;
+        }
+        if line.len() > MAX_MIME_HEADER_LINE_BYTES {
+            return Err(anyhow!("message contains an oversized MIME header"));
+        }
+        header_bytes = header_bytes.saturating_add(line.len().saturating_add(1));
+        if header_bytes > MAX_MIME_HEADER_BYTES {
+            return Err(anyhow!(
+                "message MIME headers exceed the safe complexity limit"
+            ));
+        }
+
+        if line.first().is_some_and(u8::is_ascii_whitespace) {
+            if logical_header.is_empty() {
+                return Err(anyhow!("message contains a malformed MIME header"));
+            }
+            logical_folds = logical_folds.saturating_add(1);
+            if logical_folds > MAX_MIME_HEADER_FOLDS {
+                return Err(anyhow!("message contains an overly folded MIME header"));
+            }
+            logical_header.push(b' ');
+            logical_header.extend_from_slice(trim_ascii_start(line));
+        } else {
+            validate_logical_header(&logical_header, &mut declared_boundaries)?;
+            logical_header.clear();
+            logical_folds = 0;
+            let Some(separator) = line.iter().position(|byte| *byte == b':') else {
+                return Err(anyhow!("message contains a malformed MIME header"));
+            };
+            if separator == 0
+                || separator > 128
+                || !line[..separator]
+                    .iter()
+                    .all(|byte| is_header_name_byte(*byte))
+            {
+                return Err(anyhow!("message contains a malformed MIME header"));
             }
             header_fields = header_fields.saturating_add(1);
-            header_bytes = header_bytes.saturating_add(line.len());
-            if header_fields > MAX_MIME_HEADER_FIELDS || header_bytes > MAX_MIME_HEADER_BYTES {
+            if header_fields > MAX_MIME_HEADER_FIELDS {
                 return Err(anyhow!(
                     "message MIME headers exceed the safe complexity limit"
                 ));
             }
+            logical_header.extend_from_slice(line);
+        }
+        if logical_header.len() > MAX_MIME_LOGICAL_HEADER_BYTES {
+            return Err(anyhow!("message contains an oversized logical MIME header"));
         }
     }
+    validate_logical_header(&logical_header, &mut declared_boundaries)?;
     Ok(())
+}
+
+fn declared_boundary_line(line: &[u8], declared_boundaries: &[Vec<u8>]) -> Option<bool> {
+    let line = trim_ascii(line);
+    let candidate = line.strip_prefix(b"--")?;
+    declared_boundaries.iter().find_map(|boundary| {
+        candidate
+            .strip_prefix(boundary.as_slice())
+            .and_then(|suffix| match suffix {
+                b"" => Some(false),
+                b"--" => Some(true),
+                _ => None,
+            })
+    })
+}
+
+fn trim_ascii_start(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    value
+}
+
+fn is_header_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn validate_logical_header(header: &[u8], declared_boundaries: &mut Vec<Vec<u8>>) -> Result<()> {
+    if header.is_empty() {
+        return Ok(());
+    }
+    if header.len() > MAX_MIME_LOGICAL_HEADER_BYTES {
+        return Err(anyhow!("message contains an oversized logical MIME header"));
+    }
+    let Some(separator) = header.iter().position(|byte| *byte == b':') else {
+        return Err(anyhow!("message contains a malformed MIME header"));
+    };
+    let name = &header[..separator];
+    if name.eq_ignore_ascii_case(b"content-type") {
+        if let Some(boundary) = validate_structured_header(&header[separator + 1..], true)? {
+            if !declared_boundaries.iter().any(|known| known == &boundary) {
+                declared_boundaries.push(boundary);
+            }
+        }
+    } else if name.eq_ignore_ascii_case(b"content-disposition") {
+        validate_structured_header(&header[separator + 1..], false)?;
+    }
+    Ok(())
+}
+
+fn validate_structured_header(value: &[u8], validate_boundary: bool) -> Result<Option<Vec<u8>>> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut segment_start = 0usize;
+    let mut parameter_count = 0usize;
+    let mut boundary = None;
+
+    for index in 0..=value.len() {
+        let byte = value.get(index).copied();
+        if let Some(delimiter) = quote {
+            match byte {
+                Some(_) if escaped => escaped = false,
+                Some(b'\\') => escaped = true,
+                Some(candidate) if candidate == delimiter => quote = None,
+                None => return Err(anyhow!("message contains a malformed MIME parameter")),
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            Some(b'\"') => quote = byte,
+            Some(b';') | None => {
+                if segment_start > 0 {
+                    parameter_count = parameter_count.saturating_add(1);
+                    if parameter_count > MAX_MIME_PARAMETERS_PER_HEADER {
+                        return Err(anyhow!("message contains too many MIME parameters"));
+                    }
+                    if let Some(candidate) =
+                        validate_mime_parameter(&value[segment_start..index], validate_boundary)?
+                    {
+                        if boundary.is_some() {
+                            return Err(anyhow!("message contains duplicate MIME boundaries"));
+                        }
+                        boundary = Some(candidate);
+                    }
+                }
+                segment_start = index.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    Ok(boundary)
+}
+
+fn validate_mime_parameter(parameter: &[u8], validate_boundary: bool) -> Result<Option<Vec<u8>>> {
+    let parameter = trim_ascii(parameter);
+    if parameter.is_empty() {
+        return Ok(None);
+    }
+    let Some(separator) = parameter.iter().position(|byte| *byte == b'=') else {
+        return Ok(None);
+    };
+    let name = trim_ascii(&parameter[..separator]);
+    if validate_boundary {
+        if name.eq_ignore_ascii_case(b"boundary") {
+            return validate_mime_boundary(trim_ascii(&parameter[separator + 1..])).map(Some);
+        }
+        if name.len() > b"boundary".len()
+            && name[..b"boundary".len()].eq_ignore_ascii_case(b"boundary")
+            && name[b"boundary".len()] == b'*'
+        {
+            return Err(anyhow!(
+                "message contains an unsupported MIME boundary continuation"
+            ));
+        }
+    }
+    Ok(None)
+}
+
+fn trim_ascii(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn validate_mime_boundary(value: &[u8]) -> Result<Vec<u8>> {
+    let boundary = if value.first() == Some(&b'\"') {
+        if value.len() < 2 || value.last() != Some(&b'\"') {
+            return Err(anyhow!("message contains a malformed MIME boundary"));
+        }
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    if boundary.is_empty()
+        || boundary.len() > MAX_MIME_BOUNDARY_BYTES
+        || boundary.last() == Some(&b' ')
+        || !boundary.iter().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'\''
+                        | b'('
+                        | b')'
+                        | b'+'
+                        | b'_'
+                        | b','
+                        | b'-'
+                        | b'.'
+                        | b'/'
+                        | b':'
+                        | b'='
+                        | b'?'
+                        | b' '
+                )
+        })
+    {
+        return Err(anyhow!("message contains an unsafe MIME boundary"));
+    }
+    Ok(boundary.to_vec())
 }
 
 fn ensure_attachment_count(parsed: &Message<'_>) -> Result<()> {
@@ -445,8 +703,14 @@ fn ensure_attachment_count(parsed: &Message<'_>) -> Result<()> {
 pub fn embed_inline_images(html: &mut Option<String>, payloads: &[AttachmentPayload]) {
     let Some(html) = html.as_mut() else { return };
     *html = truncate_utf8(html, MAX_CACHED_HTML_BYTES);
-    let mut embedded_references = 0usize;
-    for payload in payloads {
+    struct InlineImage<'a> {
+        content_type: String,
+        bytes: &'a [u8],
+        data_uri: Option<String>,
+    }
+
+    let mut inline_images = HashMap::new();
+    for payload in payloads.iter().take(MAX_ATTACHMENTS_PER_MESSAGE) {
         let content_type = payload.content_type.to_ascii_lowercase();
         if !matches!(
             content_type.as_str(),
@@ -458,44 +722,87 @@ pub fn embed_inline_images(html: &mut Option<String>, payloads: &[AttachmentPayl
         let Some(content_id) = payload.content_id.as_deref().and_then(safe_content_id) else {
             continue;
         };
-        let needles = [format!("cid:{content_id}"), format!("cid:<{content_id}>")];
-        let reference_count = needles
-            .iter()
-            .map(|needle| count_ascii_case_insensitive(html, needle))
-            .sum::<usize>();
-        if reference_count == 0
-            || embedded_references.saturating_add(reference_count) > MAX_INLINE_IMAGE_REFERENCES
+        inline_images
+            .entry(content_id.to_ascii_lowercase())
+            .or_insert(InlineImage {
+                content_type,
+                bytes: &payload.bytes,
+                data_uri: None,
+            });
+    }
+    if inline_images.is_empty() {
+        return;
+    }
+
+    let lowered = html.to_ascii_lowercase();
+    let mut output = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+    let mut embedded_references = 0usize;
+    while let Some(relative) = lowered[cursor..].find("cid:") {
+        let start = cursor + relative;
+        output.push_str(&html[cursor..start]);
+        let token_start = start + 4;
+        let (content_start, bracketed) = if lowered.as_bytes().get(token_start) == Some(&b'<') {
+            (token_start + 1, true)
+        } else {
+            (token_start, false)
+        };
+        let mut content_end = content_start;
+        while lowered
+            .as_bytes()
+            .get(content_end)
+            .is_some_and(|byte| is_content_id_byte(*byte))
         {
+            content_end += 1;
+        }
+        let token_end = if bracketed && lowered.as_bytes().get(content_end) == Some(&b'>') {
+            content_end + 1
+        } else if bracketed {
+            start + 4
+        } else {
+            content_end
+        };
+        if content_end == content_start || token_end == start + 4 {
+            output.push_str(&html[start..start + 4]);
+            cursor = start + 4;
             continue;
         }
-        let encoded = STANDARD.encode(&payload.bytes);
-        let data_uri = format!("data:{content_type};base64,{encoded}");
-        let replaced_bytes = needles.iter().fold(html.len(), |total, needle| {
-            total.saturating_add(
-                count_ascii_case_insensitive(html, needle)
-                    .saturating_mul(data_uri.len().saturating_sub(needle.len())),
+
+        let content_id = &lowered[content_start..content_end];
+        let original_token = &html[start..token_end];
+        let remaining_original = html.len().saturating_sub(token_end);
+        let Some(image) = inline_images.get_mut(content_id) else {
+            output.push_str(original_token);
+            cursor = token_end;
+            continue;
+        };
+        if embedded_references >= MAX_INLINE_IMAGE_REFERENCES {
+            output.push_str(original_token);
+            cursor = token_end;
+            continue;
+        }
+        let data_uri = image.data_uri.get_or_insert_with(|| {
+            format!(
+                "data:{};base64,{}",
+                image.content_type,
+                STANDARD.encode(image.bytes)
             )
         });
-        if replaced_bytes > MAX_CACHED_HTML_BYTES {
-            continue;
+        if output
+            .len()
+            .saturating_add(data_uri.len())
+            .saturating_add(remaining_original)
+            > MAX_CACHED_HTML_BYTES
+        {
+            output.push_str(original_token);
+        } else {
+            output.push_str(data_uri);
+            embedded_references += 1;
         }
-        for needle in needles {
-            *html = replace_ascii_case_insensitive(html, &needle, &data_uri);
-        }
-        embedded_references = embedded_references.saturating_add(reference_count);
+        cursor = token_end;
     }
-    *html = truncate_utf8(html, MAX_CACHED_HTML_BYTES);
-}
-
-fn count_ascii_case_insensitive(value: &str, needle: &str) -> usize {
-    if needle.is_empty() || value.len() < needle.len() {
-        return 0;
-    }
-    value
-        .as_bytes()
-        .windows(needle.len())
-        .filter(|candidate| candidate.eq_ignore_ascii_case(needle.as_bytes()))
-        .count()
+    output.push_str(&html[cursor..]);
+    *html = output;
 }
 
 fn safe_content_id(value: &str) -> Option<String> {
@@ -536,22 +843,31 @@ fn safe_content_id(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
-fn replace_ascii_case_insensitive(value: &str, needle: &str, replacement: &str) -> String {
-    if needle.is_empty() {
-        return value.to_string();
-    }
-    let lowered_value = value.to_ascii_lowercase();
-    let lowered_needle = needle.to_ascii_lowercase();
-    let mut output = String::with_capacity(value.len());
-    let mut cursor = 0usize;
-    while let Some(relative) = lowered_value[cursor..].find(&lowered_needle) {
-        let start = cursor + relative;
-        output.push_str(&value[cursor..start]);
-        output.push_str(replacement);
-        cursor = start + needle.len();
-    }
-    output.push_str(&value[cursor..]);
-    output
+fn is_content_id_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'/'
+                | b'='
+                | b'?'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'{'
+                | b'|'
+                | b'}'
+                | b'~'
+                | b'.'
+                | b'@'
+        )
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> String {
@@ -713,10 +1029,15 @@ pub fn sanitize_outgoing_html(input: &str) -> String {
 }
 
 fn sanitize_html_with_image_policy(input: &str, allow_https_images: bool) -> String {
+    if preflight_html_structure(input).is_err() {
+        return String::new();
+    }
     let mut allowed_schemes = HashSet::new();
     allowed_schemes.insert("cid");
     allowed_schemes.insert("https");
     allowed_schemes.insert("mailto");
+    let remote_image_count = Arc::new(AtomicUsize::new(0));
+    let remote_image_count_for_filter = Arc::clone(&remote_image_count);
     Builder::default()
         .url_schemes(allowed_schemes)
         .attribute_filter(move |element, attribute, value| {
@@ -743,9 +1064,16 @@ fn sanitize_html_with_image_policy(input: &str, allow_https_images: bool) -> Str
                 return None;
             }
             if element == "img" && attribute == "src" {
-                let normalized = value.to_ascii_lowercase();
-                if normalized.starts_with("cid:")
-                    || (allow_https_images && normalized.starts_with("https://"))
+                if value
+                    .get(..4)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cid:"))
+                {
+                    return Some(Cow::Borrowed(value));
+                }
+                if allow_https_images
+                    && is_safe_remote_image_url(value)
+                    && remote_image_count_for_filter.fetch_add(1, Ordering::Relaxed)
+                        < MAX_REMOTE_IMAGES_PER_MESSAGE
                 {
                     return Some(Cow::Borrowed(value));
                 }
@@ -753,9 +1081,242 @@ fn sanitize_html_with_image_policy(input: &str, allow_https_images: bool) -> Str
             }
             Some(Cow::Borrowed(value))
         })
+        .set_tag_attribute_value("img", "loading", "lazy")
+        .set_tag_attribute_value("img", "decoding", "async")
+        .set_tag_attribute_value("img", "referrerpolicy", "no-referrer")
         .link_rel(Some("noreferrer noopener"))
         .clean(input)
         .to_string()
+}
+
+fn is_safe_remote_image_url(value: &str) -> bool {
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port_or_known_default() != Some(443)
+    {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.');
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || host.contains('%')
+    {
+        return false;
+    }
+    host.parse::<IpAddr>()
+        .map_or(true, |address| match address {
+            IpAddr::V4(address) => is_public_ipv4(address),
+            IpAddr::V6(address) => is_public_ipv6(address),
+        })
+}
+
+fn is_public_ipv4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    !address.is_private()
+        && !address.is_loopback()
+        && !address.is_link_local()
+        && !address.is_unspecified()
+        && !address.is_multicast()
+        && octets != [255, 255, 255, 255]
+        && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
+        && !(octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        && !(octets[0] == 198 && matches!(octets[1], 18 | 19))
+        && !(octets[0] >= 240)
+}
+
+fn is_public_ipv6(address: Ipv6Addr) -> bool {
+    let segments = address.segments();
+    if address.is_loopback()
+        || address.is_unspecified()
+        || address.is_multicast()
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+    {
+        return false;
+    }
+    if segments[..5] == [0, 0, 0, 0, 0] && (segments[5] == 0 || segments[5] == 0xffff) {
+        let mapped = Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        );
+        return is_public_ipv4(mapped);
+    }
+    true
+}
+
+fn preflight_html_structure(input: &str) -> Result<()> {
+    if input.len() > MAX_HTML_SANITIZER_INPUT_BYTES {
+        return Err(anyhow!("message HTML exceeds the safe size limit"));
+    }
+    let bytes = input.as_bytes();
+    let mut cursor = 0usize;
+    let mut elements = 0usize;
+    let mut attributes = 0usize;
+    let mut attribute_bytes = 0usize;
+    let mut open_tags: Vec<Vec<u8>> = Vec::new();
+
+    while let Some(relative) = bytes[cursor..].iter().position(|byte| *byte == b'<') {
+        let start = cursor + relative;
+        if bytes[start..].starts_with(b"<!--") {
+            let Some(end) = find_bytes(&bytes[start + 4..], b"-->") else {
+                return Err(anyhow!("message HTML contains an unterminated comment"));
+            };
+            cursor = start + 4 + end + 3;
+            continue;
+        }
+        let Some(end) = find_html_tag_end(bytes, start + 1) else {
+            return Err(anyhow!("message HTML contains an unterminated tag"));
+        };
+        if end.saturating_sub(start) > MAX_HTML_TAG_BYTES {
+            return Err(anyhow!("message HTML contains an oversized tag"));
+        }
+        let mut inner = trim_ascii(&bytes[start + 1..end]);
+        cursor = end + 1;
+        if inner.is_empty() || matches!(inner[0], b'!' | b'?') {
+            continue;
+        }
+        if inner[0] == b'/' {
+            let closing = trim_ascii_start(&inner[1..]);
+            let name_len = closing
+                .iter()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(**byte, b':' | b'-'))
+                .count();
+            if name_len > 0
+                && open_tags
+                    .last()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&closing[..name_len]))
+            {
+                open_tags.pop();
+            }
+            continue;
+        }
+
+        let name_len = inner
+            .iter()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(**byte, b':' | b'-'))
+            .count();
+        if name_len == 0 {
+            continue;
+        }
+        let tag_name = &inner[..name_len];
+        elements = elements.saturating_add(1);
+        if elements > MAX_HTML_ELEMENTS {
+            return Err(anyhow!("message HTML has too many elements"));
+        }
+        inner = &inner[name_len..];
+        let self_closing = trim_ascii(inner).ends_with(b"/");
+        count_html_attributes(inner, &mut attributes, &mut attribute_bytes)?;
+
+        if !self_closing && !is_void_html_tag(tag_name) {
+            open_tags.push(tag_name.to_vec());
+            if open_tags.len() > MAX_HTML_NESTING_DEPTH {
+                return Err(anyhow!("message HTML is nested too deeply"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|candidate| candidate == needle)
+}
+
+fn find_html_tag_end(bytes: &[u8], mut cursor: usize) -> Option<usize> {
+    let mut quote = None;
+    while let Some(byte) = bytes.get(cursor).copied() {
+        match (quote, byte) {
+            (Some(delimiter), candidate) if candidate == delimiter => quote = None,
+            (None, b'\'' | b'\"') => quote = Some(byte),
+            (None, b'>') => return Some(cursor),
+            _ => {}
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn count_html_attributes(
+    mut input: &[u8],
+    attributes: &mut usize,
+    attribute_bytes: &mut usize,
+) -> Result<()> {
+    while !input.is_empty() {
+        input = trim_ascii_start(input);
+        if input.is_empty() || input == b"/" {
+            break;
+        }
+        let before = input.len();
+        let name_len = input
+            .iter()
+            .take_while(|byte| !byte.is_ascii_whitespace() && !matches!(**byte, b'=' | b'/' | b'>'))
+            .count();
+        if name_len == 0 {
+            input = &input[1..];
+            continue;
+        }
+        input = trim_ascii_start(&input[name_len..]);
+        if input.first() == Some(&b'=') {
+            input = trim_ascii_start(&input[1..]);
+            if let Some(delimiter @ (b'\'' | b'\"')) = input.first().copied() {
+                input = &input[1..];
+                let Some(end) = input.iter().position(|byte| *byte == delimiter) else {
+                    return Err(anyhow!("message HTML contains an unterminated attribute"));
+                };
+                input = &input[end + 1..];
+            } else {
+                let value_len = input
+                    .iter()
+                    .take_while(|byte| !byte.is_ascii_whitespace() && **byte != b'>')
+                    .count();
+                input = &input[value_len..];
+            }
+        }
+        *attributes = attributes.saturating_add(1);
+        *attribute_bytes = attribute_bytes.saturating_add(before.saturating_sub(input.len()));
+        if *attributes > MAX_HTML_ATTRIBUTES || *attribute_bytes > MAX_HTML_ATTRIBUTE_BYTES {
+            return Err(anyhow!(
+                "message HTML attributes exceed the safe complexity limit"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_void_html_tag(name: &[u8]) -> bool {
+    [
+        b"area".as_slice(),
+        b"base",
+        b"br",
+        b"col",
+        b"embed",
+        b"hr",
+        b"img",
+        b"input",
+        b"link",
+        b"meta",
+        b"param",
+        b"source",
+        b"track",
+        b"wbr",
+    ]
+    .iter()
+    .any(|tag| name.eq_ignore_ascii_case(tag))
 }
 
 #[cfg(test)]
@@ -1140,10 +1701,36 @@ mod tests {
         let original = "<img src=\"cid:logo@example.com\">".repeat(MAX_INLINE_IMAGE_REFERENCES + 1);
         let mut html = Some(original.clone());
         embed_inline_images(&mut html, &[payload]);
-        assert_eq!(html.as_deref(), Some(original.as_str()));
-        assert!(html
-            .as_ref()
-            .is_some_and(|value| value.len() <= MAX_CACHED_HTML_BYTES));
+        let html = html.unwrap();
+        assert_eq!(html.matches("data:image/png;base64,").count(), 1);
+        assert_eq!(
+            html.matches("cid:logo@example.com").count(),
+            MAX_INLINE_IMAGE_REFERENCES
+        );
+        assert!(html.len() <= MAX_CACHED_HTML_BYTES);
+    }
+
+    #[test]
+    fn deduplicates_inline_payloads_and_rewrites_each_reference_once() {
+        let payloads = [
+            AttachmentPayload {
+                content_type: "image/png".into(),
+                content_id: Some("logo@example.com".into()),
+                bytes: vec![0, 1, 2],
+            },
+            AttachmentPayload {
+                content_type: "image/png".into(),
+                content_id: Some("LOGO@example.com".into()),
+                bytes: vec![9, 9, 9],
+            },
+        ];
+        let mut html = Some(
+            "<img src=\"cid:logo@example.com\"><img src=\"CID:<LOGO@EXAMPLE.COM>\">".to_string(),
+        );
+        embed_inline_images(&mut html, &payloads);
+        let html = html.unwrap();
+        assert_eq!(html.matches("data:image/png;base64,AAEC").count(), 2);
+        assert!(!html.contains("CQkJ"));
     }
 
     #[test]
@@ -1170,6 +1757,92 @@ mod tests {
         let error = parse_full("account", "INBOX", 99, false, false, raw.as_bytes())
             .expect_err("excessive MIME boundaries must be rejected");
         assert!(error.to_string().contains("too complex"));
+    }
+
+    #[test]
+    fn plaintext_lines_that_look_like_boundaries_do_not_start_header_parsing() {
+        let raw = "From: sender@example.com\r\nSubject: Dashes\r\nContent-Type: text/plain\r\n\r\n--not-a-declared-boundary\r\nordinary body text\r\n";
+        let message = parse_full("account", "INBOX", 98, false, false, raw.as_bytes()).unwrap();
+        assert!(message.text_body.contains("ordinary body text"));
+    }
+
+    #[test]
+    fn rejects_oversized_folded_headers_for_header_and_full_parsing() {
+        let mut raw = String::from("From: sender@example.com\r\nContent-Type: text/plain;");
+        for _ in 0..=MAX_MIME_HEADER_FOLDS {
+            raw.push_str("\r\n x=value");
+        }
+        raw.push_str("\r\n\r\nbody");
+        assert!(parse_header("account", "INBOX", 1, false, false, raw.as_bytes()).is_err());
+        assert!(parse_full("account", "INBOX", 1, false, false, raw.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn rejects_excessive_mime_parameters_before_parser_merging() {
+        let mut raw = String::from("From: sender@example.com\r\nContent-Type: text/plain");
+        for index in 0..=MAX_MIME_PARAMETERS_PER_HEADER {
+            raw.push_str(&format!("; name*{index}=segment"));
+        }
+        raw.push_str("\r\n\r\nbody");
+        let error = parse_full("account", "INBOX", 2, false, false, raw.as_bytes())
+            .expect_err("structured header parameter count must be bounded");
+        assert!(error.to_string().contains("too many MIME parameters"));
+    }
+
+    #[test]
+    fn validates_declared_mime_boundary_length_and_grammar() {
+        let valid = "From: sender@example.com\r\nContent-Type: multipart/mixed;\r\n boundary=\"safe boundary\"\r\n\r\n--safe boundary--\r\n";
+        assert!(parse_full("account", "INBOX", 3, false, false, valid.as_bytes()).is_ok());
+
+        let oversized = "x".repeat(MAX_MIME_BOUNDARY_BYTES + 1);
+        let raw = format!(
+            "From: sender@example.com\r\nContent-Type: multipart/mixed;\r\n boundary=\"{oversized}\"\r\n\r\n"
+        );
+        let error = parse_full("account", "INBOX", 4, false, false, raw.as_bytes())
+            .expect_err("oversized MIME boundary must be rejected");
+        assert!(error.to_string().contains("unsafe MIME boundary"));
+
+        let continued = "From: sender@example.com\r\nContent-Type: multipart/mixed; boundary*0=unsafe; boundary*1=value\r\n\r\n";
+        let error = parse_full("account", "INBOX", 5, false, false, continued.as_bytes())
+            .expect_err("continued MIME boundaries must not bypass the boundary limit");
+        assert!(error.to_string().contains("boundary continuation"));
+    }
+
+    #[test]
+    fn bounds_html_structure_before_sanitizer_parsing() {
+        let deeply_nested = format!(
+            "{}body{}",
+            "<div>".repeat(MAX_HTML_NESTING_DEPTH + 1),
+            "</div>".repeat(MAX_HTML_NESTING_DEPTH + 1)
+        );
+        assert!(sanitize_html(&deeply_nested).is_empty());
+
+        let too_many_elements = "<br>".repeat(MAX_HTML_ELEMENTS + 1);
+        assert!(sanitize_html(&too_many_elements).is_empty());
+        let mismatched_closers = "<div></unknown>".repeat(MAX_HTML_NESTING_DEPTH + 1);
+        assert!(sanitize_html(&mismatched_closers).is_empty());
+        assert!(sanitize_html("<article><p>ordinary message</p></article>")
+            .contains("ordinary message"));
+    }
+
+    #[test]
+    fn caps_remote_images_and_rejects_private_literal_targets() {
+        let mut input =
+            String::from("<img src=\"https://127.0.0.1/pixel\"><img src=\"https://[::1]/pixel\">");
+        for index in 0..MAX_REMOTE_IMAGES_PER_MESSAGE + 5 {
+            input.push_str(&format!(
+                "<img src=\"https://images{index}.example.invalid/pixel\">"
+            ));
+        }
+        let html = sanitize_html(&input);
+        assert!(!html.contains("127.0.0.1"));
+        assert!(!html.contains("[::1]"));
+        assert_eq!(
+            html.matches(" src=\"https://").count(),
+            MAX_REMOTE_IMAGES_PER_MESSAGE
+        );
+        assert!(html.contains("loading=\"lazy\""));
+        assert!(html.contains("referrerpolicy=\"no-referrer\""));
     }
 
     #[test]
