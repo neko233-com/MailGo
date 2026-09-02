@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::{distributions::Alphanumeric, Rng};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::form_urlencoded::Serializer;
@@ -19,6 +20,20 @@ const SESSION_TTL_SECONDS: u64 = 10 * 60;
 const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:8765/oauth/callback";
 const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const HTTP_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const HTTP_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+const MAX_OAUTH_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_ACCESS_TOKEN_BYTES: usize = 128 * 1024;
+const MAX_REFRESH_TOKEN_BYTES: usize = 128 * 1024;
+const MAX_DEVICE_CODE_BYTES: usize = 64 * 1024;
+const MAX_USER_CODE_BYTES: usize = 256;
+const MAX_VERIFICATION_URI_BYTES: usize = 4096;
+const MAX_PROVIDER_MESSAGE_BYTES: usize = 2048;
+const MAX_OAUTH_ERROR_CODE_BYTES: usize = 128;
+const MAX_OAUTH_ERROR_DESCRIPTION_BYTES: usize = 1024;
+const MAX_TOKEN_TYPE_BYTES: usize = 32;
+const MAX_ACCESS_TOKEN_LIFETIME_SECONDS: u64 = 365 * 24 * 60 * 60;
+const MAX_DEVICE_FLOW_LIFETIME_SECONDS: u64 = 24 * 60 * 60;
+const MAX_DEVICE_POLL_INTERVAL_SECONDS: u64 = 5 * 60;
 const CALLBACK_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 const CALLBACK_REQUEST_DEADLINE: Duration = Duration::from_secs(3);
 const MAX_PENDING_CALLBACKS: usize = 16;
@@ -27,13 +42,49 @@ const MAX_CALLBACK_REQUEST_BYTES: usize = 16 * 1024;
 static HTTP_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
 fn http_agent() -> &'static ureq::Agent {
-    HTTP_AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .timeout_connect(HTTP_CONNECT_TIMEOUT)
-            .timeout_read(HTTP_IO_TIMEOUT)
-            .timeout_write(HTTP_IO_TIMEOUT)
-            .build()
-    })
+    HTTP_AGENT.get_or_init(|| http_agent_with_total_timeout(HTTP_TOTAL_TIMEOUT))
+}
+
+fn http_agent_with_total_timeout(total_timeout: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(HTTP_CONNECT_TIMEOUT)
+        .timeout_read(HTTP_IO_TIMEOUT)
+        .timeout_write(HTTP_IO_TIMEOUT)
+        .timeout(total_timeout)
+        .build()
+}
+
+fn parse_oauth_json<T: DeserializeOwned>(response: ureq::Response, context: &str) -> Result<T> {
+    let declared_length = response
+        .header("Content-Length")
+        .map(|value| {
+            value
+                .trim()
+                .parse::<u64>()
+                .context("OAuth response had an invalid Content-Length")
+        })
+        .transpose()?;
+    if declared_length
+        .map(|length| length > MAX_OAUTH_RESPONSE_BYTES as u64)
+        .unwrap_or(false)
+    {
+        return Err(anyhow!("{context} exceeded the response size limit"));
+    }
+
+    let capacity = declared_length
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(MAX_OAUTH_RESPONSE_BYTES);
+    let mut bytes = Zeroizing::new(Vec::with_capacity(capacity));
+    response
+        .into_reader()
+        .take((MAX_OAUTH_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("{context} could not be read"))?;
+    if bytes.len() > MAX_OAUTH_RESPONSE_BYTES {
+        return Err(anyhow!("{context} exceeded the response size limit"));
+    }
+    serde_json::from_slice(&bytes).with_context(|| format!("{context} was not valid JSON"))
 }
 
 struct PendingCallback {
@@ -157,6 +208,18 @@ struct TokenResponse {
     expires_in: Option<u64>,
 }
 
+impl Drop for TokenResponse {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        if let Some(refresh_token) = &mut self.refresh_token {
+            refresh_token.zeroize();
+        }
+        if let Some(token_type) = &mut self.token_type {
+            token_type.zeroize();
+        }
+    }
+}
+
 struct ProviderOAuthConfig {
     client_id: String,
     client_secret: Option<String>,
@@ -230,6 +293,31 @@ struct DeviceAuthorizationResponse {
     message: Option<String>,
 }
 
+impl Drop for DeviceAuthorizationResponse {
+    fn drop(&mut self) {
+        self.device_code.zeroize();
+        self.user_code.zeroize();
+        if let Some(value) = &mut self.verification_uri {
+            value.zeroize();
+        }
+        if let Some(value) = &mut self.verification_uri_complete {
+            value.zeroize();
+        }
+        if let Some(value) = &mut self.message {
+            value.zeroize();
+        }
+    }
+}
+
+struct ValidatedDeviceAuthorization {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    expires_in: u64,
+    interval: u64,
+    message: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct DeviceTokenError {
     error: Option<String>,
@@ -253,22 +341,11 @@ pub fn start_device(
         .set("Content-Type", "application/x-www-form-urlencoded")
         .send_string(&form.finish())
         .map_err(|error| oauth_request_error("OAuth device authorization endpoint", error))?;
-    let device: DeviceAuthorizationResponse = response
-        .into_json()
-        .context("OAuth device response was not valid JSON")?;
-    if device.device_code.trim().is_empty() || device.user_code.trim().is_empty() {
-        return Err(anyhow!(
-            "OAuth device response did not contain a usable code"
-        ));
-    }
-    let expires_in = device.expires_in.max(60);
-    let interval = device.interval.unwrap_or(5).max(5);
+    let device = validate_device_authorization_response(parse_oauth_json::<
+        DeviceAuthorizationResponse,
+    >(response, "OAuth device response")?)?;
     let session_id = random_string(24);
     let now = now_seconds();
-    let verification_uri = device
-        .verification_uri_complete
-        .or(device.verification_uri)
-        .ok_or_else(|| anyhow!("OAuth device response did not contain a verification URL"))?;
     let session = PendingSession {
         id: session_id.clone(),
         provider,
@@ -281,8 +358,8 @@ pub fn start_device(
         token_endpoint: config.token_endpoint.to_string(),
         created_at: now,
         device_code: Some(device.device_code),
-        device_expires_at: Some(now.saturating_add(expires_in)),
-        device_interval: interval,
+        device_expires_at: Some(now.saturating_add(device.expires_in)),
+        device_interval: device.interval,
         callback: Arc::new(Mutex::new(None)),
     };
     Ok((
@@ -290,10 +367,10 @@ pub fn start_device(
         DeviceStartResponse {
             session_id,
             user_code: device.user_code,
-            verification_uri,
+            verification_uri: device.verification_uri,
             message: device.message,
-            expires_in,
-            interval,
+            expires_in: device.expires_in,
+            interval: device.interval,
         },
     ))
 }
@@ -325,9 +402,19 @@ pub fn poll_device(session: &PendingSession) -> Result<DevicePollResult> {
     {
         Ok(response) => response,
         Err(ureq::Error::Status(400, response)) => {
-            let error = response.into_json::<DeviceTokenError>().ok();
-            let error_code = error.as_ref().and_then(|error| error.error.clone());
-            let description = error.and_then(|error| error.error_description);
+            let error =
+                parse_oauth_json::<DeviceTokenError>(response, "OAuth device token error response")
+                    .ok();
+            let (error_code, description) = match error {
+                Some(error) => (
+                    bounded_provider_code(error.error),
+                    bounded_provider_text(
+                        error.error_description,
+                        MAX_OAUTH_ERROR_DESCRIPTION_BYTES,
+                    ),
+                ),
+                None => (None, None),
+            };
             match error_code {
                 Some(error) if error == "authorization_pending" => {
                     return Ok(DevicePollResult::Pending {
@@ -369,9 +456,7 @@ pub fn poll_device(session: &PendingSession) -> Result<DevicePollResult> {
             return Err(anyhow!("OAuth device token endpoint is unavailable"))
         }
     };
-    let token: TokenResponse = response
-        .into_json()
-        .context("OAuth device token response was not valid JSON")?;
+    let token = parse_oauth_json::<TokenResponse>(response, "OAuth device token response")?;
     Ok(DevicePollResult::Complete {
         credential: serialize_token(token)?,
     })
@@ -429,35 +514,12 @@ pub fn exchange_code(
         .set("Content-Type", "application/x-www-form-urlencoded")
         .send_string(&form.finish())
         .map_err(|error| oauth_request_error("OAuth token endpoint", error))?;
-    let token: TokenResponse = response
-        .into_json()
-        .context("OAuth token response was not valid JSON")?;
-    if token.access_token.trim().is_empty() {
-        return Err(anyhow!(
-            "OAuth token response did not contain an access token"
-        ));
-    }
+    let token = parse_oauth_json::<TokenResponse>(response, "OAuth token response")?;
     serialize_token(token)
 }
 
 fn serialize_token(token: TokenResponse) -> Result<Zeroizing<String>> {
-    if token.access_token.trim().is_empty() {
-        return Err(anyhow!(
-            "OAuth token response did not contain an access token"
-        ));
-    }
-    let expires_at = token
-        .expires_in
-        .map(|seconds| now_seconds().saturating_add(seconds));
-    Ok(Zeroizing::new(
-        serde_json::to_string(&StoredCredential {
-            access_token: token.access_token,
-            refresh_token: token.refresh_token,
-            token_type: token.token_type.unwrap_or_else(|| "Bearer".into()),
-            expires_at,
-        })
-        .context("serialize OAuth credential")?,
-    ))
+    serialize_stored_credential(validated_token_credential(token, None, None)?)
 }
 
 pub fn access_token(raw: &str) -> String {
@@ -496,25 +558,160 @@ pub fn refresh_if_needed(provider: ProviderKind, raw: &str) -> Result<Zeroizing<
         .set("Content-Type", "application/x-www-form-urlencoded")
         .send_string(&form.finish())
         .map_err(|error| oauth_request_error("OAuth refresh endpoint", error))?;
-    let token: TokenResponse = response
-        .into_json()
-        .context("OAuth refresh response was not valid JSON")?;
-    if token.access_token.trim().is_empty() {
+    let token = parse_oauth_json::<TokenResponse>(response, "OAuth refresh response")?;
+    serialize_stored_credential(validated_token_credential(
+        token,
+        stored.refresh_token,
+        Some(stored.token_type),
+    )?)
+}
+
+fn validate_device_authorization_response(
+    mut device: DeviceAuthorizationResponse,
+) -> Result<ValidatedDeviceAuthorization> {
+    validate_required_secret(
+        &device.device_code,
+        MAX_DEVICE_CODE_BYTES,
+        "OAuth device code",
+    )?;
+    validate_required_text(&device.user_code, MAX_USER_CODE_BYTES, "OAuth user code")?;
+    let verification_uri = device
+        .verification_uri_complete
+        .take()
+        .or_else(|| device.verification_uri.take())
+        .ok_or_else(|| anyhow!("OAuth device response did not contain a verification URL"))?;
+    let verification_uri = validate_verification_uri(verification_uri)?;
+    Ok(ValidatedDeviceAuthorization {
+        device_code: std::mem::take(&mut device.device_code),
+        user_code: std::mem::take(&mut device.user_code),
+        verification_uri,
+        expires_in: device
+            .expires_in
+            .clamp(60, MAX_DEVICE_FLOW_LIFETIME_SECONDS),
+        interval: device
+            .interval
+            .unwrap_or(5)
+            .clamp(5, MAX_DEVICE_POLL_INTERVAL_SECONDS),
+        message: bounded_provider_text(device.message.take(), MAX_PROVIDER_MESSAGE_BYTES),
+    })
+}
+
+fn validated_token_credential(
+    mut token: TokenResponse,
+    fallback_refresh_token: Option<String>,
+    fallback_token_type: Option<String>,
+) -> Result<StoredCredential> {
+    let mut fallback_refresh_token = Zeroizing::new(fallback_refresh_token);
+    validate_required_secret(
+        &token.access_token,
+        MAX_ACCESS_TOKEN_BYTES,
+        "OAuth access token",
+    )?;
+    if let Some(refresh_token) = token.refresh_token.as_deref() {
+        validate_required_secret(
+            refresh_token,
+            MAX_REFRESH_TOKEN_BYTES,
+            "OAuth refresh token",
+        )?;
+    }
+    if let Some(refresh_token) = fallback_refresh_token.as_deref() {
+        validate_required_secret(
+            refresh_token,
+            MAX_REFRESH_TOKEN_BYTES,
+            "stored OAuth refresh token",
+        )?;
+    }
+    let token_type = token
+        .token_type
+        .as_deref()
+        .or(fallback_token_type.as_deref())
+        .unwrap_or("Bearer");
+    if token_type.is_empty()
+        || token_type.len() > MAX_TOKEN_TYPE_BYTES
+        || !token_type.eq_ignore_ascii_case("Bearer")
+    {
         return Err(anyhow!(
-            "OAuth refresh response did not contain an access token"
+            "OAuth token response used an unsupported token type"
         ));
     }
-    Ok(Zeroizing::new(
-        serde_json::to_string(&StoredCredential {
-            access_token: token.access_token,
-            refresh_token: token.refresh_token.or(stored.refresh_token),
-            token_type: token.token_type.unwrap_or(stored.token_type),
-            expires_at: token
-                .expires_in
-                .map(|seconds| now_seconds().saturating_add(seconds)),
-        })
-        .context("serialize refreshed OAuth credential")?,
-    ))
+    Ok(StoredCredential {
+        access_token: std::mem::take(&mut token.access_token),
+        refresh_token: token
+            .refresh_token
+            .take()
+            .or_else(|| fallback_refresh_token.take()),
+        token_type: "Bearer".into(),
+        expires_at: token.expires_in.map(|seconds| {
+            now_seconds().saturating_add(seconds.min(MAX_ACCESS_TOKEN_LIFETIME_SECONDS))
+        }),
+    })
+}
+
+fn serialize_stored_credential(mut credential: StoredCredential) -> Result<Zeroizing<String>> {
+    let serialized = serde_json::to_string(&credential)
+        .context("serialize OAuth credential")
+        .map(Zeroizing::new);
+    credential.access_token.zeroize();
+    if let Some(refresh_token) = &mut credential.refresh_token {
+        refresh_token.zeroize();
+    }
+    credential.token_type.zeroize();
+    serialized
+}
+
+fn validate_required_secret(value: &str, max_bytes: usize, label: &str) -> Result<()> {
+    if value.trim().is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+        return Err(anyhow!("{label} was missing or invalid"));
+    }
+    Ok(())
+}
+
+fn validate_required_text(value: &str, max_bytes: usize, label: &str) -> Result<()> {
+    if value.trim().is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+        return Err(anyhow!("{label} was missing or invalid"));
+    }
+    Ok(())
+}
+
+fn validate_verification_uri(value: String) -> Result<String> {
+    if value.len() > MAX_VERIFICATION_URI_BYTES {
+        return Err(anyhow!("OAuth verification URL was invalid"));
+    }
+    let parsed = url::Url::parse(&value).context("OAuth verification URL was invalid")?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(anyhow!("OAuth verification URL was invalid"));
+    }
+    Ok(value)
+}
+
+fn bounded_provider_code(value: Option<String>) -> Option<String> {
+    value.filter(|value| {
+        !value.trim().is_empty()
+            && value.len() <= MAX_OAUTH_ERROR_CODE_BYTES
+            && !value.chars().any(char::is_control)
+    })
+}
+
+fn bounded_provider_text(value: Option<String>, max_bytes: usize) -> Option<String> {
+    let value = value?;
+    let mut bounded = String::with_capacity(value.len().min(max_bytes));
+    for character in value.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if bounded.len().saturating_add(character.len_utf8()) > max_bytes {
+            break;
+        }
+        bounded.push(character);
+    }
+    let bounded = bounded.trim().to_string();
+    (!bounded.is_empty()).then_some(bounded)
 }
 
 fn provider_config(provider: ProviderKind) -> Result<ProviderOAuthConfig> {
@@ -853,6 +1050,168 @@ fn now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oauth_json_reader_rejects_declared_and_streamed_oversize_bodies() {
+        let declared = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{{}}",
+            MAX_OAUTH_RESPONSE_BYTES + 1
+        )
+        .parse::<ureq::Response>()
+        .expect("declared-length fixture response");
+        let declared_error =
+            parse_oauth_json::<serde_json::Value>(declared, "OAuth fixture response")
+                .expect_err("oversized declared response must fail");
+        assert!(declared_error.to_string().contains("response size limit"));
+
+        let streamed_body = "x".repeat(MAX_OAUTH_RESPONSE_BYTES + 1);
+        let streamed =
+            ureq::Response::new(200, "OK", &streamed_body).expect("streamed fixture response");
+        let streamed_error =
+            parse_oauth_json::<serde_json::Value>(streamed, "OAuth fixture response")
+                .expect_err("oversized streamed response must fail");
+        assert!(streamed_error.to_string().contains("response size limit"));
+
+        let valid = ureq::Response::new(
+            200,
+            "OK",
+            r#"{"access_token":"fixture-token","token_type":"Bearer"}"#,
+        )
+        .expect("valid fixture response");
+        let token = parse_oauth_json::<TokenResponse>(valid, "OAuth fixture response")
+            .expect("bounded JSON should parse");
+        assert_eq!(token.access_token, "fixture-token");
+    }
+
+    #[test]
+    fn oauth_total_timeout_covers_a_trickling_response_body() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("OAuth fixture listener");
+        let address = listener.local_addr().expect("OAuth fixture address");
+        let body = br#"{"access_token":"fixture-token","token_type":"Bearer"}"#;
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("OAuth fixture accept");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .expect("OAuth fixture write timeout");
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(header.as_bytes())
+                .expect("OAuth fixture headers");
+            stream.flush().expect("OAuth fixture flush");
+            for byte in body {
+                thread::sleep(Duration::from_millis(80));
+                if stream.write_all(&[*byte]).is_err() || stream.flush().is_err() {
+                    break;
+                }
+            }
+        });
+
+        let agent = http_agent_with_total_timeout(Duration::from_millis(250));
+        let started = Instant::now();
+        let response = agent
+            .get(&format!("http://{address}/token"))
+            .call()
+            .expect("OAuth fixture response headers");
+        let error = parse_oauth_json::<TokenResponse>(response, "OAuth fixture response")
+            .expect_err("trickling body must hit the total timeout");
+        assert!(error.to_string().contains("could not be read"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.join().expect("OAuth fixture server");
+    }
+
+    #[test]
+    fn token_fields_are_bounded_normalized_and_expiry_capped() {
+        let started = now_seconds();
+        let serialized = serialize_token(TokenResponse {
+            access_token: "fixture-access-token".into(),
+            token_type: Some("bearer".into()),
+            refresh_token: Some("fixture-refresh-token".into()),
+            expires_in: Some(u64::MAX),
+        })
+        .expect("valid token response");
+        let stored: StoredCredential =
+            serde_json::from_str(&serialized).expect("stored token fixture");
+        assert_eq!(stored.token_type, "Bearer");
+        assert_eq!(stored.access_token, "fixture-access-token");
+        assert_eq!(
+            stored.refresh_token.as_deref(),
+            Some("fixture-refresh-token")
+        );
+        assert!(stored.expires_at.unwrap() <= started + MAX_ACCESS_TOKEN_LIFETIME_SECONDS + 1);
+
+        assert!(serialize_token(TokenResponse {
+            access_token: "x".repeat(MAX_ACCESS_TOKEN_BYTES + 1),
+            token_type: Some("Bearer".into()),
+            refresh_token: None,
+            expires_in: Some(3600),
+        })
+        .is_err());
+        assert!(serialize_token(TokenResponse {
+            access_token: "fixture-access-token".into(),
+            token_type: Some("MAC".into()),
+            refresh_token: None,
+            expires_in: Some(3600),
+        })
+        .is_err());
+        assert!(serialize_token(TokenResponse {
+            access_token: "fixture-access-token".into(),
+            token_type: Some("Bearer".into()),
+            refresh_token: Some("unsafe\r\ntoken".into()),
+            expires_in: Some(3600),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn device_authorization_fields_are_bounded_and_urls_are_https() {
+        let validated = validate_device_authorization_response(DeviceAuthorizationResponse {
+            device_code: "fixture-device-code".into(),
+            user_code: "ABCD-EFGH".into(),
+            verification_uri: Some("https://microsoft.com/devicelogin".into()),
+            verification_uri_complete: None,
+            expires_in: u64::MAX,
+            interval: Some(u64::MAX),
+            message: Some(format!(
+                "Ready\n{}",
+                "x".repeat(MAX_PROVIDER_MESSAGE_BYTES * 2)
+            )),
+        })
+        .expect("valid device authorization fixture");
+        assert_eq!(validated.user_code, "ABCD-EFGH");
+        assert_eq!(validated.expires_in, MAX_DEVICE_FLOW_LIFETIME_SECONDS);
+        assert_eq!(validated.interval, MAX_DEVICE_POLL_INTERVAL_SECONDS);
+        let message = validated.message.expect("bounded provider message");
+        assert!(message.len() <= MAX_PROVIDER_MESSAGE_BYTES);
+        assert!(!message.chars().any(char::is_control));
+
+        assert!(
+            validate_device_authorization_response(DeviceAuthorizationResponse {
+                device_code: "fixture-device-code".into(),
+                user_code: "ABCD-EFGH".into(),
+                verification_uri: Some("http://example.invalid/device".into()),
+                verification_uri_complete: None,
+                expires_in: 900,
+                interval: Some(5),
+                message: None,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_device_authorization_response(DeviceAuthorizationResponse {
+                device_code: "x".repeat(MAX_DEVICE_CODE_BYTES + 1),
+                user_code: "ABCD-EFGH".into(),
+                verification_uri: Some("https://microsoft.com/devicelogin".into()),
+                verification_uri_complete: None,
+                expires_in: 900,
+                interval: Some(5),
+                message: None,
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn pkce_start_contains_no_secret_or_token() {

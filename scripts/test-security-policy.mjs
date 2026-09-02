@@ -33,6 +33,14 @@ assert(nativeMain.includes('legacy custom account credentials require reauthoriz
 
 assert(oauth.includes('CALLBACK_REQUEST_DEADLINE'), 'OAuth callbacks need an absolute request deadline')
 assert(oauth.includes('checked_duration_since(Instant::now())'), 'OAuth read timeout must shrink with the remaining deadline')
+assert(oauth.includes('HTTP_TOTAL_TIMEOUT'), 'OAuth provider calls need an overall request deadline')
+assert(oauth.includes('.timeout(total_timeout)'), 'OAuth provider deadlines must include response-body reads')
+assert(oauth.includes('MAX_OAUTH_RESPONSE_BYTES'), 'OAuth JSON needs an explicit response-body limit')
+assert(oauth.includes('.take((MAX_OAUTH_RESPONSE_BYTES + 1) as u64)'), 'OAuth JSON must be bounded before deserialization')
+assert(!oauth.includes('.into_json()'), 'OAuth responses must not use unbounded JSON body reads')
+assert(oauth.includes('MAX_ACCESS_TOKEN_BYTES'), 'OAuth access tokens need a field-size limit')
+assert(oauth.includes('MAX_REFRESH_TOKEN_BYTES'), 'OAuth refresh tokens need a field-size limit')
+assert(oauth.includes('MAX_VERIFICATION_URI_BYTES'), 'OAuth verification URLs need a field-size limit')
 
 assert(nativeMail.includes('is_unsafe_attachment_format_character(character)'), 'attachment names must remove unsafe Unicode format controls')
 assert(nativeMail.includes("'\\u{202a}'..='\\u{202e}'"), 'attachment names must remove bidi embedding and override controls')
