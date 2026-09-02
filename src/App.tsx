@@ -15,6 +15,7 @@ import { mapWithConcurrency } from './lib/asyncPool'
 import { invoke, readNativeState } from './lib/ipc'
 import { inspectExternalLink, type ExternalLinkInspection } from './linkSafety'
 import { applyMailRules, domainFromSender } from './mailRules'
+import { revealFirstMailboxWhileSyncing, shouldSelectFirstRevealedMessage } from './mailboxBootstrap'
 import { buildMailboxCountIndex, isSameNativeFolder, nativeFolderCountKey, nativeFolderName } from './mailboxCounts'
 import { mailNeedsBodyHydration, selectBodyHydrationCandidates } from './messageHydration'
 import { normalizeAccountSignature } from './signature'
@@ -621,6 +622,7 @@ function App() {
   const [isSyncing, setSyncing] = useState(false)
   const [isLoadingEarlier, setLoadingEarlier] = useState(false)
   const [isMailboxHydrating, setMailboxHydrating] = useState(isNativeRuntime)
+  const [mailboxBootstrapAccountId, setMailboxBootstrapAccountId] = useState<string | null>(null)
   const [loadingMessageId, setLoadingMessageId] = useState<string | null>(null)
   const [mailboxMeta, setMailboxMeta] = useState<Record<string, MailboxPagingMeta>>({})
   const mailboxMetaRef = useRef<Record<string, MailboxPagingMeta>>({})
@@ -628,6 +630,7 @@ function App() {
   const [nativeFolders, setNativeFolders] = useState<Record<string, string[]>>({})
   const [nativeFolderLabels, setNativeFolderLabels] = useState<Record<string, Record<string, string>>>({})
   const [selectedNativeFolder, setSelectedNativeFolder] = useState<{ accountId: string; name: string } | null>(null)
+  const selectedMailboxViewRef = useRef({ accountId: selectedAccountId, folder: selectedFolder, nativeFolder: selectedNativeFolder })
   const [isHtmlMode, setHtmlMode] = useState(false)
   const [isImporting, setImporting] = useState(false)
   const [toasts, setToasts] = useState<Toast[]>([])
@@ -673,6 +676,10 @@ function App() {
   useEffect(() => {
     mailboxMetaRef.current = mailboxMeta
   }, [mailboxMeta])
+
+  useEffect(() => {
+    selectedMailboxViewRef.current = { accountId: selectedAccountId, folder: selectedFolder, nativeFolder: selectedNativeFolder }
+  }, [selectedAccountId, selectedFolder, selectedNativeFolder])
 
   const rememberMailboxPage = useCallback((result: NativeMailboxResponse, preserveOlderCursor = false) => {
     const next = pagingMetaFromResponse(result)
@@ -2391,21 +2398,47 @@ function App() {
     }
   }
 
-  const refreshAccountMailbox = async (account: MailAccount) => {
-    if (!isNativeRuntime) return
-    const mailbox = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, limit: INITIAL_MAILBOX_PAGE_SIZE })
+  const applyAccountMailboxPage = (account: MailAccount, mailbox: NativeMailboxResponse) => {
     const converted = (mailbox.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, account))
-    if (mailbox.mailbox) {
-      rememberMailboxPage(mailbox, true)
-      startTransition(() => setMails((current) => mergeMailboxPage(current, converted, account.id, mailbox.mailbox!.folder, 'latest')))
+    if (!mailbox.mailbox) return false
+    rememberMailboxPage(mailbox, true)
+    startTransition(() => setMails((current) => mergeMailboxPage(current, converted, account.id, mailbox.mailbox!.folder, 'latest')))
+    const selectedView = selectedMailboxViewRef.current
+    if (converted.length && shouldSelectFirstRevealedMessage(selectedView, account.id)) {
+      setSelectedMailId((current) => current === '' || current === 'launch-plan' ? converted[0].id : current)
     }
-    if (converted.length) setSelectedMailId((current) => current === '' || current === 'launch-plan' ? converted[0].id : current)
+    return true
+  }
+
+  const refreshAccountMailbox = async (account: MailAccount) => {
+    if (!isNativeRuntime) return false
+    const mailbox = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, limit: INITIAL_MAILBOX_PAGE_SIZE })
+    return applyAccountMailboxPage(account, mailbox)
   }
 
   const syncAccountInBackground = async (account: MailAccount, accountList: MailAccount[]) => {
     if (!isNativeRuntime || offlineMode) return
+    let syncSettled = false
+    const syncRequest = invoke<NativeSyncItem>('sync.account', { accountId: account.id }, 60_000)
+      .finally(() => { syncSettled = true })
+    const firstMailbox = revealFirstMailboxWhileSyncing<NativeMailboxResponse>({
+      isSyncSettled: () => syncSettled,
+      readMailbox: () => invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, limit: INITIAL_MAILBOX_PAGE_SIZE }),
+      hasMailbox: (result) => Boolean(result.mailbox),
+      revealMailbox: (result) => {
+        applyAccountMailboxPage(account, result)
+        const visibleUnread = result.mailbox?.messages.filter((message) => message.unread).length ?? 0
+        if (visibleUnread > 0) {
+          setAccounts((current) => current.map((item) => item.id === account.id
+            ? { ...item, unread: Math.max(item.unread, visibleUnread) }
+            : item))
+        }
+        setMailboxBootstrapAccountId((current) => current === account.id ? null : current)
+      },
+    })
     try {
-      const result = await invoke<NativeSyncItem>('sync.account', { accountId: account.id }, 60_000)
+      const result = await syncRequest
+      await firstMailbox
       if (result.folders?.length) setNativeFolders((current) => ({ ...current, [account.id]: result.folders! }))
       if (result.folderLabels) setNativeFolderLabels((current) => ({ ...current, [account.id]: result.folderLabels! }))
       setAccounts((current) => current.map((item) => item.id === account.id
@@ -2422,6 +2455,7 @@ function App() {
       ])
       pushToast(`${account.label} 已完成首次同步`, 'success')
     } catch (error) {
+      await firstMailbox
       const message = error instanceof Error ? error.message : ''
       if (/already in progress/i.test(message)) {
         pushToast(`${account.label} 正在同步`, 'info')
@@ -2432,6 +2466,8 @@ function App() {
         ? { ...item, status: needsAuth ? 'needs-auth' as const : 'offline' as const, lastSync: needsAuth ? '等待重新授权' : '首次同步失败，可重试' }
         : item))
       pushToast(needsAuth ? `${account.label} 需要重新授权` : `${account.label} 首次同步失败，可稍后重试`, needsAuth ? 'error' : 'info')
+    } finally {
+      setMailboxBootstrapAccountId((current) => current === account.id ? null : current)
     }
   }
 
@@ -2817,6 +2853,7 @@ function App() {
       pushToast(`${selectedProvider.label}账户${existingAccount ? '已重新授权' : '已加入'}，当前为离线模式`, 'success')
       return
     }
+    setMailboxBootstrapAccountId(id)
     pushToast(`${selectedProvider.label}账户${existingAccount ? '已重新授权' : '已加入'}，后台同步中`, 'success')
     void syncAccountInBackground(newAccount, nextAccounts)
   }
@@ -3078,6 +3115,17 @@ function App() {
             : localSearchTruncated || serverSearchTruncated
               ? '已显示部分结果'
               : offlineMode ? '本地结果' : '本地 + 云端'
+  const isSelectedMailboxBootstrapping = mailboxBootstrapAccountId != null
+    && mailboxBootstrapAccountId === selectedAccountId
+    && selectedFolder === 'inbox'
+    && !selectedNativeFolder
+  const isCurrentMailboxLoading = isNativeRuntime
+    && (!nativeStateReady || isMailboxHydrating || isSelectedMailboxBootstrapping)
+  const currentMailboxLoadingLabel = !nativeStateReady
+    ? '正在读取本地账户，主界面已可操作'
+    : isSelectedMailboxBootstrapping
+      ? '正在接收首批邮件，收件箱落库后立即显示；其他文件夹继续后台同步'
+      : '正在从本地索引加载当前页，其他区域仍可操作'
 
   return (
     <div className={`app-shell ${isCompactDensity ? 'is-compact-density' : ''}`}>
@@ -3220,8 +3268,8 @@ function App() {
               </div>}
             </div>
           </div>}
-          <div ref={mailListRef} className="mail-list-scroll" onScroll={handleMailListScroll} aria-busy={isNativeRuntime && (!nativeStateReady || isMailboxHydrating) || isLoadingEarlier || Boolean(outboxAction) || Boolean(snoozeActionId)}>
-            {isNativeRuntime && (!nativeStateReady || isMailboxHydrating) && <div className="list-loading-strip" role="status"><span className="loading-spinner" aria-hidden="true" /><span>{nativeStateReady ? '正在从本地索引加载当前页，其他区域仍可操作' : '正在读取本地账户，主界面已可操作'}</span></div>}
+          <div ref={mailListRef} className="mail-list-scroll" onScroll={handleMailListScroll} aria-busy={isCurrentMailboxLoading || isLoadingEarlier || Boolean(outboxAction) || Boolean(snoozeActionId)}>
+            {isCurrentMailboxLoading && <div className="list-loading-strip" role="status"><span className="loading-spinner" aria-hidden="true" /><span>{currentMailboxLoadingLabel}</span></div>}
             {nativeStateError && <div className="local-state-error" role="alert"><Icon name="info" size={18} /><span><strong>本地邮件服务连接失败</strong>{nativeStateError}<small>账户文件与安全凭据保持原样，请重新启动 MailGo 或查看本机日志。</small></span></div>}
             {virtualMailItems.length > 0 && <div className="mail-virtual-space" style={{ height: mailListVirtualizer.getTotalSize() }}>
               {mailListVirtualizer.getVirtualItems().map((virtualItem) => {
@@ -3238,7 +3286,7 @@ function App() {
                 </div>
               })}
             </div>}
-            {visibleMails.length === 0 && <div className="empty-list"><span className="empty-icon"><Icon name={selectedFolder === 'outbox' ? 'send' : selectedFolder === 'snoozed' ? 'clock' : isNativeRuntime && (!nativeStateReady || isMailboxHydrating) ? 'rotate' : accounts.length === 0 ? 'user' : 'search'} size={24} /></span><strong>{selectedFolder === 'outbox' ? '发件箱是空的' : selectedFolder === 'snoozed' ? '没有稍后处理的邮件' : isNativeRuntime && (!nativeStateReady || isMailboxHydrating) ? '正在打开本地邮箱' : accounts.length === 0 ? '还没有添加邮箱账户' : '没有找到邮件'}</strong><p>{selectedFolder === 'outbox' ? '待发送邮件会先安全写入本机，再由后台异步发送。' : selectedFolder === 'snoozed' ? '在阅读工具栏点击时钟，可让邮件在指定时间自动回到收件箱。' : isNativeRuntime && (!nativeStateReady || isMailboxHydrating) ? '先显示本地索引页；远程邮件会在进入后异步同步。' : accounts.length === 0 ? '添加 Google、QQ、Outlook 或自定义 IMAP/SMTP 账户后开始使用。' : '试试清除筛选或搜索其他关键词。'}</p>{isNativeRuntime && nativeStateReady && accounts.length === 0 && <button type="button" className="empty-list-action" onClick={openNewAccount}><Icon name="add" size={16} />添加第一个账户</button>}</div>}
+            {visibleMails.length === 0 && <div className="empty-list"><span className="empty-icon"><Icon name={selectedFolder === 'outbox' ? 'send' : selectedFolder === 'snoozed' ? 'clock' : isCurrentMailboxLoading ? 'rotate' : accounts.length === 0 ? 'user' : 'search'} size={24} /></span><strong>{selectedFolder === 'outbox' ? '发件箱是空的' : selectedFolder === 'snoozed' ? '没有稍后处理的邮件' : isCurrentMailboxLoading ? '正在打开本地邮箱' : accounts.length === 0 ? '还没有添加邮箱账户' : '没有找到邮件'}</strong><p>{selectedFolder === 'outbox' ? '待发送邮件会先安全写入本机，再由后台异步发送。' : selectedFolder === 'snoozed' ? '在阅读工具栏点击时钟，可让邮件在指定时间自动回到收件箱。' : isCurrentMailboxLoading ? '先显示收件箱首批邮件；其他服务器文件夹会继续在后台完成。' : accounts.length === 0 ? '添加 Google、QQ、Outlook 或自定义 IMAP/SMTP 账户后开始使用。' : '试试清除筛选或搜索其他关键词。'}</p>{isNativeRuntime && nativeStateReady && accounts.length === 0 && <button type="button" className="empty-list-action" onClick={openNewAccount}><Icon name="add" size={16} />添加第一个账户</button>}</div>}
             {isLoadingEarlier && <div className="mail-page-loading" role="status"><span className="loading-spinner" aria-hidden="true" />正在增量加载更早邮件…</div>}
           </div>
           <div className="list-footer"><span>{selectedFolder === 'outbox' ? `${visibleMails.length} 封待发送` : selectedFolder === 'snoozed' ? `${visibleMails.length} 封稍后处理` : visibleThreads.length ? `${visibleThreads.length} 个会话 · ${visibleMails.length} 封邮件` : '0 封邮件'}</span><div className="list-footer-actions">{canLoadEarlier && <button type="button" className="load-earlier-button" onClick={() => { void loadEarlier() }} disabled={isLoadingEarlier}>{isLoadingEarlier ? '加载中…' : '加载更早邮件'}</button>}<TooltipButton label={selectedFolder === 'outbox' ? '刷新发件箱' : selectedFolder === 'snoozed' ? '刷新稍后处理' : '刷新邮件'} onClick={selectedFolder === 'outbox' ? () => { void refreshOutbox() } : selectedFolder === 'snoozed' ? () => { void refreshSnoozed() } : handleSync}><Icon name="rotate" size={17} /></TooltipButton></div></div>
