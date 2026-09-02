@@ -5,6 +5,7 @@ import appIconUrl from '../resources/icons/mailgo-64.png'
 import { AccountSignatureSettings } from './components/AccountSignatureSettings'
 import { ExternalLinkDialog } from './components/ExternalLinkDialog'
 import { Icon, type IconName } from './components/Icon'
+import { RecipientInput } from './components/RecipientInput'
 import { buildComposeThreadHeaders, type ComposeMode } from './compose-thread'
 import { sanitizeCustomCss } from './customCss'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
@@ -38,12 +39,12 @@ const ATTACHMENT_DOWNLOAD_CONCURRENCY = 3
 const MOBILE_LAYOUT_QUERY = '(max-width: 900px)'
 const COMPACT_DENSITY_QUERY = '(max-height: 820px), (max-width: 1366px)'
 const AUTO_COLLAPSE_SIDEBAR_QUERY = '(max-width: 1366px) and (min-width: 901px)'
-const COMPACT_MAIL_GROUP_HEIGHT = 18
-const COMPACT_MAIL_ROW_HEIGHT = 40
-const COMFORTABLE_MAIL_GROUP_HEIGHT = 26
-const COMFORTABLE_MAIL_ROW_HEIGHT = 54
-const MOBILE_MAIL_GROUP_HEIGHT = 24
-const MOBILE_MAIL_ROW_HEIGHT = 58
+const COMPACT_MAIL_GROUP_HEIGHT = 16
+const COMPACT_MAIL_ROW_HEIGHT = 36
+const COMFORTABLE_MAIL_GROUP_HEIGHT = 22
+const COMFORTABLE_MAIL_ROW_HEIGHT = 48
+const MOBILE_MAIL_GROUP_HEIGHT = 18
+const MOBILE_MAIL_ROW_HEIGHT = 44
 const HTML_PRESENTATIONAL_SIZING_ATTRIBUTES = new Set([
   'border', 'cellpadding', 'cellspacing', 'face', 'height', 'nowrap', 'size', 'width',
 ])
@@ -521,7 +522,7 @@ function loadTheme(): ThemeMode {
 }
 
 function loadDisplayDensity(): DisplayDensity {
-  return readLocalStorageValue('mailgo-display-density') === 'comfortable' ? 'comfortable' : 'compact'
+  return readLocalStorageValue('mailgo-display-density-v2') === 'comfortable' ? 'comfortable' : 'compact'
 }
 
 function loadRemoteImages() {
@@ -936,7 +937,7 @@ function App() {
   }, [isNativeRuntime, nativeStateReady, theme])
 
   useEffect(() => {
-    writeLocalStorageValue('mailgo-display-density', displayDensity)
+    writeLocalStorageValue('mailgo-display-density-v2', displayDensity)
   }, [displayDensity])
 
   useEffect(() => {
@@ -3517,8 +3518,8 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
   return <motion.div className="modal-backdrop compose-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) void requestClose() }}>
     <motion.div className="compose-modal" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1 }} exit={{ opacity: 0, y: 20 }}>
       <div className="compose-header"><strong>{composeTitle}</strong><div><TooltipButton label="最小化撰写窗口"><span className="window-minimize" /></TooltipButton><TooltipButton label="关闭撰写窗口" onClick={() => { void requestClose() }}><Icon name="close" size={17} /></TooltipButton></div></div>
-      <div className="compose-recipient-row"><label>收件人<input autoFocus value={to} onChange={(event) => setTo(event.target.value)} placeholder="name@example.com，可用逗号分隔多个地址" /></label><button type="button" className="copy-fields-button" onClick={() => setShowCopyFields((value) => !value)} aria-expanded={showCopyFields}>{showCopyFields ? '隐藏抄送' : '抄送 / 密送'}</button></div>
-      {showCopyFields && <><label>抄送<input value={cc} onChange={(event) => setCc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label><label>密送<input value={bcc} onChange={(event) => setBcc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label></>}
+      <div className="compose-recipient-row"><RecipientInput fieldId="compose-to" label="收件人" autoFocus value={to} onChange={setTo} accountId={accountId} senderEmail={senderEmail} placeholder="姓名或邮箱，可用逗号分隔多个地址" /><button type="button" className="copy-fields-button" onClick={() => setShowCopyFields((value) => !value)} aria-expanded={showCopyFields}>{showCopyFields ? '隐藏抄送' : '抄送 / 密送'}</button></div>
+      {showCopyFields && <><RecipientInput fieldId="compose-cc" label="抄送" value={cc} onChange={setCc} accountId={accountId} senderEmail={senderEmail} placeholder="输入姓名或邮箱" /><RecipientInput fieldId="compose-bcc" label="密送" value={bcc} onChange={setBcc} accountId={accountId} senderEmail={senderEmail} placeholder="输入姓名或邮箱" /></>}
       <label>主题<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="主题" /></label>
       <textarea className="compose-body" value={body} onChange={(event) => setBody(event.target.value)} placeholder={htmlEnabled ? '输入内容，将以 HTML + 纯文本双格式发送…' : '写下你的邮件…'} />
       {accountSignature && <div className="compose-signature-preview"><span>账户签名 · 发送时自动加入</span><p>{accountSignature}</p></div>}

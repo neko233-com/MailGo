@@ -143,6 +143,19 @@ export interface NativeLocalSearchResponse {
   indexing: boolean
 }
 
+export interface NativeRecipientSuggestion {
+  name: string
+  email: string
+  frequency: number
+  lastSeen?: string
+}
+
+export interface NativeRecipientSuggestionResponse {
+  suggestions: NativeRecipientSuggestion[]
+  truncated: boolean
+  indexing: boolean
+}
+
 export interface NativeQueueStatus {
   flags: number
   moves: number

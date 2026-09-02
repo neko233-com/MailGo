@@ -76,6 +76,9 @@ try {
     & npm run test:link-safety
     if ($LASTEXITCODE -ne 0) { throw "external link safety checks failed with exit code $LASTEXITCODE" }
 
+    & npm run test:recipients
+    if ($LASTEXITCODE -ne 0) { throw "recipient autocomplete checks failed with exit code $LASTEXITCODE" }
+
     & cargo fmt --manifest-path 'native\Cargo.toml' -- --check
     if ($LASTEXITCODE -ne 0) { throw "cargo fmt check failed with exit code $LASTEXITCODE" }
 

@@ -2493,6 +2493,36 @@ fn handle_ipc(
                     "indexing": result.indexing,
                 }))
             }
+            "contacts.suggest" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                let account = account_for(shared, &account_id)?;
+                let query =
+                    bounded_string_field(&message.payload, "query", MAX_SEARCH_QUERY_BYTES)?
+                        .trim()
+                        .to_string();
+                if query.is_empty() || query.chars().any(char::is_control) {
+                    return Err(anyhow!("recipient suggestion query is invalid"));
+                }
+                let limit = message
+                    .payload
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(8)
+                    .clamp(1, 20);
+                let result = cache_db::suggest_recipients(
+                    &cache_dir(),
+                    &account.id,
+                    &account.email,
+                    &query,
+                    limit,
+                )?;
+                Ok(json!({
+                    "suggestions": result.suggestions,
+                    "truncated": result.truncated,
+                    "indexing": result.indexing,
+                }))
+            }
             "sync.all" => {
                 ensure_network_allowed(shared)?;
                 let accounts = shared

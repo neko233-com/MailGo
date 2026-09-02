@@ -32,7 +32,11 @@ const MAX_SEARCH_WORD_CHARACTERS: usize = 256;
 const MAX_SEARCH_TERMS_PER_MESSAGE: usize = 512;
 const MAX_SEARCH_QUERY_TERMS: usize = 32;
 const MAX_LOCAL_SEARCH_CANDIDATES: usize = 2000;
-const DATABASE_SCHEMA_VERSION: i64 = 3;
+const MAX_RECIPIENT_INDEX_CANDIDATES: usize = 384;
+const MAX_RECIPIENT_RECENT_CANDIDATES: usize = 128;
+const MAX_RECIPIENT_FALLBACK_CANDIDATES: usize = 512;
+const MAX_RECIPIENT_SUGGESTIONS: usize = 20;
+const DATABASE_SCHEMA_VERSION: i64 = 4;
 const MAX_PAGE_SIZE: usize = 500;
 const MAX_SYNC_SUMMARIES: usize = 10_000;
 const MAX_ENCRYPTED_ROW_BYTES: usize = 8 * 1024 * 1024;
@@ -134,6 +138,22 @@ pub struct MailboxPage {
 #[derive(Debug)]
 pub struct LocalSearchResult {
     pub messages: Vec<CachedMessage>,
+    pub truncated: bool,
+    pub indexing: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipientSuggestion {
+    pub name: String,
+    pub email: String,
+    pub frequency: u32,
+    pub last_seen: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct RecipientSuggestionResult {
+    pub suggestions: Vec<RecipientSuggestion>,
     pub truncated: bool,
     pub indexing: bool,
 }
@@ -348,11 +368,23 @@ fn search_grams(words: &[String], query: bool, limit: usize) -> Vec<String> {
     grams
 }
 
-fn blind_search_term(key: &[u8; SEARCH_KEY_BYTES], gram: &str) -> Result<[u8; 32]> {
+fn blind_index_term(
+    key: &[u8; SEARCH_KEY_BYTES],
+    namespace: &[u8],
+    gram: &str,
+) -> Result<[u8; 32]> {
     let mut mac = HmacSha256::new_from_slice(key).context("initialize local search HMAC")?;
-    mac.update(b"mailgo-search-v1\0");
+    mac.update(namespace);
     mac.update(gram.as_bytes());
     Ok(mac.finalize().into_bytes().into())
+}
+
+fn blind_search_term(key: &[u8; SEARCH_KEY_BYTES], gram: &str) -> Result<[u8; 32]> {
+    blind_index_term(key, b"mailgo-search-v1\0", gram)
+}
+
+fn blind_recipient_term(key: &[u8; SEARCH_KEY_BYTES], gram: &str) -> Result<[u8; 32]> {
+    blind_index_term(key, b"mailgo-recipient-v1\0", gram)
 }
 
 fn message_search_terms(
@@ -369,10 +401,40 @@ fn message_search_terms(
     .collect()
 }
 
+fn recipient_search_words(message: &CachedMessage) -> Vec<String> {
+    normalize_search_words(
+        [message.sender_name.as_str(), message.sender_email.as_str()]
+            .into_iter()
+            .chain(message.to.iter().map(String::as_str))
+            .chain(message.cc.iter().map(String::as_str)),
+    )
+}
+
+fn recipient_search_terms(
+    key: &[u8; SEARCH_KEY_BYTES],
+    message: &CachedMessage,
+) -> Result<Vec<[u8; 32]>> {
+    search_grams(
+        &recipient_search_words(message),
+        false,
+        MAX_SEARCH_TERMS_PER_MESSAGE,
+    )
+    .iter()
+    .map(|gram| blind_recipient_term(key, gram))
+    .collect()
+}
+
 fn query_search_terms(key: &[u8; SEARCH_KEY_BYTES], words: &[String]) -> Result<Vec<[u8; 32]>> {
     search_grams(words, true, MAX_SEARCH_QUERY_TERMS)
         .iter()
         .map(|gram| blind_search_term(key, gram))
+        .collect()
+}
+
+fn recipient_query_terms(key: &[u8; SEARCH_KEY_BYTES], words: &[String]) -> Result<Vec<[u8; 32]>> {
+    search_grams(words, true, MAX_SEARCH_QUERY_TERMS)
+        .iter()
+        .map(|gram| blind_recipient_term(key, gram))
         .collect()
 }
 
@@ -753,6 +815,7 @@ fn initialize(connection: &mut Connection) -> Result<()> {
             payload BLOB NOT NULL,
             encryption_version INTEGER NOT NULL DEFAULT 0,
             search_version INTEGER NOT NULL DEFAULT 0,
+            recipient_version INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL,
             PRIMARY KEY (account_key, folder_key, uid),
             FOREIGN KEY (account_key, folder_key)
@@ -779,6 +842,12 @@ fn initialize(connection: &mut Connection) -> Result<()> {
     if !message_columns.contains("search_version") {
         connection.execute(
             "ALTER TABLE messages ADD COLUMN search_version INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !message_columns.contains("recipient_version") {
+        connection.execute(
+            "ALTER TABLE messages ADD COLUMN recipient_version INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }
@@ -880,6 +949,17 @@ fn initialize(connection: &mut Connection) -> Result<()> {
         ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS message_search_terms_owner
             ON message_search_terms(account_key, folder_key, uid);
+        CREATE TABLE IF NOT EXISTS recipient_search_terms (
+            term BLOB NOT NULL,
+            account_key BLOB NOT NULL,
+            folder_key BLOB NOT NULL,
+            uid INTEGER NOT NULL,
+            PRIMARY KEY (term, account_key, folder_key, uid),
+            FOREIGN KEY (account_key, folder_key, uid)
+                REFERENCES messages(account_key, folder_key, uid) ON DELETE CASCADE
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS recipient_search_terms_owner
+            ON recipient_search_terms(account_key, folder_key, uid);
         CREATE TABLE IF NOT EXISTS search_index_meta (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             key_fingerprint BLOB NOT NULL,
@@ -1131,8 +1211,10 @@ fn ensure_search_key_state(
 
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute("DELETE FROM message_search_terms", [])?;
+    transaction.execute("DELETE FROM recipient_search_terms", [])?;
     transaction.execute(
-        "UPDATE messages SET search_version = 0 WHERE search_version != 0",
+        "UPDATE messages SET search_version = 0, recipient_version = 0
+         WHERE search_version != 0 OR recipient_version != 0",
         [],
     )?;
     transaction.execute(
@@ -1152,7 +1234,8 @@ fn replace_message_search_terms(
     account_key: &[u8],
     folder_key: &[u8],
     uid: i64,
-    terms: &[[u8; 32]],
+    message_terms: &[[u8; 32]],
+    recipient_terms: &[[u8; 32]],
 ) -> Result<()> {
     connection.execute(
         "DELETE FROM message_search_terms
@@ -1164,12 +1247,26 @@ fn replace_message_search_terms(
             "INSERT OR IGNORE INTO message_search_terms(term, account_key, folder_key, uid)
              VALUES (?1, ?2, ?3, ?4)",
         )?;
-        for term in terms {
+        for term in message_terms {
             insert.execute(params![term, account_key, folder_key, uid])?;
         }
     }
     connection.execute(
-        "UPDATE messages SET search_version = ?4
+        "DELETE FROM recipient_search_terms
+         WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3",
+        params![account_key, folder_key, uid],
+    )?;
+    {
+        let mut insert = connection.prepare(
+            "INSERT OR IGNORE INTO recipient_search_terms(term, account_key, folder_key, uid)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for term in recipient_terms {
+            insert.execute(params![term, account_key, folder_key, uid])?;
+        }
+    }
+    connection.execute(
+        "UPDATE messages SET search_version = ?4, recipient_version = ?4
          WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3",
         params![account_key, folder_key, uid, SEARCH_INDEX_VERSION],
     )?;
@@ -1188,7 +1285,7 @@ pub fn rebuild_search_index_batch(
             let mut statement = transaction.prepare(
                 "SELECT account_key, folder_key, uid, payload
                  FROM messages
-                 WHERE search_version != ?1
+                 WHERE search_version != ?1 OR recipient_version != ?1
                  ORDER BY updated_at DESC
                  LIMIT ?2",
             )?;
@@ -1224,26 +1321,38 @@ pub fn rebuild_search_index_batch(
                     {
                         return Err(anyhow!("indexed message cache identity mismatch"));
                     }
-                    message_search_terms(&key, &message)
+                    Ok((
+                        message_search_terms(&key, &message)?,
+                        recipient_search_terms(&key, &message)?,
+                    ))
                 });
             match terms {
-                Ok(terms) => replace_message_search_terms(
+                Ok((message_terms, recipient_terms)) => replace_message_search_terms(
                     &transaction,
                     account_key,
                     folder_key,
                     *uid,
-                    &terms,
+                    &message_terms,
+                    &recipient_terms,
                 )?,
                 Err(error) => {
                     // Search is a secondary index. Mark one unreadable row complete with no terms
                     // so it cannot stall every later batch or prevent healthy mail from being found.
                     tracing::warn!(error = %error, "skipped one unreadable message while rebuilding local search");
-                    replace_message_search_terms(&transaction, account_key, folder_key, *uid, &[])?;
+                    replace_message_search_terms(
+                        &transaction,
+                        account_key,
+                        folder_key,
+                        *uid,
+                        &[],
+                        &[],
+                    )?;
                 }
             }
         }
         let has_more: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE search_version != ?1 LIMIT 1)",
+            "SELECT EXISTS(SELECT 1 FROM messages
+             WHERE search_version != ?1 OR recipient_version != ?1 LIMIT 1)",
             params![SEARCH_INDEX_VERSION],
             |row| row.get(0),
         )?;
@@ -1886,6 +1995,339 @@ pub fn search_messages(
     Ok(result)
 }
 
+#[derive(Debug)]
+struct RecipientAggregate {
+    suggestion: RecipientSuggestion,
+    score: u16,
+}
+
+fn safe_recipient_name(value: &str, email: &str) -> String {
+    let mut output = String::new();
+    let mut pending_space = false;
+    for character in value.trim().chars() {
+        if character.is_control()
+            || matches!(
+                character,
+                '\u{200b}'..='\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2060}'..='\u{2069}'
+                    | '\u{feff}'
+                    | '<'
+                    | '>'
+                    | ','
+                    | ';'
+                    | '"'
+                    | '\\'
+            )
+        {
+            pending_space = !output.is_empty();
+            continue;
+        }
+        if character.is_whitespace() {
+            pending_space = !output.is_empty();
+            continue;
+        }
+        if pending_space && output.len() < 160 {
+            output.push(' ');
+            pending_space = false;
+        }
+        if output.len() + character.len_utf8() > 160 {
+            break;
+        }
+        output.push(character);
+    }
+    let output = output.trim().to_string();
+    if output.eq_ignore_ascii_case(email) {
+        String::new()
+    } else {
+        output
+    }
+}
+
+fn recipient_match_score(name: &str, email: &str, query_words: &[String]) -> Option<u16> {
+    let searchable = normalize_search_words([name, email]);
+    if !query_words
+        .iter()
+        .all(|query| searchable.iter().any(|word| word.contains(query)))
+    {
+        return None;
+    }
+    let email_lower = email.to_lowercase();
+    let name_lower = name.to_lowercase();
+    let raw_query = query_words.join(" ");
+    let first = query_words.first().map(String::as_str).unwrap_or_default();
+    let score = if email_lower == raw_query {
+        1_000
+    } else if email_lower.starts_with(&raw_query) {
+        850
+    } else if email_lower
+        .split_once('@')
+        .is_some_and(|(local, _)| local.starts_with(first))
+    {
+        760
+    } else if name_lower.starts_with(&raw_query) || name_lower.starts_with(first) {
+        680
+    } else if email_lower.contains(&raw_query) {
+        520
+    } else if name_lower.contains(&raw_query) {
+        440
+    } else {
+        300
+    };
+    Some(score)
+}
+
+fn collect_recipient_candidate(
+    aggregates: &mut HashMap<String, RecipientAggregate>,
+    seen_in_message: &mut HashSet<String>,
+    name: &str,
+    email: &str,
+    own_email: &str,
+    query_words: &[String],
+    received_at: Option<&str>,
+) {
+    let email = email.trim();
+    if email.eq_ignore_ascii_case(own_email) || crate::providers::validate_email(email).is_err() {
+        return;
+    }
+    let normalized_email = email.to_lowercase();
+    if !seen_in_message.insert(normalized_email.clone()) {
+        return;
+    }
+    let name = safe_recipient_name(name, email);
+    let Some(score) = recipient_match_score(&name, email, query_words) else {
+        return;
+    };
+    let entry = aggregates
+        .entry(normalized_email)
+        .or_insert_with(|| RecipientAggregate {
+            suggestion: RecipientSuggestion {
+                name: name.clone(),
+                email: email.to_string(),
+                frequency: 0,
+                last_seen: received_at.map(str::to_string),
+            },
+            score,
+        });
+    entry.suggestion.frequency = entry.suggestion.frequency.saturating_add(1);
+    entry.score = entry.score.max(score);
+    if entry.suggestion.name.is_empty() && !name.is_empty() {
+        entry.suggestion.name = name;
+    }
+    if received_at.is_some_and(|date| {
+        entry
+            .suggestion
+            .last_seen
+            .as_deref()
+            .is_none_or(|stored| date > stored)
+    }) {
+        entry.suggestion.last_seen = received_at.map(str::to_string);
+        entry.suggestion.email = email.to_string();
+    }
+}
+
+pub fn suggest_recipients(
+    cache_root: &Path,
+    account_id: &str,
+    own_email: &str,
+    query: &str,
+    limit: usize,
+) -> Result<RecipientSuggestionResult> {
+    let query_words = query_search_words(query);
+    if query_words.is_empty() {
+        return Ok(RecipientSuggestionResult {
+            suggestions: Vec::new(),
+            truncated: false,
+            indexing: false,
+        });
+    }
+    let key = load_search_key(cache_root)?;
+    let query_terms = recipient_query_terms(&key, &query_words)?;
+    let account_key = identity_key(account_id);
+    let bounded_limit = limit.clamp(1, MAX_RECIPIENT_SUGGESTIONS);
+    let (encrypted_rows, candidate_truncated, needs_indexing, needs_list_index) =
+        with_recovery(cache_root, |connection| {
+            ensure_search_key_state(connection, &key)?;
+            let needs_indexing: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages
+                 WHERE account_key = ?1 AND recipient_version != ?2 LIMIT 1)",
+                params![account_key, SEARCH_INDEX_VERSION],
+                |row| row.get(0),
+            )?;
+            let needs_list_index: bool = connection.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM messages
+                   WHERE account_key = ?1 AND NOT EXISTS (
+                     SELECT 1 FROM message_list
+                     WHERE message_list.account_key = messages.account_key
+                       AND message_list.folder_key = messages.folder_key
+                       AND message_list.uid = messages.uid
+                   ) LIMIT 1
+                 )",
+                params![account_key],
+                |row| row.get(0),
+            )?;
+            let mut encrypted_rows: Vec<(Vec<u8>, i64, Vec<u8>)> = Vec::new();
+            let mut seen_rows: HashSet<(Vec<u8>, i64)> = HashSet::new();
+            let mut candidate_truncated = false;
+
+            if !query_terms.is_empty() {
+                let term_placeholders = (1..=query_terms.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let account_parameter = query_terms.len() + 1;
+                let count_parameter = account_parameter + 1;
+                let limit_parameter = count_parameter + 1;
+                let sql = format!(
+                    "SELECT message_list.folder_key, message_list.uid, message_list.payload
+                     FROM message_list
+                     INNER JOIN messages USING(account_key, folder_key, uid)
+                     INNER JOIN (
+                       SELECT account_key, folder_key, uid
+                       FROM recipient_search_terms
+                       WHERE term IN ({term_placeholders}) AND account_key = ?{account_parameter}
+                       GROUP BY account_key, folder_key, uid
+                       HAVING COUNT(DISTINCT term) = ?{count_parameter}
+                     ) AS candidates USING(account_key, folder_key, uid)
+                     ORDER BY messages.updated_at DESC, messages.uid DESC
+                     LIMIT ?{limit_parameter}"
+                );
+                let mut parameters = query_terms
+                    .iter()
+                    .map(|term| SqlValue::Blob(term.to_vec()))
+                    .collect::<Vec<_>>();
+                parameters.push(SqlValue::Blob(account_key.to_vec()));
+                parameters.push(SqlValue::Integer(query_terms.len() as i64));
+                parameters.push(SqlValue::Integer(
+                    (MAX_RECIPIENT_INDEX_CANDIDATES + 1) as i64,
+                ));
+                let mut statement = connection.prepare(&sql)?;
+                let rows =
+                    statement.query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                        ))
+                    })?;
+                for row in rows {
+                    let row = row?;
+                    if encrypted_rows.len() == MAX_RECIPIENT_INDEX_CANDIDATES {
+                        candidate_truncated = true;
+                        break;
+                    }
+                    seen_rows.insert((row.0.clone(), row.1));
+                    encrypted_rows.push(row);
+                }
+            }
+
+            let recent_limit = if query_terms.is_empty() {
+                MAX_RECIPIENT_FALLBACK_CANDIDATES
+            } else {
+                MAX_RECIPIENT_RECENT_CANDIDATES
+            };
+            let mut statement = connection.prepare(
+                "SELECT message_list.folder_key, message_list.uid, message_list.payload
+                 FROM message_list INNER JOIN messages USING(account_key, folder_key, uid)
+                 WHERE message_list.account_key = ?1
+                 ORDER BY messages.updated_at DESC, messages.uid DESC
+                 LIMIT ?2",
+            )?;
+            let rows =
+                statement.query_map(params![account_key, (recent_limit + 1) as i64], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })?;
+            let mut recent_count = 0usize;
+            for row in rows {
+                recent_count += 1;
+                if recent_count > recent_limit {
+                    candidate_truncated = true;
+                    break;
+                }
+                let row = row?;
+                if seen_rows.insert((row.0.clone(), row.1)) {
+                    encrypted_rows.push(row);
+                }
+            }
+            Ok((
+                encrypted_rows,
+                candidate_truncated,
+                needs_indexing,
+                needs_list_index,
+            ))
+        })?;
+
+    let mut aggregates = HashMap::new();
+    for (stored_folder_key, uid, payload) in encrypted_rows {
+        let Ok(mut message) = decrypt_json::<CachedMessage>(&payload, "recipient suggestion")
+        else {
+            continue;
+        };
+        crate::mail::bound_cached_message(&mut message);
+        if message.account_id != account_id
+            || folder_identity_key(&message.account_id, &message.folder).as_slice()
+                != stored_folder_key
+            || i64::from(message.uid) != uid
+        {
+            continue;
+        }
+        let mut seen_in_message = HashSet::new();
+        collect_recipient_candidate(
+            &mut aggregates,
+            &mut seen_in_message,
+            &message.sender_name,
+            &message.sender_email,
+            own_email,
+            &query_words,
+            message.received_at.as_deref(),
+        );
+        for email in message.to.iter().chain(message.cc.iter()) {
+            collect_recipient_candidate(
+                &mut aggregates,
+                &mut seen_in_message,
+                "",
+                email,
+                own_email,
+                &query_words,
+                message.received_at.as_deref(),
+            );
+        }
+    }
+    let mut ranked = aggregates.into_values().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| right.suggestion.frequency.cmp(&left.suggestion.frequency))
+            .then_with(|| right.suggestion.last_seen.cmp(&left.suggestion.last_seen))
+            .then_with(|| left.suggestion.email.cmp(&right.suggestion.email))
+    });
+    let truncated = candidate_truncated || ranked.len() > bounded_limit;
+    ranked.truncate(bounded_limit);
+    if needs_indexing {
+        spawn_search_indexer(cache_root.to_path_buf());
+    }
+    if needs_list_index {
+        spawn_list_indexer(cache_root.to_path_buf());
+    }
+    Ok(RecipientSuggestionResult {
+        suggestions: ranked
+            .into_iter()
+            .map(|aggregate| aggregate.suggestion)
+            .collect(),
+        truncated,
+        indexing: needs_indexing
+            || needs_list_index
+            || SEARCH_INDEX_RUNNING.load(Ordering::Acquire)
+            || LIST_INDEX_RUNNING.load(Ordering::Acquire),
+    })
+}
+
 pub fn load_mailbox(
     cache_root: &Path,
     account_id: &str,
@@ -2215,12 +2657,13 @@ pub fn save_mailbox(
         }
         {
             let mut upsert_message = transaction.prepare(
-                "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, search_version, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+                "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, search_version, recipient_version, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6)
                  ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
                    payload_hash = excluded.payload_hash,
                    payload = excluded.payload,
                    search_version = 0,
+                   recipient_version = 0,
                    updated_at = excluded.updated_at",
             )?;
             let mut upsert_list = transaction.prepare(
@@ -2310,12 +2753,13 @@ pub fn save_message(cache_root: &Path, account_id: &str, message: &CachedMessage
         )?;
         let (payload, digest, list_payload) = encrypt_message_payloads(message)?;
         transaction.execute(
-            "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, search_version, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+            "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, search_version, recipient_version, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6)
              ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
                payload_hash = excluded.payload_hash,
                payload = excluded.payload,
                search_version = 0,
+               recipient_version = 0,
                updated_at = excluded.updated_at",
             params![
                 account_key,
@@ -2417,12 +2861,13 @@ pub fn merge_messages(
         }
         {
             let mut upsert_message = transaction.prepare(
-                "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, search_version, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+                "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, search_version, recipient_version, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6)
                  ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
                    payload_hash = excluded.payload_hash,
                    payload = excluded.payload,
                    search_version = 0,
+                   recipient_version = 0,
                    updated_at = excluded.updated_at
                  WHERE messages.payload_hash != excluded.payload_hash",
             )?;
@@ -2672,12 +3117,13 @@ pub fn apply_mailbox_sync_delta(
                           WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3)",
             )?;
             let mut upsert_message = transaction.prepare(
-                "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, search_version, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+                "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, search_version, recipient_version, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6)
                  ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
                    payload_hash = excluded.payload_hash,
                    payload = excluded.payload,
                    search_version = 0,
+                   recipient_version = 0,
                    updated_at = excluded.updated_at
                  WHERE messages.payload_hash != excluded.payload_hash",
             )?;
@@ -2847,12 +3293,13 @@ pub fn move_message(
             params![account_key, source_folder_key, i64::from(uid)],
         )?;
         transaction.execute(
-            "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, search_version, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+            "INSERT INTO messages(account_key, folder_key, uid, payload_hash, payload, search_version, recipient_version, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6)
              ON CONFLICT(account_key, folder_key, uid) DO UPDATE SET
                payload_hash = excluded.payload_hash,
                payload = excluded.payload,
                search_version = 0,
+               recipient_version = 0,
                updated_at = excluded.updated_at",
             params![
                 account_key,
@@ -3139,6 +3586,17 @@ mod tests {
         rows.map(Result::unwrap).collect()
     }
 
+    fn stored_recipient_terms(root: &Path) -> Vec<Vec<u8>> {
+        let connection = open(root).unwrap();
+        let mut statement = connection
+            .prepare("SELECT term FROM recipient_search_terms ORDER BY term")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
     #[test]
     fn encryption_migration_queries_use_small_version_indexes() {
         let root = temporary_root("encryption-plan");
@@ -3347,6 +3805,13 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        let recipient_column: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'recipient_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         let list_table: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -3387,8 +3852,17 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        let recipient_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'recipient_search_terms'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(schema_version, DATABASE_SCHEMA_VERSION);
         assert_eq!(search_column, 1);
+        assert_eq!(recipient_column, 1);
         assert_eq!(list_table, 1);
         assert_eq!(count_column, 1);
         assert_eq!(list_count_column, 1);
@@ -3396,6 +3870,7 @@ mod tests {
         assert_eq!(migrated_list_count, 0);
         assert_eq!(legacy_summaries, 0);
         assert_eq!(search_tables, 2);
+        assert_eq!(recipient_tables, 1);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3475,11 +3950,134 @@ mod tests {
     }
 
     #[test]
+    fn recipient_suggestions_are_account_scoped_ranked_and_deduplicated() {
+        let root = temporary_root("recipient-suggestions");
+        let mut first = fixture_message(1);
+        first.sender_name = "Alice Example".into();
+        first.sender_email = "alice@example.invalid".into();
+        first.to = vec!["owner@example.invalid".into(), "bob@example.invalid".into()];
+        first.received_at = Some("2026-01-01T08:00:00Z".into());
+        let mut second = fixture_message(2);
+        second.sender_name = "Alice Example".into();
+        second.sender_email = "ALICE@example.invalid".into();
+        second.received_at = Some("2026-01-02T08:00:00Z".into());
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = vec![first, second];
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+
+        let mut other = fixture_message(3);
+        other.account_id = "other-account".into();
+        other.id = "other:3".into();
+        other.sender_name = "Alice Other".into();
+        other.sender_email = "alice-other@example.invalid".into();
+        let mut other_mailbox = CachedMailbox::empty("other-account", "INBOX");
+        other_mailbox.messages = vec![other];
+        save_mailbox(&root, "other-account", &other_mailbox).unwrap();
+        index_every_message(&root);
+
+        let result = suggest_recipients(
+            &root,
+            "fixture-account",
+            "owner@example.invalid",
+            "alice",
+            8,
+        )
+        .unwrap();
+        assert_eq!(result.suggestions.len(), 1);
+        assert_eq!(result.suggestions[0].email, "ALICE@example.invalid");
+        assert_eq!(result.suggestions[0].name, "Alice Example");
+        assert_eq!(result.suggestions[0].frequency, 2);
+        assert_eq!(
+            result.suggestions[0].last_seen.as_deref(),
+            Some("2026-01-02T08:00:00Z")
+        );
+        assert!(!result.indexing);
+
+        let owner = suggest_recipients(
+            &root,
+            "fixture-account",
+            "owner@example.invalid",
+            "owner",
+            8,
+        )
+        .unwrap();
+        assert!(owner.suggestions.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recipient_blind_index_finds_old_contacts_from_body_free_rows() {
+        let root = temporary_root("recipient-old-indexed");
+        let mut messages = (1..=600).map(fixture_message).collect::<Vec<_>>();
+        messages[0].sender_name = "Unique Old Contact".into();
+        messages[0].sender_email = "unique-old-contact@example.invalid".into();
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = messages;
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        index_every_message(&root);
+
+        let connection = open(&root).unwrap();
+        connection
+            .execute(
+                "UPDATE messages SET payload = X'00'
+                 WHERE account_key = ?1 AND folder_key = ?2 AND uid = 1",
+                params![
+                    identity_key("fixture-account"),
+                    folder_identity_key("fixture-account", "INBOX")
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let result = suggest_recipients(
+            &root,
+            "fixture-account",
+            "owner@example.invalid",
+            "unique-old",
+            8,
+        )
+        .unwrap();
+        assert_eq!(result.suggestions.len(), 1);
+        assert_eq!(
+            result.suggestions[0].email,
+            "unique-old-contact@example.invalid"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recipient_index_excludes_subject_preview_and_body_terms() {
+        let root = temporary_root("recipient-field-only");
+        let mut message = fixture_message(1);
+        message.sender_name = "Alice".into();
+        message.sender_email = "alice@example.invalid".into();
+        message.subject = "bodyonlyrecipientneedle".into();
+        message.preview = "bodyonlyrecipientneedle".into();
+        message.text_body = "bodyonlyrecipientneedle".into();
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = vec![message];
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        index_every_message(&root);
+
+        let result = suggest_recipients(
+            &root,
+            "fixture-account",
+            "owner@example.invalid",
+            "bodyonlyrecipientneedle",
+            8,
+        )
+        .unwrap();
+        assert!(result.suggestions.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn blind_index_and_protected_key_never_store_search_plaintext() {
         let root = temporary_root("search-privacy");
         let plaintext = "mailgoprivacycanarytoken";
         let mut message = fixture_message(5);
         message.subject = plaintext.into();
+        message.sender_email = format!("{plaintext}@example.invalid");
         message.text_body = format!("cached body {plaintext}");
         let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
         mailbox.messages = vec![message];
@@ -3546,7 +4144,9 @@ mod tests {
         save_mailbox(&root, "fixture-account", &mailbox).unwrap();
         index_every_message(&root);
         let original_terms = stored_search_terms(&root);
+        let original_recipient_terms = stored_recipient_terms(&root);
         assert!(!original_terms.is_empty());
+        assert!(!original_recipient_terms.is_empty());
 
         let key_path = search_key_path(&root);
         fs::remove_file(&key_path).unwrap();
@@ -3558,7 +4158,9 @@ mod tests {
             .remove(&key_path);
         index_every_message(&root);
         let rotated_terms = stored_search_terms(&root);
+        let rotated_recipient_terms = stored_recipient_terms(&root);
         assert_ne!(original_terms, rotated_terms);
+        assert_ne!(original_recipient_terms, rotated_recipient_terms);
         let result = search_messages(
             &root,
             &["fixture-account".into()],
@@ -3895,7 +4497,7 @@ mod tests {
         let connection = open(&root).unwrap();
         connection
             .execute(
-                "UPDATE messages SET search_version = 1
+                "UPDATE messages SET search_version = 1, recipient_version = 1
                  WHERE account_key = ?1 AND folder_key = ?2 AND uid = 2",
                 params![
                     identity_key("fixture-account"),
@@ -3940,17 +4542,21 @@ mod tests {
             .unwrap()
             .is_none());
         let connection = open(&root).unwrap();
-        let (message_count, list_count, search_version): (i64, i64, i64) = connection
-            .query_row(
-                "SELECT mailbox_meta.message_count, mailbox_meta.list_count,
-                        messages.search_version
+        let (message_count, list_count, search_version, recipient_version): (i64, i64, i64, i64) =
+            connection
+                .query_row(
+                    "SELECT mailbox_meta.message_count, mailbox_meta.list_count,
+                        messages.search_version, messages.recipient_version
                  FROM mailbox_meta JOIN messages USING(account_key, folder_key)
                  WHERE messages.uid = 2",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!((message_count, list_count, search_version), (1, 1, 1));
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+        assert_eq!(
+            (message_count, list_count, search_version, recipient_version),
+            (1, 1, 1, 1)
+        );
         let _ = fs::remove_dir_all(root);
     }
 
