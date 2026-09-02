@@ -839,7 +839,7 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; transition-duration: .001ms !important; }
 }
 
-@media (max-width: 900px) {
+@media (max-width: 720px) {
   html, body, #root { min-width: 0; }
   body { min-width: 0; }
   .titlebar, .app-shell.is-compact-density .titlebar { height: 38px; padding: 0 7px 0 9px; }
@@ -889,18 +889,18 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
   .toolbar-action span { display: none; }
   .list-toolbar > .menu-anchor { margin-left: auto; }
   .list-toolbar .icon-button { margin-left: 0; }
-  .mail-row { min-height: 58px; gap: 4px; margin-inline: 0; padding-inline: 9px; }
+  .mail-row { min-height: 44px; gap: 4px; margin-inline: 0; padding: 2px 9px; }
   .mail-group-label { padding-inline: 14px; }
   .reading-toolbar { height: 46px; gap: 6px; padding-inline: 9px; }
   .reading-actions { min-width: 0; flex: 1; overflow-x: auto; }
   .reading-actions > span { display: none; }
   .reading-back-button { flex: 0 0 auto; width: auto !important; padding-inline: 7px; color: var(--accent); }
   .mobile-back-label { font-size: 11px; }
-  .reading-scroll { padding: 16px 14px 22px; }
+  .reading-scroll { padding: 11px 12px 16px; }
   .outbox-summary { grid-template-columns: auto minmax(0, 1fr); }
   .outbox-summary dl { grid-column: 1 / -1; }
   .outbox-attachments > div { grid-template-columns: 1fr; }
-  .reading-heading h1 { font-size: 18px; }
+  .reading-heading h1 { font-size: 15px; }
   .sender-row { gap: 8px; }
   .sender-row > time { display: none; }
   .auth-panel, .app-shell.is-compact-density .auth-panel { position: fixed; top: 38px; right: 0; bottom: 0; z-index: 24; display: flex; width: min(340px, calc(100vw - 24px)); transform: translateX(102%); box-shadow: -18px 0 44px rgba(2, 7, 18, .34); transition: transform .2s ease; }

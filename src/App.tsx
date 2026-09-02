@@ -33,7 +33,7 @@ type ConnectionDiagnosticViewState =
 type ActionMenu = 'bulk' | 'message'
 type MobilePane = 'list' | 'reading'
 type DisplayDensity = 'compact' | 'comfortable'
-type MailContentScale = 80 | 90 | 100 | 110
+type MailContentScale = 70 | 80 | 90 | 100
 type MailMoveTarget = { folder: string; label: string; icon: IconName }
 type OutboxAction = { id: string; kind: 'edit' | 'retry' | 'discard' }
 type VirtualMailItem =
@@ -46,11 +46,11 @@ const ACCOUNT_IPC_CONCURRENCY = 4
 const BULK_ACTION_IPC_CONCURRENCY = 6
 const ATTACHMENT_DOWNLOAD_CONCURRENCY = 3
 const DEFAULT_UNDO_SEND_SECONDS: UndoSendSeconds = 10
-const MAIL_CONTENT_SCALES: MailContentScale[] = [80, 90, 100, 110]
-const DEFAULT_MAIL_CONTENT_SCALE: MailContentScale = 90
-const MOBILE_LAYOUT_QUERY = '(max-width: 900px)'
+const MAIL_CONTENT_SCALES: MailContentScale[] = [70, 80, 90, 100]
+const DEFAULT_MAIL_CONTENT_SCALE: MailContentScale = 80
+const MOBILE_LAYOUT_QUERY = '(max-width: 720px)'
 const COMPACT_DENSITY_QUERY = '(max-height: 820px), (max-width: 1366px)'
-const AUTO_COLLAPSE_SIDEBAR_QUERY = '(max-width: 1366px) and (min-width: 901px)'
+const AUTO_COLLAPSE_SIDEBAR_QUERY = '(max-width: 1366px) and (min-width: 721px)'
 const COMPACT_MAIL_GROUP_HEIGHT = 16
 const COMPACT_MAIL_ROW_HEIGHT = 36
 const COMFORTABLE_MAIL_GROUP_HEIGHT = 22
@@ -598,11 +598,11 @@ function loadTheme(): ThemeMode {
 }
 
 function loadDisplayDensity(): DisplayDensity {
-  return readLocalStorageValue('mailgo-display-density-v2') === 'comfortable' ? 'comfortable' : 'compact'
+  return readLocalStorageValue('mailgo-display-density-v3') === 'comfortable' ? 'comfortable' : 'compact'
 }
 
 function loadMailContentScale(): MailContentScale {
-  const stored = Number(readLocalStorageValue('mailgo-mail-content-scale'))
+  const stored = Number(readLocalStorageValue('mailgo-mail-content-scale-v2'))
   return MAIL_CONTENT_SCALES.includes(stored as MailContentScale)
     ? stored as MailContentScale
     : DEFAULT_MAIL_CONTENT_SCALE
@@ -1074,11 +1074,11 @@ function App() {
   }, [isNativeRuntime, nativeStateReady, theme])
 
   useEffect(() => {
-    writeLocalStorageValue('mailgo-display-density-v2', displayDensity)
+    writeLocalStorageValue('mailgo-display-density-v3', displayDensity)
   }, [displayDensity])
 
   useEffect(() => {
-    writeLocalStorageValue('mailgo-mail-content-scale', String(mailContentScale))
+    writeLocalStorageValue('mailgo-mail-content-scale-v2', String(mailContentScale))
   }, [mailContentScale])
 
   useEffect(() => {
