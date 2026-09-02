@@ -2,7 +2,7 @@ export type Provider = 'google' | 'qq' | 'outlook' | 'other'
 
 export type ThemeMode = 'dark' | 'light'
 
-export type FolderId = 'inbox' | 'starred' | 'sent' | 'drafts' | 'archive' | 'spam' | 'trash'
+export type FolderId = 'inbox' | 'starred' | 'outbox' | 'sent' | 'drafts' | 'archive' | 'spam' | 'trash'
 
 export type SmartCategory = 'apple-connect' | 'apple-ads' | 'social' | 'ads' | 'finance'
 
@@ -43,6 +43,8 @@ export interface MailMessage {
   htmlBody?: string
   nativeUid?: number
   nativeFolder?: string
+  outboxId?: string
+  outboxState?: NativeOutboxItemState
 }
 
 export interface MailAccount {
@@ -186,6 +188,49 @@ export interface NativeOutboxStatus {
   pending: number
   paused: number
   scheduled?: number
+}
+
+export type NativeOutboxItemState = 'scheduled' | 'pending' | 'retrying' | 'paused'
+
+export interface NativeOutboxAttachmentSummary {
+  fileName: string
+  contentType: string
+  size: number
+  inline: boolean
+}
+
+export interface NativeOutboxItem {
+  id: string
+  accountId: string
+  draftId?: string
+  to: string
+  cc: string
+  bcc: string
+  subject: string
+  preview: string
+  createdAt: number
+  updatedAt: number
+  nextAttemptAt: number
+  attempts: number
+  state: NativeOutboxItemState
+  lastError?: string
+  attachments: NativeOutboxAttachmentSummary[]
+}
+
+export interface NativeOutboxSnapshot {
+  status: NativeOutboxStatus
+  items: NativeOutboxItem[]
+}
+
+export interface NativeOutboxRecallResponse {
+  status: 'recalled' | 'missing' | 'too-late'
+  draft?: NativeDraft
+}
+
+export interface NativeOutboxActionResponse {
+  accountId: string
+  outboxId: string
+  status: 'retried' | 'discarded' | 'missing' | 'too-late'
 }
 
 export interface NativeCacheStats {

@@ -25,10 +25,12 @@ const MAX_TOTAL_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 const MAX_FILE_NAME_BYTES: usize = 255;
 const MAX_CONTENT_TYPE_BYTES: usize = 128;
 const MAX_FAILURE_BYTES: usize = 256;
+const MAX_PREVIEW_CHARS: usize = 240;
 const MAX_RETRY_ATTEMPTS: u32 = 8;
 pub const MAX_UNDO_SEND_SECONDS: u64 = 30;
 
 static OUTBOX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static IN_FLIGHT_IDS: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
 static FLUSH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static SCHEDULER_WAKE: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
 
@@ -99,6 +101,98 @@ pub struct OutboxStatus {
     pub scheduled: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboxAttachmentSummary {
+    pub file_name: String,
+    pub content_type: String,
+    pub size: u64,
+    pub inline: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutboxItemState {
+    Scheduled,
+    Pending,
+    Retrying,
+    Paused,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboxListItem {
+    pub id: String,
+    pub account_id: String,
+    pub draft_id: Option<String>,
+    pub to: String,
+    pub cc: String,
+    pub bcc: String,
+    pub subject: String,
+    pub preview: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub next_attempt_at: u64,
+    pub attempts: u32,
+    pub state: OutboxItemState,
+    pub last_error: Option<String>,
+    pub attachments: Vec<OutboxAttachmentSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboxSnapshot {
+    pub status: OutboxStatus,
+    pub items: Vec<OutboxListItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecallOutboxStatus {
+    Recalled,
+    Missing,
+    TooLate,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecallOutboxResult {
+    pub status: RecallOutboxStatus,
+    pub draft: Option<crate::drafts::Draft>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiscardOutboxStatus {
+    Discarded,
+    Missing,
+    TooLate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RetryOutboxStatus {
+    Retried,
+    Missing,
+    TooLate,
+}
+
+struct InFlightGuard {
+    keys: Vec<(String, String)>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut in_flight = IN_FLIGHT_IDS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .expect("MailGo outbox in-flight lock poisoned");
+        for key in &self.keys {
+            in_flight.remove(key);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CancelScheduledResult {
@@ -162,18 +256,231 @@ pub fn status(cache_root: &Path, account_id: &str) -> Result<OutboxStatus> {
         .into_iter()
         .filter(|item| item.account_id == account_id)
         .collect::<Vec<_>>();
-    let paused = messages.iter().filter(|item| item.paused).count();
+    Ok(status_for(&messages, now_seconds()))
+}
+
+pub fn snapshot(cache_root: &Path, account_id: &str) -> Result<OutboxSnapshot> {
+    let _outbox_guard = outbox_guard();
+    validate_account_id(account_id)?;
+    let mut messages = load(cache_root)?
+        .messages
+        .into_iter()
+        .filter(|item| item.account_id == account_id)
+        .collect::<Vec<_>>();
+    messages.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
     let now = now_seconds();
+    let status = status_for(&messages, now);
+    let items = messages
+        .into_iter()
+        .map(|message| OutboxListItem {
+            id: message.id,
+            account_id: message.account_id,
+            draft_id: message.draft_id,
+            to: message.to,
+            cc: message.cc,
+            bcc: message.bcc,
+            subject: message.subject,
+            preview: bounded_preview(&message.text_body),
+            created_at: message.created_at,
+            updated_at: message.updated_at,
+            next_attempt_at: message.next_attempt_at,
+            attempts: message.attempts,
+            state: if message.paused {
+                OutboxItemState::Paused
+            } else if message.attempts > 0 {
+                OutboxItemState::Retrying
+            } else if message.next_attempt_at > now {
+                OutboxItemState::Scheduled
+            } else {
+                OutboxItemState::Pending
+            },
+            last_error: message.last_error,
+            attachments: message
+                .attachments
+                .into_iter()
+                .map(|attachment| OutboxAttachmentSummary {
+                    file_name: attachment.file_name,
+                    content_type: attachment.content_type,
+                    size: u64::try_from(attachment.bytes.len()).unwrap_or(u64::MAX),
+                    inline: attachment.content_id.is_some(),
+                })
+                .collect(),
+        })
+        .collect();
+    Ok(OutboxSnapshot { status, items })
+}
+
+fn status_for(messages: &[QueuedMessage], now: u64) -> OutboxStatus {
+    let paused = messages.iter().filter(|item| item.paused).count();
     let scheduled = messages
         .iter()
         .filter(|item| !item.paused && item.attempts == 0 && item.next_attempt_at > now)
         .count();
-    Ok(OutboxStatus {
+    OutboxStatus {
         total: messages.len(),
         pending: messages.len().saturating_sub(paused),
         paused,
         scheduled,
+    }
+}
+
+fn bounded_preview(value: &str) -> String {
+    let mut preview = String::with_capacity(value.len().min(MAX_PREVIEW_CHARS));
+    let mut whitespace = false;
+    let mut length = 0usize;
+    for character in value.chars() {
+        if character.is_whitespace() {
+            whitespace = !preview.is_empty();
+            continue;
+        }
+        if whitespace && length < MAX_PREVIEW_CHARS {
+            preview.push(' ');
+            length += 1;
+        }
+        whitespace = false;
+        if length >= MAX_PREVIEW_CHARS {
+            break;
+        }
+        preview.push(character);
+        length += 1;
+    }
+    if preview.is_empty() {
+        "无纯文本摘要".to_string()
+    } else {
+        preview
+    }
+}
+
+pub fn recall_to_draft(
+    cache_root: &Path,
+    account_id: &str,
+    message_id: &str,
+) -> Result<RecallOutboxResult> {
+    let _outbox_guard = outbox_guard();
+    validate_account_id(account_id)?;
+    validate_message_id(message_id)?;
+    let mut store = load(cache_root)?;
+    let Some(index) = store
+        .messages
+        .iter()
+        .position(|item| item.account_id == account_id && item.id == message_id)
+    else {
+        return Ok(RecallOutboxResult {
+            status: RecallOutboxStatus::Missing,
+            draft: None,
+        });
+    };
+    if is_in_flight(account_id, message_id) {
+        return Ok(RecallOutboxResult {
+            status: RecallOutboxStatus::TooLate,
+            draft: None,
+        });
+    }
+
+    let message = store.messages[index].clone();
+    let existing = crate::drafts::list(cache_root, account_id)?
+        .into_iter()
+        .find(|draft| message.draft_id.as_deref() == Some(draft.id.as_str()));
+    let (draft, created) = if let Some(draft) = existing {
+        (draft, false)
+    } else {
+        let saved = crate::drafts::save(
+            cache_root,
+            crate::drafts::Draft {
+                id: message.draft_id.clone().unwrap_or_default(),
+                account_id: account_id.to_string(),
+                to: message.to.clone(),
+                cc: message.cc.clone(),
+                bcc: message.bcc.clone(),
+                subject: message.subject.clone(),
+                body: message.text_body.clone(),
+                html_mode: message.html_body.is_some(),
+                in_reply_to: message.in_reply_to.clone(),
+                references: message.references.clone(),
+                attachments: Vec::new(),
+                updated_at: 0,
+            },
+        )?;
+        let saved_id = saved.id.clone();
+        let reconstructed =
+            message
+                .attachments
+                .iter()
+                .enumerate()
+                .try_fold(saved, |_, (index, attachment)| {
+                    crate::drafts::attach(
+                        cache_root,
+                        account_id,
+                        &saved_id,
+                        crate::drafts::NewDraftAttachment {
+                            id: format!("recall-{index}-{:016x}", rand::random::<u64>()),
+                            file_name: attachment.file_name.clone(),
+                            content_type: attachment.content_type.clone(),
+                            content_id: attachment.content_id.clone(),
+                        },
+                        &attachment.bytes,
+                    )
+                });
+        match reconstructed {
+            Ok(draft) => (draft, true),
+            Err(error) => {
+                let _ = crate::drafts::remove(cache_root, account_id, &saved_id);
+                return Err(error).context("reconstruct queued draft attachments");
+            }
+        }
+    };
+
+    store.messages.remove(index);
+    if let Err(error) = persist(cache_root, &store) {
+        if created {
+            let _ = crate::drafts::remove(cache_root, account_id, &draft.id);
+        }
+        return Err(error);
+    }
+    notify_scheduler();
+    Ok(RecallOutboxResult {
+        status: RecallOutboxStatus::Recalled,
+        draft: Some(draft),
     })
+}
+
+pub fn discard_queued(
+    cache_root: &Path,
+    account_id: &str,
+    message_id: &str,
+) -> Result<DiscardOutboxStatus> {
+    let _outbox_guard = outbox_guard();
+    validate_account_id(account_id)?;
+    validate_message_id(message_id)?;
+    let mut store = load(cache_root)?;
+    let Some(index) = store
+        .messages
+        .iter()
+        .position(|item| item.account_id == account_id && item.id == message_id)
+    else {
+        return Ok(DiscardOutboxStatus::Missing);
+    };
+    if is_in_flight(account_id, message_id) {
+        return Ok(DiscardOutboxStatus::TooLate);
+    }
+    let draft_id = store.messages[index].draft_id.clone();
+    store.messages.remove(index);
+    persist(cache_root, &store)?;
+    notify_scheduler();
+    if let Some(draft_id) = draft_id {
+        if let Err(error) = crate::drafts::remove(cache_root, account_id, &draft_id) {
+            tracing::warn!(account_id = %account_id, "could not remove discarded outbox draft: {error}");
+        }
+    }
+    Ok(DiscardOutboxStatus::Discarded)
+}
+
+fn is_in_flight(account_id: &str, message_id: &str) -> bool {
+    IN_FLIGHT_IDS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .expect("MailGo outbox in-flight lock poisoned")
+        .contains(&(account_id.to_string(), message_id.to_string()))
 }
 
 pub fn cancel_scheduled(
@@ -210,7 +517,7 @@ pub fn retry_all(cache_root: &Path, account_id: &str) -> Result<usize> {
     let now = now_seconds();
     let mut changed = 0;
     for message in &mut store.messages {
-        if message.account_id != account_id || (!message.paused && message.next_attempt_at <= now) {
+        if message.account_id != account_id || !message.paused {
             continue;
         }
         message.attempts = 0;
@@ -225,6 +532,36 @@ pub fn retry_all(cache_root: &Path, account_id: &str) -> Result<usize> {
         notify_scheduler();
     }
     Ok(changed)
+}
+
+pub fn retry_queued(
+    cache_root: &Path,
+    account_id: &str,
+    message_id: &str,
+) -> Result<RetryOutboxStatus> {
+    let _outbox_guard = outbox_guard();
+    validate_account_id(account_id)?;
+    validate_message_id(message_id)?;
+    let mut store = load(cache_root)?;
+    let Some(message) = store
+        .messages
+        .iter_mut()
+        .find(|item| item.account_id == account_id && item.id == message_id)
+    else {
+        return Ok(RetryOutboxStatus::Missing);
+    };
+    if is_in_flight(account_id, message_id) {
+        return Ok(RetryOutboxStatus::TooLate);
+    }
+    let now = now_seconds();
+    message.attempts = 0;
+    message.next_attempt_at = now;
+    message.paused = false;
+    message.last_error = None;
+    message.updated_at = now;
+    persist(cache_root, &store)?;
+    notify_scheduler();
+    Ok(RetryOutboxStatus::Retried)
 }
 
 pub fn remove(cache_root: &Path, account_id: &str, message_id: &str) -> Result<bool> {
@@ -247,6 +584,17 @@ pub fn remove(cache_root: &Path, account_id: &str, message_id: &str) -> Result<b
 pub fn remove_account(cache_root: &Path, account_id: &str) -> Result<()> {
     let _outbox_guard = outbox_guard();
     validate_account_id(account_id)?;
+    if IN_FLIGHT_IDS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .expect("MailGo outbox in-flight lock poisoned")
+        .iter()
+        .any(|(in_flight_account, _)| in_flight_account == account_id)
+    {
+        return Err(anyhow!(
+            "account has an outbox message in flight; retry removal after sending finishes"
+        ));
+    }
     let mut store = load(cache_root)?;
     let original_len = store.messages.len();
     store.messages.retain(|item| item.account_id != account_id);
@@ -324,15 +672,27 @@ pub fn flush_due(
     let _flush_reset = FlushReset;
     validate_account_id(account_id)?;
     let now = now_seconds();
-    let due = {
+    let (due, _in_flight_guard) = {
         let _outbox_guard = outbox_guard();
-        load(cache_root)?
+        let mut in_flight = IN_FLIGHT_IDS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .expect("MailGo outbox in-flight lock poisoned");
+        let due = load(cache_root)?
             .messages
             .into_iter()
             .filter(|item| {
                 item.account_id == account_id && !item.paused && item.next_attempt_at <= now
             })
-            .collect::<Vec<_>>()
+            .filter(|item| in_flight.insert((item.account_id.clone(), item.id.clone())))
+            .collect::<Vec<_>>();
+        let guard = InFlightGuard {
+            keys: due
+                .iter()
+                .map(|item| (item.account_id.clone(), item.id.clone()))
+                .collect(),
+        };
+        (due, guard)
     };
     let mut summary = FlushSummary::default();
     for message in due {
@@ -729,6 +1089,23 @@ mod tests {
         }
     }
 
+    fn draft_fixture(body: &str) -> crate::drafts::Draft {
+        crate::drafts::Draft {
+            id: "draft-fixture".into(),
+            account_id: "account-1".into(),
+            to: "person@example.com".into(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: "Queued message".into(),
+            body: body.into(),
+            html_mode: false,
+            in_reply_to: None,
+            references: Vec::new(),
+            attachments: Vec::new(),
+            updated_at: 0,
+        }
+    }
+
     #[test]
     fn encrypted_outbox_round_trips_and_filters_by_account() {
         let root = std::env::temp_dir().join(format!("mailgo-outbox-test-{}", std::process::id()));
@@ -739,6 +1116,124 @@ mod tests {
         assert_eq!(status(&root, "account-2").unwrap().total, 0);
         assert!(remove(&root, "account-1", &saved.id).unwrap());
         assert_eq!(status(&root, "account-1").unwrap().total, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_is_bounded_and_never_serializes_attachment_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "mailgo-outbox-snapshot-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut message = fixture();
+        message.text_body = format!("  {}\n{}  ", "摘要 ".repeat(180), "结尾");
+        enqueue(&root, message).expect("enqueue snapshot fixture");
+        let snapshot = snapshot(&root, "account-1").expect("read snapshot");
+        assert_eq!(snapshot.status.total, 1);
+        assert_eq!(snapshot.items.len(), 1);
+        assert!(snapshot.items[0].preview.chars().count() <= MAX_PREVIEW_CHARS);
+        assert_eq!(snapshot.items[0].attachments[0].size, 5);
+        let json = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        assert!(json["items"][0]["attachments"][0].get("bytes").is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recall_reconstructs_a_missing_draft_and_its_attachments() {
+        let root = std::env::temp_dir().join(format!(
+            "mailgo-outbox-recall-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let saved = enqueue(&root, fixture()).expect("enqueue recall fixture");
+        let result = recall_to_draft(&root, "account-1", &saved.id).expect("recall message");
+        assert_eq!(result.status, RecallOutboxStatus::Recalled);
+        let draft = result.draft.expect("reconstructed draft");
+        assert_eq!(draft.id, "draft-fixture");
+        assert_eq!(draft.attachments.len(), 1);
+        let attachment =
+            crate::drafts::load_attachment(&root, "account-1", &draft.id, &draft.attachments[0].id)
+                .expect("load reconstructed attachment");
+        assert_eq!(attachment.bytes, b"hello");
+        assert_eq!(status(&root, "account-1").unwrap().total, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recall_preserves_an_existing_editable_draft() {
+        let root = std::env::temp_dir().join(format!(
+            "mailgo-outbox-existing-draft-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        crate::drafts::save(&root, draft_fixture("newer local edit")).expect("save linked draft");
+        let saved = enqueue(&root, fixture()).expect("enqueue existing-draft fixture");
+        let result = recall_to_draft(&root, "account-1", &saved.id).expect("recall message");
+        assert_eq!(result.status, RecallOutboxStatus::Recalled);
+        assert_eq!(
+            result.draft.expect("existing draft").body,
+            "newer local edit"
+        );
+        assert_eq!(status(&root, "account-1").unwrap().total, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discard_removes_the_linked_draft_after_queue_persistence() {
+        let root = std::env::temp_dir().join(format!(
+            "mailgo-outbox-discard-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        crate::drafts::save(&root, draft_fixture("discard me")).expect("save linked draft");
+        let saved = enqueue(&root, fixture()).expect("enqueue discard fixture");
+        assert_eq!(
+            discard_queued(&root, "account-1", &saved.id).unwrap(),
+            DiscardOutboxStatus::Discarded
+        );
+        assert!(crate::drafts::list(&root, "account-1").unwrap().is_empty());
+        assert_eq!(status(&root, "account-1").unwrap().total, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_actions_refuse_messages_already_being_sent() {
+        let root = std::env::temp_dir().join(format!(
+            "mailgo-outbox-in-flight-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut message = fixture();
+        message.id = format!("outbox-in-flight-{:016x}", rand::random::<u64>());
+        let saved = enqueue(&root, message).expect("enqueue in-flight fixture");
+        let key = (saved.account_id.clone(), saved.id.clone());
+        IN_FLIGHT_IDS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .expect("in-flight lock")
+            .insert(key.clone());
+        let guard = InFlightGuard { keys: vec![key] };
+
+        assert_eq!(
+            retry_queued(&root, &saved.account_id, &saved.id).unwrap(),
+            RetryOutboxStatus::TooLate
+        );
+        assert_eq!(
+            discard_queued(&root, &saved.account_id, &saved.id).unwrap(),
+            DiscardOutboxStatus::TooLate
+        );
+        assert_eq!(
+            recall_to_draft(&root, &saved.account_id, &saved.id)
+                .unwrap()
+                .status,
+            RecallOutboxStatus::TooLate
+        );
+        drop(guard);
+        assert_eq!(
+            discard_queued(&root, &saved.account_id, &saved.id).unwrap(),
+            DiscardOutboxStatus::Discarded
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -785,16 +1280,24 @@ mod tests {
             std::env::temp_dir().join(format!("mailgo-outbox-resume-{}", std::process::id()));
         let mut store = OutboxStore {
             schema_version: STORE_SCHEMA_VERSION,
-            messages: vec![QueuedMessage {
-                paused: true,
-                last_error: Some("账户需要重新授权后才能发送".into()),
-                ..fixture()
-            }],
+            messages: vec![
+                QueuedMessage {
+                    paused: true,
+                    last_error: Some("账户需要重新授权后才能发送".into()),
+                    ..fixture()
+                },
+                QueuedMessage {
+                    id: "outbox-scheduled".into(),
+                    next_attempt_at: now_seconds().saturating_add(30),
+                    ..fixture()
+                },
+            ],
         };
         persist(&root, &store).expect("persist paused fixture");
         assert_eq!(status(&root, "account-1").unwrap().paused, 1);
         assert_eq!(retry_all(&root, "account-1").unwrap(), 1);
         assert_eq!(status(&root, "account-1").unwrap().paused, 0);
+        assert_eq!(status(&root, "account-1").unwrap().scheduled, 1);
         store.messages[0].paused = false;
         store.messages[0].next_attempt_at = now_seconds();
         persist(&root, &store).expect("persist due fixture");

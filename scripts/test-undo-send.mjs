@@ -29,7 +29,7 @@ assert.doesNotMatch(sync, /mailgo-outbox-[^"\n]*\{/) // one scheduler, never one
 
 assert.match(app, /撤销发送/)
 assert.match(app, /mail\.outbox\.undo/)
-assert.match(app, /!sendResult\.undoable/)
+assert.match(app, /!sendResult\.queued/)
 assert.match(app, /openCompose\(action\.draftId\)/)
 assert.match(app, /currentDraftId \? \{ draftId: currentDraftId \}/)
 assert.match(styles, /animation: toast-progress var\(--toast-duration\) linear forwards/)

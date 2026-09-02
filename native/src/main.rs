@@ -1941,9 +1941,9 @@ fn handle_ipc(
                 }
                 let cleanup_result = (|| -> Result<()> {
                     for account in &imported_accounts {
-                        sync::remove_account_cache(&cache_dir(), &account.id)?;
-                        drafts::remove_account(&cache_dir(), &account.id)?;
                         outbox::remove_account(&cache_dir(), &account.id)?;
+                        drafts::remove_account(&cache_dir(), &account.id)?;
+                        sync::remove_account_cache(&cache_dir(), &account.id)?;
                         delete_credential_if_present(&account.id).with_context(|| {
                             format!("remove credential for account {}", account.id)
                         })?;
@@ -1991,9 +1991,9 @@ fn handle_ipc(
                 let previous_folders = app.state.folder_names.clone();
                 let mut previous_credentials = vec![(id.clone(), snapshot_credential(&id)?)];
                 let cleanup_result = (|| -> Result<()> {
-                    sync::remove_account_cache(&cache_dir(), &id)?;
-                    drafts::remove_account(&cache_dir(), &id)?;
                     outbox::remove_account(&cache_dir(), &id)?;
+                    drafts::remove_account(&cache_dir(), &id)?;
+                    sync::remove_account_cache(&cache_dir(), &id)?;
                     delete_credential_if_present(&id)?;
                     Ok(())
                 })();
@@ -2270,6 +2270,14 @@ fn handle_ipc(
                     &account_id,
                 )?)?)
             }
+            "mail.outbox.snapshot" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
+                Ok(serde_json::to_value(outbox::snapshot(
+                    &cache_dir(),
+                    &account_id,
+                )?)?)
+            }
             "mail.outbox.undo" => {
                 let account_id = string_field(&message.payload, "accountId")?;
                 account_for(shared, &account_id)?;
@@ -2286,6 +2294,38 @@ fn handle_ipc(
                 account_for(shared, &account_id)?;
                 let reset = outbox::retry_all(&cache_dir(), &account_id)?;
                 Ok(json!({ "accountId": account_id, "reset": reset }))
+            }
+            "mail.outbox.retry" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
+                let outbox_id = string_field(&message.payload, "outboxId")?;
+                let status = outbox::retry_queued(&cache_dir(), &account_id, &outbox_id)?;
+                Ok(json!({
+                    "accountId": account_id,
+                    "outboxId": outbox_id,
+                    "status": status,
+                }))
+            }
+            "mail.outbox.recall" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
+                let outbox_id = string_field(&message.payload, "outboxId")?;
+                Ok(serde_json::to_value(outbox::recall_to_draft(
+                    &cache_dir(),
+                    &account_id,
+                    &outbox_id,
+                )?)?)
+            }
+            "mail.outbox.discard" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
+                let outbox_id = string_field(&message.payload, "outboxId")?;
+                let status = outbox::discard_queued(&cache_dir(), &account_id, &outbox_id)?;
+                Ok(json!({
+                    "accountId": account_id,
+                    "outboxId": outbox_id,
+                    "status": status,
+                }))
             }
             "sync.account" => {
                 ensure_network_allowed(shared)?;

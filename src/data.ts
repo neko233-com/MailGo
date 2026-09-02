@@ -1,4 +1,4 @@
-import type { MailAccount, MailMessage, ProviderDefinition } from './types'
+import type { MailAccount, MailMessage, NativeOutboxItem, ProviderDefinition } from './types'
 
 export const providerDefinitions: ProviderDefinition[] = [
   {
@@ -213,9 +213,49 @@ export const sampleMails: MailMessage[] = [
 export const folderLabels = [
   { id: 'inbox' as const, label: '收件箱', icon: 'inbox', unread: 12 },
   { id: 'starred' as const, label: '星标', icon: 'star', unread: 0 },
+  { id: 'outbox' as const, label: '发件箱', icon: 'clock', unread: 0 },
   { id: 'sent' as const, label: '已发送', icon: 'send', unread: 0 },
   { id: 'drafts' as const, label: '草稿箱', icon: 'document', unread: 3 },
   { id: 'archive' as const, label: '归档', icon: 'archive', unread: 0 },
   { id: 'spam' as const, label: '垃圾邮件', icon: 'shield', unread: 4 },
   { id: 'trash' as const, label: '回收站', icon: 'trash', unread: 0 },
+]
+
+const sampleOutboxNow = Math.floor(Date.now() / 1_000)
+
+export const sampleOutboxItems: NativeOutboxItem[] = [
+  {
+    id: 'demo-outbox-retry',
+    accountId: 'google-work',
+    draftId: 'demo-draft-retry',
+    to: 'project-team@example.invalid',
+    cc: '',
+    bcc: '',
+    subject: '项目周报与下周计划',
+    preview: '周报已经整理完成，附件中包含进度摘要与下周安排。',
+    createdAt: sampleOutboxNow - 780,
+    updatedAt: sampleOutboxNow - 120,
+    nextAttemptAt: sampleOutboxNow + 60,
+    attempts: 2,
+    state: 'retrying',
+    lastError: '网络暂不可用，MailGo 将自动重试',
+    attachments: [{ fileName: 'weekly-report.pdf', contentType: 'application/pdf', size: 286_720, inline: false }],
+  },
+  {
+    id: 'demo-outbox-paused',
+    accountId: 'qq-personal',
+    draftId: 'demo-draft-paused',
+    to: 'design-review@example.invalid',
+    cc: 'product@example.invalid',
+    bcc: '',
+    subject: '桌面端设计评审',
+    preview: '请查收最新桌面端布局，重点确认紧凑密度和小窗口适配。',
+    createdAt: sampleOutboxNow - 3_600,
+    updatedAt: sampleOutboxNow - 420,
+    nextAttemptAt: 0,
+    attempts: 1,
+    state: 'paused',
+    lastError: '账户需要重新授权后才能发送',
+    attachments: [],
+  },
 ]

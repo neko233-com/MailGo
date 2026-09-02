@@ -3,18 +3,20 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import appIconUrl from '../resources/icons/mailgo-64.png'
 import { AccountSignatureSettings } from './components/AccountSignatureSettings'
+import { ConfirmDialog } from './components/ConfirmDialog'
 import { ExternalLinkDialog } from './components/ExternalLinkDialog'
 import { Icon, type IconName } from './components/Icon'
+import { OutboxDetail } from './components/OutboxDetail'
 import { RecipientInput } from './components/RecipientInput'
 import { buildComposeThreadHeaders, type ComposeMode } from './compose-thread'
 import { sanitizeCustomCss } from './customCss'
-import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
+import { folderLabels, providerDefinitions, sampleAccounts, sampleMails, sampleOutboxItems } from './data'
 import { mapWithConcurrency } from './lib/asyncPool'
 import { invoke, readNativeState } from './lib/ipc'
 import { inspectExternalLink, type ExternalLinkInspection } from './linkSafety'
 import { appendAccountSignature, normalizeAccountSignature } from './signature'
 import { buildMailThreads, type MailThread } from './threading'
-import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeConnectionDiagnostic, NativeConnectionDiagnosticChannel, NativeDeviceStartResponse, NativeDraft, NativeDraftAttachment, NativeLocalSearchResponse, NativeMailboxResponse, NativeMessageResponse, NativeOutboxStatus, NativeQueueStatus, NativeSearchResponse, NativeSendResponse, NativeSyncItem, NativeSyncResponse, NativeUndoSendResponse, Provider, SmartCategory, ThemeMode } from './types'
+import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeConnectionDiagnostic, NativeConnectionDiagnosticChannel, NativeDeviceStartResponse, NativeDraft, NativeDraftAttachment, NativeLocalSearchResponse, NativeMailboxResponse, NativeMessageResponse, NativeOutboxActionResponse, NativeOutboxItem, NativeOutboxRecallResponse, NativeOutboxSnapshot, NativeQueueStatus, NativeSearchResponse, NativeSendResponse, NativeSyncItem, NativeSyncResponse, NativeUndoSendResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 type ToastTone = 'info' | 'success' | 'error'
 type UndoSendSeconds = 0 | 5 | 10 | 20 | 30
@@ -30,6 +32,7 @@ type ActionMenu = 'bulk' | 'message'
 type MobilePane = 'list' | 'reading'
 type DisplayDensity = 'compact' | 'comfortable'
 type MailMoveTarget = { folder: string; label: string; icon: IconName }
+type OutboxAction = { id: string; kind: 'edit' | 'retry' | 'discard' }
 type VirtualMailItem =
   | { type: 'group'; key: string; label: string }
   | { type: 'thread'; key: string; thread: MailThread }
@@ -192,6 +195,7 @@ function uiFolderForNative(folder: string): FolderId {
 }
 
 function nativeFolderName(account: MailAccount, folder: FolderId): string {
+  if (folder === 'outbox') return '__MAILGO_LOCAL_OUTBOX__'
   if (folder === 'inbox') return 'INBOX'
   if (folder === 'sent') return account.provider === 'google' ? '[Gmail]/Sent Mail' : account.provider === 'outlook' ? 'Sent Items' : 'Sent Messages'
   if (folder === 'drafts') return account.provider === 'google' ? '[Gmail]/Drafts' : 'Drafts'
@@ -212,7 +216,7 @@ function isSameNativeFolder(left: string, right: string) {
 
 function customNativeFolders(account: MailAccount, folders: string[] | undefined) {
   const builtInFolders = folderLabels
-    .filter((folder) => folder.id !== 'starred')
+    .filter((folder) => folder.id !== 'starred' && folder.id !== 'outbox')
     .map((folder) => nativeFolderName(account, folder.id))
   const result: string[] = []
   for (const folder of folders ?? []) {
@@ -415,6 +419,35 @@ function draftToUi(draft: NativeDraft, account: MailAccount): MailMessage {
     accent: account.accent,
     avatar: '草',
     body: draft.body ? draft.body.split(/\r?\n\s*\r?\n/).filter(Boolean) : ['这是一封尚未完成的本地草稿。'],
+  }
+}
+
+function outboxToUi(item: NativeOutboxItem, account: MailAccount): MailMessage {
+  const date = new Date(item.updatedAt * 1_000)
+  const validDate = !Number.isNaN(date.getTime()) ? date : null
+  const recipient = item.to.split(/[,;]/).map((value) => value.trim()).find(Boolean) ?? '未填写收件人'
+  return {
+    id: `local-outbox:${item.accountId}:${item.id}`,
+    messageId: `outbox:${item.id}`,
+    threadId: `outbox:${item.id}`,
+    accountId: item.accountId,
+    folder: 'outbox',
+    from: account.email,
+    senderName: `发送给 ${recipient}`,
+    subject: item.subject || '(无主题)',
+    to: item.to.split(/[,;]/).map((value) => value.trim()).filter(Boolean),
+    cc: item.cc.split(/[,;]/).map((value) => value.trim()).filter(Boolean),
+    preview: item.lastError || item.preview || '等待后台发送',
+    timestamp: validDate ? validDate.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : '—',
+    receivedAt: validDate?.toISOString(),
+    dateGroup: '待发送',
+    unread: false,
+    starred: false,
+    accent: account.accent,
+    avatar: item.state === 'paused' ? '!' : '发',
+    body: [item.preview || '无纯文本摘要'],
+    outboxId: item.id,
+    outboxState: item.state,
   }
 }
 
@@ -684,6 +717,9 @@ function App() {
   const [outboxTotal, setOutboxTotal] = useState(0)
   const [outboxPaused, setOutboxPaused] = useState(0)
   const [outboxScheduled, setOutboxScheduled] = useState(0)
+  const [nativeOutboxItems, setNativeOutboxItems] = useState<NativeOutboxItem[]>(() => isNativeRuntime ? [] : sampleOutboxItems)
+  const [outboxAction, setOutboxAction] = useState<OutboxAction | null>(null)
+  const [pendingOutboxDiscard, setPendingOutboxDiscard] = useState<NativeOutboxItem | null>(null)
   const [cacheStats, setCacheStats] = useState<NativeCacheStats | null>(null)
   const [cacheStatsState, setCacheStatsState] = useState<'loading' | 'ready' | 'error'>(isNativeRuntime ? 'loading' : 'ready')
   const [nativeDrafts, setNativeDrafts] = useState<NativeDraft[]>([])
@@ -830,20 +866,26 @@ function App() {
 
   const refreshOutbox = async (accountList: MailAccount[] = accounts) => {
     if (!isNativeRuntime) {
-      setOutboxTotal(0)
-      setOutboxPaused(0)
-      setOutboxScheduled(0)
       return
     }
     try {
-      const statuses = await mapWithConcurrency(accountList, ACCOUNT_IPC_CONCURRENCY, (account) => invoke<NativeOutboxStatus>('mail.outbox.status', { accountId: account.id }))
-      setOutboxTotal(statuses.reduce((total, status) => total + status.total, 0))
-      setOutboxPaused(statuses.reduce((total, status) => total + status.paused, 0))
-      setOutboxScheduled(statuses.reduce((total, status) => total + (status.scheduled ?? 0), 0))
+      const snapshots = await mapWithConcurrency(accountList, ACCOUNT_IPC_CONCURRENCY, (account) => invoke<NativeOutboxSnapshot>('mail.outbox.snapshot', { accountId: account.id }))
+      const items = snapshots.flatMap((snapshot) => snapshot.items).sort((left, right) => right.updatedAt - left.updatedAt)
+      startTransition(() => setNativeOutboxItems(items))
+      setOutboxTotal(snapshots.reduce((total, snapshot) => total + snapshot.status.total, 0))
+      setOutboxPaused(snapshots.reduce((total, snapshot) => total + snapshot.status.paused, 0))
+      setOutboxScheduled(snapshots.reduce((total, snapshot) => total + (snapshot.status.scheduled ?? 0), 0))
     } catch {
-      // Outbox telemetry is intentionally non-blocking; the encrypted queue remains native-owned.
+      // The encrypted queue remains native-owned; a transient summary read must not interrupt mail actions.
     }
   }
+
+  useEffect(() => {
+    if (isNativeRuntime) return
+    setOutboxTotal(nativeOutboxItems.length)
+    setOutboxPaused(nativeOutboxItems.filter((item) => item.state === 'paused').length)
+    setOutboxScheduled(nativeOutboxItems.filter((item) => item.state === 'scheduled').length)
+  }, [isNativeRuntime, nativeOutboxItems])
 
   const refreshNativeDrafts = async (accountList: MailAccount[] = accounts) => {
     if (!isNativeRuntime) {
@@ -1317,7 +1359,7 @@ function App() {
         event.preventDefault()
         openCompose()
       }
-      if (!event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 'r' && !isEditableTarget && selectedMailRef.current?.id !== 'empty-mail') {
+      if (!event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 'r' && !isEditableTarget && selectedMailRef.current?.id !== 'empty-mail' && !selectedMailRef.current?.outboxId) {
         event.preventDefault()
         if (selectedMailRef.current) openCompose(undefined, 'reply', selectedMailRef.current)
       }
@@ -1327,26 +1369,34 @@ function App() {
   }, [])
 
   const selectedProvider = providerFor(provider)
-  const localDraftMails = useMemo(() => nativeDrafts.flatMap((draft) => {
+  const queuedDraftKeys = useMemo(() => new Set(nativeOutboxItems.flatMap((item) => item.draftId ? [`${item.accountId}\u0000${item.draftId}`] : [])), [nativeOutboxItems])
+  const visibleNativeDrafts = useMemo(() => nativeDrafts.filter((draft) => !queuedDraftKeys.has(`${draft.accountId}\u0000${draft.id}`)), [nativeDrafts, queuedDraftKeys])
+  const localDraftMails = useMemo(() => visibleNativeDrafts.flatMap((draft) => {
     const account = accounts.find((item) => item.id === draft.accountId)
     return account ? [draftToUi(draft, account)] : []
-  }), [accounts, nativeDrafts])
+  }), [accounts, visibleNativeDrafts])
+  const outboxMails = useMemo(() => nativeOutboxItems.flatMap((item) => {
+    const account = accounts.find((candidate) => candidate.id === item.accountId)
+    return account ? [outboxToUi(item, account)] : []
+  }), [accounts, nativeOutboxItems])
   const allMails = useMemo(() => {
     const merged = new Map<string, MailMessage>()
     for (const mail of localSearchMails) merged.set(mail.id, mail)
     for (const mail of serverSearchMails) merged.set(mail.id, mail)
     for (const mail of mails) merged.set(mail.id, mail)
     for (const mail of localDraftMails) merged.set(mail.id, mail)
+    for (const mail of outboxMails) merged.set(mail.id, mail)
     return [...merged.values()]
-  }, [localDraftMails, localSearchMails, mails, serverSearchMails])
+  }, [localDraftMails, localSearchMails, mails, outboxMails, serverSearchMails])
   const nativeSearchResultIds = useMemo(
     () => new Set([...localSearchMails, ...serverSearchMails].map((mail) => mail.id)),
     [localSearchMails, serverSearchMails],
   )
   const displayedFolderLabels = useMemo(() => {
-    if (!isNativeRuntime) return folderLabels
+    if (!isNativeRuntime) return folderLabels.map((folder) => folder.id === 'outbox' ? { ...folder, unread: nativeOutboxItems.length } : folder)
     const matchesFixedFolder = (mail: MailMessage, folder: FolderId) => {
       if (folder === 'starred') return mail.starred
+      if (folder === 'outbox') return mail.folder === 'outbox'
       const account = accounts.find((item) => item.id === mail.accountId)
       return mail.nativeFolder && account
         ? isSameNativeFolder(mail.nativeFolder, nativeFolderName(account, folder))
@@ -1354,11 +1404,13 @@ function App() {
     }
     return folderLabels.map((folder) => ({
       ...folder,
-      unread: folder.id === 'drafts'
-        ? nativeDrafts.length
+      unread: folder.id === 'outbox'
+        ? nativeOutboxItems.length
+        : folder.id === 'drafts'
+          ? visibleNativeDrafts.length
         : allMails.filter((mail) => matchesFixedFolder(mail, folder.id) && mail.unread).length,
     }))
-  }, [accounts, allMails, isNativeRuntime, nativeDrafts.length])
+  }, [accounts, allMails, isNativeRuntime, nativeOutboxItems.length, visibleNativeDrafts.length])
   const visibleMails = useMemo(() => {
     const lowerQuery = deferredQuery.trim().toLowerCase()
     return allMails.filter((mail) => {
@@ -1367,6 +1419,8 @@ function App() {
         ? mail.accountId === selectedNativeFolder.accountId && typeof nativeFolder === 'string' && isSameNativeFolder(nativeFolder, selectedNativeFolder.name)
         : selectedFolder === 'starred'
           ? mail.starred
+          : selectedFolder === 'outbox'
+            ? mail.folder === 'outbox'
           : (() => {
               const account = accounts.find((item) => item.id === mail.accountId)
               return nativeFolder && account
@@ -1410,6 +1464,9 @@ function App() {
   }, [selectedMail.hasHtml, selectedMail.id])
   const selectedThread = visibleThreads.find((thread) => thread.messages.some((mail) => mail.id === selectedMail.id)) ?? visibleThreads[0]
   const selectedMailAccount = accounts.find((account) => account.id === selectedMail.accountId)
+  const selectedOutboxItem = selectedMail.outboxId
+    ? nativeOutboxItems.find((item) => item.id === selectedMail.outboxId && item.accountId === selectedMail.accountId)
+    : undefined
   const selectedMailMoveTargets = useMemo(() => {
     if (!isNativeRuntime || !selectedMailAccount || selectedMail.nativeUid == null) return []
     return nativeMoveTargets(selectedMailAccount, nativeFolders[selectedMailAccount.id], nativeFolderLabels[selectedMailAccount.id])
@@ -1453,10 +1510,12 @@ function App() {
   )
   const allVisibleSelected = visibleMails.length > 0 && selectedVisibleMails.length === visibleMails.length
 
-  const canLoadEarlier = isNativeRuntime && !selectedNativeFolder && selectedFolder !== 'starred' && accounts
-    .filter((account) => !selectedAccountId || account.id === selectedAccountId)
-    .some((account) => mailboxMeta[nativeMailboxKey(account.id, nativeFolderName(account, selectedFolder))]?.hasMore)
-    || isNativeRuntime && Boolean(selectedNativeFolder) && Boolean(mailboxMeta[nativeMailboxKey(selectedNativeFolder!.accountId, selectedNativeFolder!.name)]?.hasMore)
+  const canLoadEarlier = isNativeRuntime && selectedFolder !== 'starred' && selectedFolder !== 'outbox' && (
+    !selectedNativeFolder && accounts
+      .filter((account) => !selectedAccountId || account.id === selectedAccountId)
+      .some((account) => mailboxMeta[nativeMailboxKey(account.id, nativeFolderName(account, selectedFolder))]?.hasMore)
+    || Boolean(selectedNativeFolder) && Boolean(mailboxMeta[nativeMailboxKey(selectedNativeFolder!.accountId, selectedNativeFolder!.name)]?.hasMore)
+  )
 
   const requestNativeMessage = useCallback((mail: MailMessage) => {
     const existing = messageHydrationRef.current.get(mail.id)
@@ -1478,6 +1537,10 @@ function App() {
     setSelectedMailId(mail.id)
     setMobilePane('reading')
     setLoadingMessageId(null)
+    if (mail.outboxId) {
+      setSelectedAccountId(mail.accountId)
+      return
+    }
     const localDraft = nativeDrafts.find((draft) => mail.id === `local-draft:${draft.accountId}:${draft.id}`)
     if (localDraft) {
       setSelectedAccountId(localDraft.accountId)
@@ -1881,14 +1944,20 @@ function App() {
     setSelectedCategory(null)
     setSelectedAccountId(null)
     setSelectedMailIds([])
+    if (folder === 'outbox') setFilterUnread(false)
     const first = allMails.find((mail) => {
       if (folder === 'starred') return mail.starred
+      if (folder === 'outbox') return mail.folder === 'outbox'
       const account = accounts.find((item) => item.id === mail.accountId)
       return mail.nativeFolder && account
         ? isSameNativeFolder(mail.nativeFolder, nativeFolderName(account, folder))
         : mail.folder === folder
     })
-    if (first) setSelectedMailId(first.id)
+    setSelectedMailId(first?.id ?? '')
+    if (folder === 'outbox') {
+      void refreshOutbox()
+      return
+    }
     if (isNativeRuntime && folder !== 'starred') {
       setMailboxHydrating(true)
       void mapWithConcurrency(accounts, ACCOUNT_IPC_CONCURRENCY, async (account) => {
@@ -2125,8 +2194,104 @@ function App() {
     }
   }
 
+  const editQueuedMessage = async (item: NativeOutboxItem) => {
+    if (outboxAction) return
+    setOutboxAction({ id: item.id, kind: 'edit' })
+    try {
+      if (!isNativeRuntime) {
+        pushToast('演示数据不会写入本机草稿；安装版会立即打开完整草稿', 'info')
+        return
+      }
+      const result = await invoke<NativeOutboxRecallResponse>('mail.outbox.recall', { accountId: item.accountId, outboxId: item.id }, 30_000)
+      if (result.status === 'too-late') {
+        pushToast('邮件已经进入发送阶段，无法继续编辑', 'info')
+        void refreshOutbox()
+        return
+      }
+      if (result.status === 'missing' || !result.draft) {
+        pushToast('这封邮件已不在发件箱，可能已经发送', 'info')
+        void refreshOutbox()
+        return
+      }
+      handleDraftChanged(result.draft)
+      setSelectedMailId('')
+      setSelectedFolder('drafts')
+      openCompose(result.draft.id)
+      void Promise.all([refreshOutbox(), refreshNativeDrafts()])
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : '暂时无法恢复这封待发送邮件', 'error')
+    } finally {
+      setOutboxAction((current) => current?.id === item.id && current.kind === 'edit' ? null : current)
+    }
+  }
+
+  const retryQueuedMessage = async (item: NativeOutboxItem) => {
+    if (outboxAction) return
+    if (offlineMode) {
+      pushToast('仅离线模式已开启，关闭后即可继续发送', 'info')
+      return
+    }
+    setOutboxAction({ id: item.id, kind: 'retry' })
+    try {
+      if (!isNativeRuntime) {
+        setNativeOutboxItems((current) => current.map((candidate) => candidate.id === item.id
+          ? { ...candidate, state: 'pending' as const, attempts: 0, lastError: undefined, nextAttemptAt: Math.floor(Date.now() / 1_000) }
+          : candidate))
+        pushToast('已进入后台发送队列', 'success')
+        return
+      }
+      const result = await invoke<NativeOutboxActionResponse>('mail.outbox.retry', { accountId: item.accountId, outboxId: item.id })
+      if (result.status === 'retried') pushToast('已恢复后台发送，无需停留在此页面', 'success')
+      else if (result.status === 'too-late') pushToast('邮件已经进入发送阶段', 'info')
+      else pushToast('这封邮件已不在发件箱，可能已经发送', 'info')
+      await refreshOutbox()
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : '暂时无法重试这封邮件', 'error')
+    } finally {
+      setOutboxAction((current) => current?.id === item.id && current.kind === 'retry' ? null : current)
+    }
+  }
+
+  const discardQueuedMessage = async () => {
+    const item = pendingOutboxDiscard
+    if (!item || outboxAction) return
+    setOutboxAction({ id: item.id, kind: 'discard' })
+    try {
+      if (!isNativeRuntime) {
+        setNativeOutboxItems((current) => current.filter((candidate) => candidate.id !== item.id))
+        setSelectedMailId('')
+        setPendingOutboxDiscard(null)
+        pushToast('已删除待发送邮件', 'success')
+        return
+      }
+      const result = await invoke<NativeOutboxActionResponse>('mail.outbox.discard', { accountId: item.accountId, outboxId: item.id }, 30_000)
+      setPendingOutboxDiscard(null)
+      if (result.status === 'discarded') {
+        setSelectedMailId('')
+        pushToast('已删除待发送邮件及其本地草稿', 'success')
+      } else if (result.status === 'too-late') {
+        pushToast('邮件已经进入发送阶段，无法删除', 'info')
+      } else {
+        pushToast('这封邮件已不在发件箱，可能已经发送', 'info')
+      }
+      await Promise.all([refreshOutbox(), refreshNativeDrafts()])
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : '暂时无法删除这封待发送邮件', 'error')
+    } finally {
+      setOutboxAction((current) => current?.id === item.id && current.kind === 'discard' ? null : current)
+    }
+  }
+
   const retryPendingOutbox = async () => {
-    if (!isNativeRuntime || !accounts.length) return
+    if (!accounts.length) return
+    if (!isNativeRuntime) {
+      const retryable = nativeOutboxItems.filter((item) => item.state === 'paused' || item.state === 'retrying').length
+      setNativeOutboxItems((current) => current.map((item) => item.state === 'paused' || item.state === 'retrying'
+        ? { ...item, state: 'pending' as const, attempts: 0, lastError: undefined, nextAttemptAt: Math.floor(Date.now() / 1_000) }
+        : item))
+      pushToast(retryable ? `已恢复 ${retryable} 封待发送邮件` : '当前没有需要手动重试的待发送邮件', 'info')
+      return
+    }
     if (offlineMode) {
       pushToast('仅离线模式已开启，联网后关闭该模式即可重试发件箱', 'info')
       return
@@ -2774,8 +2939,8 @@ function App() {
 
         <main className="mail-list-panel">
           <div className="panel-toolbar">
-            <div className="mailbox-heading"><strong>{activeMailboxTitle}</strong><span>{visibleMails.length} 封邮件</span></div>
-            <button className={`filter-button ${filterUnread ? 'is-active' : ''}`} type="button" onClick={() => setFilterUnread((value) => !value)}><Icon name="filter" size={17} /> 筛选{filterUnread && <span className="filter-dot" />}</button>
+            <div className="mailbox-heading"><strong>{activeMailboxTitle}</strong><span>{visibleMails.length} {selectedFolder === 'outbox' ? '封待发送' : '封邮件'}</span></div>
+            {selectedFolder !== 'outbox' && <button className={`filter-button ${filterUnread ? 'is-active' : ''}`} type="button" onClick={() => setFilterUnread((value) => !value)}><Icon name="filter" size={17} /> 筛选{filterUnread && <span className="filter-dot" />}</button>}
           </div>
           {selectedFolder === 'inbox' && !selectedNativeFolder && <nav className="inbox-tabs" aria-label="收件箱分类">
             {inboxTabs.map((tab) => {
@@ -2783,7 +2948,10 @@ function App() {
               return <button key={tab.id} type="button" className={selected ? 'is-selected' : ''} aria-current={selected ? 'page' : undefined} onClick={() => { if (tab.category) selectCategory(tab.category); else selectFolder('inbox') }}><Icon name={tab.icon} size={17} weight={selected ? 'Filled' : 'Outline'} /><span>{tab.label}</span></button>
             })}
           </nav>}
-          <div className="list-toolbar">
+          {selectedFolder === 'outbox' && !selectedNativeFolder ? <div className="list-toolbar outbox-list-toolbar">
+            <span><Icon name="cloud" size={15} />本机队列即时显示，发送在后台继续</span>
+            {outboxPaused > 0 && <button type="button" className="toolbar-action" onClick={() => { void retryPendingOutbox() }}><Icon name="rotate" size={16} /><span>重试全部</span></button>}
+          </div> : <div className="list-toolbar">
             <label className="checkbox-wrap"><input type="checkbox" aria-label="选择所有邮件" checked={allVisibleSelected} onChange={toggleAllVisible} /><span /></label>{selectedVisibleMails.length > 0 && <span className="selection-count">已选 {selectedVisibleMails.length} 封</span>}
             <button type="button" className="toolbar-action" onClick={() => { void applyBulkMove('archive') }} disabled={!selectedVisibleMails.length}><Icon name="archive" size={17} /> <span>归档</span></button>
             <button type="button" className="toolbar-action" onClick={() => { void applyBulkMove('delete') }} disabled={!selectedVisibleMails.length}><Icon name="trash" size={17} /> <span>删除</span></button>
@@ -2799,32 +2967,41 @@ function App() {
                 <button type="button" role="menuitem" disabled={!selectedVisibleMails.length} onClick={() => { setSelectedMailIds([]); setOpenMenu(null) }}><Icon name="close" size={16} />取消选择</button>
               </div>}
             </div>
-          </div>
-          <div ref={mailListRef} className="mail-list-scroll" onScroll={handleMailListScroll} aria-busy={isNativeRuntime && (!nativeStateReady || isMailboxHydrating) || isLoadingEarlier}>
+          </div>}
+          <div ref={mailListRef} className="mail-list-scroll" onScroll={handleMailListScroll} aria-busy={isNativeRuntime && (!nativeStateReady || isMailboxHydrating) || isLoadingEarlier || Boolean(outboxAction)}>
             {isNativeRuntime && (!nativeStateReady || isMailboxHydrating) && <div className="list-loading-strip" role="status"><span className="loading-spinner" aria-hidden="true" /><span>{nativeStateReady ? '正在从本地索引加载当前页，其他区域仍可操作' : '正在读取本地账户，主界面已可操作'}</span></div>}
             {nativeStateError && <div className="local-state-error" role="alert"><Icon name="info" size={18} /><span><strong>本地邮件服务连接失败</strong>{nativeStateError}<small>账户文件与安全凭据保持原样，请重新启动 MailGo 或查看本机日志。</small></span></div>}
             {virtualMailItems.length > 0 && <div className="mail-virtual-space" style={{ height: mailListVirtualizer.getTotalSize() }}>
               {mailListVirtualizer.getVirtualItems().map((virtualItem) => {
                 const item = virtualMailItems[virtualItem.index]
                 if (!item) return null
+                const latest = item.type === 'thread' ? item.thread.latest : undefined
                 return <div key={item.key} className={`virtual-mail-item virtual-mail-${item.type}`} style={{ height: virtualItem.size, transform: `translateY(${virtualItem.start}px)` }}>
                   {item.type === 'group'
                     ? <div className="mail-group-label">{item.label}</div>
-                    : <div className={`mail-row ${item.thread.messages.some((mail) => mail.id === selectedMailId) ? 'is-selected' : ''} ${item.thread.unreadCount > 0 ? 'is-unread' : ''}`} onClick={() => { void selectMail(item.thread.latest) }}>
-                        <label className="checkbox-wrap row-checkbox" onClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`选择会话 ${item.thread.latest.subject}`} checked={item.thread.messages.every((mail) => selectedMailIds.includes(mail.id))} onChange={() => toggleThreadSelection(item.thread)} /><span /></label>
-                        <button type="button" className={`star-button ${item.thread.latest.starred ? 'is-starred' : ''}`} aria-label={item.thread.latest.starred ? '取消最新邮件星标' : '为最新邮件添加星标'} onClick={(event) => { event.stopPropagation(); toggleStar(item.thread.latest) }}><Icon name="star" size={18} weight={item.thread.latest.starred ? 'Filled' : 'Outline'} /></button>
-                        <div className="mail-row-copy"><div className="mail-row-top"><strong>{item.thread.participants.join('、') || item.thread.latest.senderName}{item.thread.messages.length > 1 && <span className="thread-count">{item.thread.messages.length}</span>}</strong><time>{item.thread.latest.timestamp}</time></div><div className="mail-row-subject">{item.thread.latest.subject}</div><p>{item.thread.latest.preview}</p></div>
+                    : <div className={`mail-row ${latest?.outboxId ? 'is-outbox-row' : ''} ${item.thread.messages.some((mail) => mail.id === selectedMailId) ? 'is-selected' : ''} ${item.thread.unreadCount > 0 ? 'is-unread' : ''}`} onClick={() => { void selectMail(item.thread.latest) }}>
+                        {latest?.outboxId ? <span className={`outbox-row-state is-${latest.outboxState}`} title={latest.outboxState === 'paused' ? '需要处理' : latest.outboxState === 'scheduled' ? '等待撤销窗口' : latest.outboxState === 'retrying' ? '自动重试中' : '等待发送'}><Icon name={latest.outboxState === 'paused' ? 'info' : latest.outboxState === 'scheduled' ? 'clock' : 'rotate'} size={15} /></span> : <><label className="checkbox-wrap row-checkbox" onClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`选择会话 ${latest?.subject}`} checked={item.thread.messages.every((mail) => selectedMailIds.includes(mail.id))} onChange={() => toggleThreadSelection(item.thread)} /><span /></label><button type="button" className={`star-button ${latest?.starred ? 'is-starred' : ''}`} aria-label={latest?.starred ? '取消最新邮件星标' : '为最新邮件添加星标'} onClick={(event) => { event.stopPropagation(); if (latest) toggleStar(latest) }}><Icon name="star" size={18} weight={latest?.starred ? 'Filled' : 'Outline'} /></button></>}
+                        <div className="mail-row-copy"><div className="mail-row-top"><strong>{item.thread.participants.join('、') || latest?.senderName}{item.thread.messages.length > 1 && <span className="thread-count">{item.thread.messages.length}</span>}</strong><time>{latest?.timestamp}</time></div><div className="mail-row-subject">{latest?.subject}</div><p>{latest?.preview}</p></div>
                       </div>}
                 </div>
               })}
             </div>}
-            {visibleMails.length === 0 && <div className="empty-list"><span className="empty-icon"><Icon name={isNativeRuntime && (!nativeStateReady || isMailboxHydrating) ? 'rotate' : accounts.length === 0 ? 'user' : 'search'} size={24} /></span><strong>{isNativeRuntime && (!nativeStateReady || isMailboxHydrating) ? '正在打开本地邮箱' : accounts.length === 0 ? '还没有添加邮箱账户' : '没有找到邮件'}</strong><p>{isNativeRuntime && (!nativeStateReady || isMailboxHydrating) ? '先显示本地索引页；远程邮件会在进入后异步同步。' : accounts.length === 0 ? '添加 Google、QQ、Outlook 或自定义 IMAP/SMTP 账户后开始使用。' : '试试清除筛选或搜索其他关键词。'}</p>{isNativeRuntime && nativeStateReady && accounts.length === 0 && <button type="button" className="empty-list-action" onClick={openNewAccount}><Icon name="add" size={16} />添加第一个账户</button>}</div>}
+            {visibleMails.length === 0 && <div className="empty-list"><span className="empty-icon"><Icon name={selectedFolder === 'outbox' ? 'send' : isNativeRuntime && (!nativeStateReady || isMailboxHydrating) ? 'rotate' : accounts.length === 0 ? 'user' : 'search'} size={24} /></span><strong>{selectedFolder === 'outbox' ? '发件箱是空的' : isNativeRuntime && (!nativeStateReady || isMailboxHydrating) ? '正在打开本地邮箱' : accounts.length === 0 ? '还没有添加邮箱账户' : '没有找到邮件'}</strong><p>{selectedFolder === 'outbox' ? '待发送邮件会先安全写入本机，再由后台异步发送。' : isNativeRuntime && (!nativeStateReady || isMailboxHydrating) ? '先显示本地索引页；远程邮件会在进入后异步同步。' : accounts.length === 0 ? '添加 Google、QQ、Outlook 或自定义 IMAP/SMTP 账户后开始使用。' : '试试清除筛选或搜索其他关键词。'}</p>{isNativeRuntime && nativeStateReady && accounts.length === 0 && <button type="button" className="empty-list-action" onClick={openNewAccount}><Icon name="add" size={16} />添加第一个账户</button>}</div>}
             {isLoadingEarlier && <div className="mail-page-loading" role="status"><span className="loading-spinner" aria-hidden="true" />正在增量加载更早邮件…</div>}
           </div>
-          <div className="list-footer"><span>{visibleThreads.length ? `${visibleThreads.length} 个会话 · ${visibleMails.length} 封邮件` : '0 封邮件'}</span><div className="list-footer-actions">{canLoadEarlier && <button type="button" className="load-earlier-button" onClick={() => { void loadEarlier() }} disabled={isLoadingEarlier}>{isLoadingEarlier ? '加载中…' : '加载更早邮件'}</button>}<TooltipButton label="刷新邮件" onClick={handleSync}><Icon name="rotate" size={17} /></TooltipButton></div></div>
+          <div className="list-footer"><span>{selectedFolder === 'outbox' ? `${visibleMails.length} 封待发送` : visibleThreads.length ? `${visibleThreads.length} 个会话 · ${visibleMails.length} 封邮件` : '0 封邮件'}</span><div className="list-footer-actions">{canLoadEarlier && <button type="button" className="load-earlier-button" onClick={() => { void loadEarlier() }} disabled={isLoadingEarlier}>{isLoadingEarlier ? '加载中…' : '加载更早邮件'}</button>}<TooltipButton label={selectedFolder === 'outbox' ? '刷新发件箱' : '刷新邮件'} onClick={selectedFolder === 'outbox' ? () => { void refreshOutbox() } : handleSync}><Icon name="rotate" size={17} /></TooltipButton></div></div>
         </main>
 
         <section className="reading-panel" aria-label="邮件阅读区">
+          {selectedOutboxItem ? <OutboxDetail
+            item={selectedOutboxItem}
+            account={selectedMailAccount}
+            busyAction={outboxAction?.id === selectedOutboxItem.id ? outboxAction.kind : undefined}
+            onBack={() => setMobilePane('list')}
+            onEdit={() => { void editQueuedMessage(selectedOutboxItem) }}
+            onRetry={() => { void retryQueuedMessage(selectedOutboxItem) }}
+            onDiscard={() => setPendingOutboxDiscard(selectedOutboxItem)}
+          /> : <>
           <div className="reading-toolbar">
             <div className="reading-actions"><TooltipButton label="返回邮件列表" className="mobile-only-button reading-back-button" onClick={() => setMobilePane('list')}><span className="mobile-back-label">列表</span></TooltipButton><TooltipButton label="回复" onClick={() => openCompose(undefined, 'reply', selectedMail)}><Icon name="reply" size={18} /></TooltipButton><span>回复</span><TooltipButton label="回复全部" onClick={() => openCompose(undefined, 'reply-all', selectedMail)}><Icon name="reply" size={18} /></TooltipButton><span>回复全部</span><TooltipButton label="转发" onClick={() => openCompose(undefined, 'forward', selectedMail)}><Icon name="forward" size={18} /></TooltipButton><span>转发</span><TooltipButton label="归档" onClick={() => { void runMove(selectedMail, 'archive') }}><Icon name="archive" size={18} /></TooltipButton><span>归档</span><TooltipButton label="删除" onClick={() => { void runMove(selectedMail, 'delete') }}><Icon name="trash" size={18} /></TooltipButton><span>删除</span><TooltipButton label="移入垃圾邮件" onClick={() => { void runMove(selectedMail, 'spam') }}><Icon name="shield" size={18} /></TooltipButton><span>垃圾邮件</span></div>
             <div className="menu-anchor">
@@ -2850,6 +3027,7 @@ function App() {
             {selectedMail.attachments && selectedMail.attachments.length > 0 && <div className="attachments"><div className="attachments-heading"><span><Icon name="paperclip" size={20} /> {selectedMail.attachments.length} 个附件</span><div><button type="button" onClick={() => { void mapWithConcurrency(selectedMail.attachments ?? [], ATTACHMENT_DOWNLOAD_CONCURRENCY, downloadAttachment) }}><Icon name="download" size={17} /> 全部下载</button></div></div><div className="attachment-grid">{selectedMail.attachments.map((attachment) => { const progress = attachmentProgress[attachment.id]; return <AttachmentCard attachment={attachment} progress={progress} key={attachment.id} onActivate={() => { if (progress != null) cancelAttachment(attachment.id); else void downloadAttachment(attachment) }} /> })}</div></div>}
             <div className="reply-composer"><Avatar message={{ ...selectedMail, avatar: 'OC', accent: '#2a5596' }} size="sm" /><div className="reply-input" onClick={() => openCompose(undefined, 'reply', selectedMail)}>点击回复，或按 R 快速回复<div className="reply-tools"><span><Icon name="paperclip" size={19} /></span><span><Icon name="image" size={19} /></span><span className="reply-emoji">☺</span><span className="reply-a">A</span><button type="button" onClick={(event) => { event.stopPropagation(); openCompose(undefined, 'reply', selectedMail) }}>回复 <span>⌄</span></button></div></div></div>
           </div>
+          </>}
         </section>
 
         <AnimatePresence initial={false}>
@@ -2884,6 +3062,14 @@ function App() {
 
       <AnimatePresence>{isHelpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}</AnimatePresence>
       <AnimatePresence>{pendingExternalLink && <ExternalLinkDialog inspection={pendingExternalLink} onClose={() => setPendingExternalLink(null)} onOpen={openExternalUrl} onError={(message) => pushToast(message, 'error')} />}</AnimatePresence>
+      <AnimatePresence>{pendingOutboxDiscard && <ConfirmDialog
+        title="删除这封待发送邮件？"
+        detail={`“${pendingOutboxDiscard.subject || '(无主题)'}”及其本地草稿会一起删除，此操作无法撤销。`}
+        confirmLabel="删除待发送"
+        busy={outboxAction?.id === pendingOutboxDiscard.id && outboxAction.kind === 'discard'}
+        onCancel={() => setPendingOutboxDiscard(null)}
+        onConfirm={() => { void discardQueuedMessage() }}
+      />}</AnimatePresence>
       <AnimatePresence>{isComposeOpen && <ComposeModal
         mode={composeMode}
         source={composeSource}
@@ -3625,7 +3811,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
         }
       }
       const sentDraftId = draftIdRef.current
-      if (isNativeRuntime && accountId && sentDraftId && !sendResult.undoable) {
+      if (isNativeRuntime && accountId && sentDraftId && !sendResult.queued) {
         await invoke('drafts.remove', { accountId, id: sentDraftId }, 30_000).catch(() => undefined)
         onDraftRemoved?.(sentDraftId)
       }
