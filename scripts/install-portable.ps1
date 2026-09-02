@@ -119,6 +119,9 @@ try {
         $parent = Split-Path -Parent $InstallDirectory
         New-Item -ItemType Directory -Force -Path $parent | Out-Null
         Copy-Item -LiteralPath $stagingRoot -Destination $deploymentRoot -Recurse -Force
+        $iconCacheName = "mailgo-$($actualHash.Substring(0, 16).ToLowerInvariant()).ico"
+        $iconCacheRelativePath = Join-Path 'resources\icons' $iconCacheName
+        Copy-Item -LiteralPath (Join-Path $deploymentRoot 'resources\icons\mailgo.ico') -Destination (Join-Path $deploymentRoot $iconCacheRelativePath) -Force
         if (Test-Path -LiteralPath $InstallDirectory) {
             Move-Item -LiteralPath $InstallDirectory -Destination $backupDirectory
         }
@@ -136,14 +139,14 @@ try {
         $shortcut = $shell.CreateShortcut($startMenu)
         $shortcut.TargetPath = Join-Path $InstallDirectory 'MailGo.exe'
         $shortcut.WorkingDirectory = $InstallDirectory
-        $shortcut.IconLocation = "$(Join-Path $InstallDirectory 'resources\icons\mailgo.ico'),0"
+        $shortcut.IconLocation = "$(Join-Path $InstallDirectory $iconCacheRelativePath),0"
         $shortcut.Description = 'MailGo Windows mail workspace'
         $shortcut.Save()
         if ($CreateDesktopShortcut) {
             $desktopShortcut = $shell.CreateShortcut((Join-Path ([Environment]::GetFolderPath('Desktop')) 'MailGo.lnk'))
             $desktopShortcut.TargetPath = Join-Path $InstallDirectory 'MailGo.exe'
             $desktopShortcut.WorkingDirectory = $InstallDirectory
-            $desktopShortcut.IconLocation = "$(Join-Path $InstallDirectory 'resources\icons\mailgo.ico'),0"
+            $desktopShortcut.IconLocation = "$(Join-Path $InstallDirectory $iconCacheRelativePath),0"
             $desktopShortcut.Description = 'MailGo Windows mail workspace'
             $desktopShortcut.Save()
         }

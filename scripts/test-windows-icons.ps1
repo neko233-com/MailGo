@@ -111,6 +111,10 @@ try {
     $portableScript = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'package-windows.ps1') -Raw
     if (!$portableScript.Contains('ExtractAssociatedIcon')) { throw 'portable packaging must verify the embedded executable icon' }
 
+    $installerScript = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'install-portable.ps1') -Raw
+    if (!$installerScript.Contains('iconCacheRelativePath')) { throw 'portable shortcuts need a content-addressed icon path to avoid stale Windows icon cache entries' }
+    if ($installerScript -match 'IconLocation = .*resources\\icons\\mailgo\.ico') { throw 'portable shortcuts still point at the stale canonical icon path' }
+
     $traySource = Get-Content -LiteralPath (Join-Path $projectRoot 'native\src\tray.rs') -Raw
     if (!$traySource.Contains('GetSystemMetricsForDpi')) { throw 'tray icon loading must use the current Windows DPI' }
     Write-Host 'Windows icon checks passed: exact ICO sizes, MSIX scale assets, target-size theme variants, and DPI-aware tray loading.'
