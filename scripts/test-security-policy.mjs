@@ -8,7 +8,10 @@ const assert = (condition, message) => {
 }
 
 const app = read('src/App.tsx')
+const styles = read('src/styles.css')
 const nativeMain = read('native/src/main.rs')
+const nativeMail = read('native/src/mail.rs')
+const nativeSync = read('native/src/sync.rs')
 const oauth = read('native/src/oauth.rs')
 const tray = read('native/src/tray.rs')
 const cargo = read('native/Cargo.toml')
@@ -30,6 +33,19 @@ assert(nativeMain.includes('legacy custom account credentials require reauthoriz
 
 assert(oauth.includes('CALLBACK_REQUEST_DEADLINE'), 'OAuth callbacks need an absolute request deadline')
 assert(oauth.includes('checked_duration_since(Instant::now())'), 'OAuth read timeout must shrink with the remaining deadline')
+
+assert(nativeMail.includes('is_unsafe_attachment_format_character(character)'), 'attachment names must remove unsafe Unicode format controls')
+assert(nativeMail.includes("'\\u{202a}'..='\\u{202e}'"), 'attachment names must remove bidi embedding and override controls')
+assert(nativeMail.includes("'\\u{2066}'..='\\u{2069}'"), 'attachment names must remove bidi isolate controls')
+assert(app.includes('<bdi dir="auto">{attachment.name}</bdi>'), 'attachment names must render inside a direction-isolating element')
+assert(app.includes('DANGEROUS_ATTACHMENT_EXTENSIONS'), 'dangerous attachment suffixes must receive an explicit warning')
+assert(styles.includes('unicode-bidi: isolate'), 'attachment filename styling must preserve direction isolation')
+
+assert(nativeSync.includes('read_bounded_starttls_line'), 'STARTTLS plaintext lines must use a bounded reader')
+assert(nativeSync.includes('MAX_STARTTLS_LINE_BYTES'), 'STARTTLS plaintext lines need an explicit byte budget')
+assert(nativeSync.includes('MAX_STARTTLS_RESPONSE_BYTES'), 'STARTTLS plaintext exchange needs an aggregate byte budget')
+assert(nativeSync.includes('STARTTLS_EXCHANGE_TIMEOUT'), 'STARTTLS plaintext exchange needs an absolute deadline')
+assert(!nativeSync.includes(".read_until(b'\\n', &mut line)"), 'STARTTLS must not allocate through an unbounded delimiter read')
 
 assert(!tray.includes('FindWindowW'), 'single-instance activation must not trust a window title alone')
 assert(tray.includes('QueryFullProcessImageNameW'), 'single-instance activation must verify the owning executable')

@@ -654,7 +654,11 @@ fn safe_attachment_name(value: &str) -> String {
     let mut name = value
         .chars()
         .map(|character| {
-            if character == '/' || character == '\\' || character.is_control() {
+            if character == '/'
+                || character == '\\'
+                || character.is_control()
+                || is_unsafe_attachment_format_character(character)
+            {
                 '_'
             } else {
                 character
@@ -669,6 +673,18 @@ fn safe_attachment_name(value: &str) -> String {
         name = "attachment".into();
     }
     name
+}
+
+fn is_unsafe_attachment_format_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
 }
 
 fn part_bytes(part: &mail_parser::MessagePart<'_>) -> Vec<u8> {
@@ -1117,6 +1133,28 @@ mod tests {
         assert!(!name.contains('/'));
         assert!(!name.contains('\\'));
         assert!(!name.starts_with('.'));
+    }
+
+    #[test]
+    fn strips_directionality_and_invisible_format_controls_from_attachment_names() {
+        let unsafe_name = "invoice\u{202e}fdp.exe";
+        let normalized = safe_attachment_name(unsafe_name);
+
+        assert_eq!(normalized, "invoice_fdp.exe");
+        assert!(!normalized
+            .chars()
+            .any(is_unsafe_attachment_format_character));
+
+        for character in [
+            '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
+            '\u{202e}', '\u{2060}', '\u{2061}', '\u{2062}', '\u{2063}', '\u{2064}', '\u{2066}',
+            '\u{2067}', '\u{2068}', '\u{2069}', '\u{feff}',
+        ] {
+            assert_eq!(
+                safe_attachment_name(&format!("report{character}.pdf")),
+                "report_.pdf"
+            );
+        }
     }
 
     #[test]

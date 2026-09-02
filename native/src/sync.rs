@@ -49,6 +49,9 @@ const MAX_DELTA_HEADER_UIDS: usize = MAX_HEADER_MESSAGES;
 const MAX_DELTA_VANISHED_RANGES: usize = MAX_CACHED_MESSAGES_PER_FOLDER;
 const IMAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const IMAP_IO_TIMEOUT: Duration = Duration::from_secs(60);
+const STARTTLS_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_STARTTLS_LINE_BYTES: usize = 64 * 1024;
+const MAX_STARTTLS_RESPONSE_BYTES: usize = 256 * 1024;
 const INITIAL_SYNC_DELAY: Duration = Duration::from_secs(3);
 const BACKGROUND_SYNC_INTERVAL: Duration = Duration::from_secs(300);
 pub(crate) const ACCOUNT_SYNC_CONCURRENCY: usize = 3;
@@ -264,15 +267,7 @@ fn connect(profile: &ProviderProfile) -> Result<imap::Client<imap::Connection>> 
             Ok(client)
         }
         TransportSecurity::StartTls => {
-            let mut client = imap::Client::new(tcp);
-            client
-                .read_greeting()
-                .with_context(|| format!("read IMAP greeting from {}", profile.imap.host))?;
-            let tcp = client
-                .into_inner()
-                .context("take IMAP socket before TLS handshake")?;
-            let mut tcp = tcp;
-            start_tls(&mut tcp)
+            let tcp = start_tls(tcp)
                 .with_context(|| format!("start TLS on IMAP host {}", profile.imap.host))?;
             let tls = tls_connect(&profile.imap.host, tcp)?;
             // The IMAP greeting was already consumed before STARTTLS. LOGIN/AUTHENTICATE is the
@@ -311,37 +306,101 @@ fn connect_socket(host: &str, port: u16) -> Result<TcpStream> {
     ))
 }
 
-fn start_tls(tcp: &mut TcpStream) -> Result<()> {
+fn set_starttls_read_deadline(stream: &TcpStream, deadline: Instant) -> Result<()> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| anyhow!("IMAP STARTTLS exchange timed out"))?;
+    stream
+        .set_read_timeout(Some(remaining.min(IMAP_IO_TIMEOUT)))
+        .context("set IMAP STARTTLS read deadline")
+}
+
+fn read_bounded_starttls_line<R, F>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    mut before_read: F,
+) -> Result<usize>
+where
+    R: BufRead,
+    F: FnMut(&mut R) -> Result<()>,
+{
+    line.clear();
+    loop {
+        before_read(reader)?;
+        let available = reader.fill_buf().context("read IMAP plaintext response")?;
+        if available.is_empty() {
+            return Ok(line.len());
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(take) > MAX_STARTTLS_LINE_BYTES {
+            return Err(anyhow!("IMAP STARTTLS response line is too large"));
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if line.last() == Some(&b'\n') {
+            return Ok(line.len());
+        }
+    }
+}
+
+fn start_tls(tcp: TcpStream) -> Result<TcpStream> {
     const STARTTLS_TAG: &[u8] = b"MAILGO1";
-    tcp.write_all(STARTTLS_TAG)
-        .and_then(|_| tcp.write_all(b" STARTTLS\r\n"))
-        .and_then(|_| tcp.flush())
+    let deadline = Instant::now() + STARTTLS_EXCHANGE_TIMEOUT;
+    let mut reader = BufReader::new(tcp);
+    let mut line = Vec::with_capacity(1024);
+
+    let greeting_bytes = read_bounded_starttls_line(&mut reader, &mut line, |reader| {
+        set_starttls_read_deadline(reader.get_ref(), deadline)
+    })?;
+    if greeting_bytes == 0 {
+        return Err(anyhow!(
+            "IMAP server closed the connection before its greeting"
+        ));
+    }
+    let mut total_read = greeting_bytes;
+    let mut greeting_parts = line.split(|byte| byte.is_ascii_whitespace());
+    if greeting_parts.next() != Some(b"*".as_slice())
+        || !greeting_parts
+            .next()
+            .is_some_and(|status| status.eq_ignore_ascii_case(b"OK"))
+    {
+        return Err(anyhow!(
+            "IMAP server did not provide a safe STARTTLS greeting"
+        ));
+    }
+
+    reader
+        .get_mut()
+        .write_all(STARTTLS_TAG)
+        .and_then(|_| reader.get_mut().write_all(b" STARTTLS\r\n"))
+        .and_then(|_| reader.get_mut().flush())
         .context("write IMAP STARTTLS command")?;
 
-    let cloned = tcp.try_clone().context("clone IMAP socket for response")?;
-    let mut reader = BufReader::new(cloned);
-    let mut line = Vec::new();
     loop {
-        line.clear();
-        let read = reader
-            .read_until(b'\n', &mut line)
-            .context("read IMAP STARTTLS response")?;
+        let read = read_bounded_starttls_line(&mut reader, &mut line, |reader| {
+            set_starttls_read_deadline(reader.get_ref(), deadline)
+        })?;
         if read == 0 {
             return Err(anyhow!("IMAP server closed the connection before STARTTLS"));
         }
-        if line.len() > 64 * 1024 {
+        total_read = total_read.saturating_add(read);
+        if total_read > MAX_STARTTLS_RESPONSE_BYTES {
             return Err(anyhow!("IMAP STARTTLS response is too large"));
         }
-        if !line.starts_with(STARTTLS_TAG) {
+        let mut parts = line.split(|byte| byte.is_ascii_whitespace());
+        if parts.next() != Some(STARTTLS_TAG) {
             continue;
         }
-        let status = line
-            .split(|byte| byte.is_ascii_whitespace())
-            .nth(1)
+        let status = parts
+            .next()
             .and_then(|value| std::str::from_utf8(value).ok())
             .unwrap_or_default();
         if status.eq_ignore_ascii_case("OK") {
-            return Ok(());
+            return Ok(reader.into_inner());
         }
         return Err(anyhow!("IMAP STARTTLS command was rejected"));
     }
@@ -3667,6 +3726,30 @@ mod tests {
     use crate::classifier::SmartCategory;
 
     #[test]
+    fn starttls_plaintext_line_is_rejected_before_unbounded_allocation() {
+        let mut reader = BufReader::new(std::io::Cursor::new(vec![
+            b'a';
+            MAX_STARTTLS_LINE_BYTES + 1
+        ]));
+        let mut line = Vec::new();
+        let error = read_bounded_starttls_line(&mut reader, &mut line, |_| Ok(()))
+            .expect_err("an unterminated oversized line must be rejected");
+
+        assert!(error.to_string().contains("line is too large"));
+        assert!(line.len() <= MAX_STARTTLS_LINE_BYTES);
+    }
+
+    #[test]
+    fn starttls_plaintext_line_accepts_a_bounded_complete_response() {
+        let mut reader = BufReader::new(std::io::Cursor::new(b"MAILGO1 OK Begin TLS\r\n"));
+        let mut line = Vec::new();
+        let read = read_bounded_starttls_line(&mut reader, &mut line, |_| Ok(())).unwrap();
+
+        assert_eq!(read, line.len());
+        assert_eq!(line, b"MAILGO1 OK Begin TLS\r\n");
+    }
+
+    #[test]
     fn bounded_worker_pool_preserves_order_and_caps_parallelism() {
         let active = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
@@ -3842,19 +3925,23 @@ mod tests {
         let address = listener.local_addr().expect("fixture address");
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept STARTTLS fixture");
+            stream
+                .write_all(b"* OK fixture ready\r\n")
+                .expect("write STARTTLS greeting");
+            stream.flush().expect("flush STARTTLS greeting");
             let mut request = [0_u8; 18];
             std::io::Read::read_exact(&mut stream, &mut request).expect("read STARTTLS command");
             assert_eq!(&request, b"MAILGO1 STARTTLS\r\n");
             std::io::Write::write_all(
                 &mut stream,
-                b"* OK ready\r\nMAILGO1 OK Begin TLS negotiation now\r\n",
+                b"* OK ready\r\nMAILGO1X OK prefix tags must not match\r\nMAILGO1 OK Begin TLS negotiation now\r\n",
             )
             .expect("write STARTTLS response");
         });
-        let mut tcp = TcpStream::connect(address).expect("connect STARTTLS fixture");
+        let tcp = TcpStream::connect(address).expect("connect STARTTLS fixture");
         tcp.set_read_timeout(Some(Duration::from_secs(10)))
             .expect("set fixture read timeout");
-        start_tls(&mut tcp).expect("STARTTLS fixture should be accepted");
+        start_tls(tcp).expect("STARTTLS fixture should be accepted");
         server.join().expect("join STARTTLS fixture");
     }
 

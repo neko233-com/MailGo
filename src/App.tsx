@@ -34,6 +34,17 @@ const ATTACHMENT_DOWNLOAD_CONCURRENCY = 3
 const MOBILE_LAYOUT_QUERY = '(max-width: 900px)'
 const COMPACT_DENSITY_QUERY = '(max-height: 820px), (max-width: 1366px)'
 const AUTO_COLLAPSE_SIDEBAR_QUERY = '(max-width: 1366px) and (min-width: 901px)'
+const DANGEROUS_ATTACHMENT_EXTENSIONS = new Set([
+  'ade', 'adp', 'app', 'application', 'appinstaller', 'appref-ms', 'appx', 'appxbundle', 'bat',
+  'bin', 'cab', 'chm', 'cmd', 'com', 'command', 'cpl', 'desktop', 'dll', 'dmg', 'docm', 'drv',
+  'exe', 'gadget', 'hta', 'inf', 'ins', 'iso', 'isp', 'jar', 'js', 'jse', 'lnk', 'mde', 'msc',
+  'msi', 'msix', 'msp', 'mst', 'msu', 'ocx', 'one', 'pif', 'pkg', 'potm', 'ppam', 'ppsm', 'pptm',
+  'ps1', 'ps1xml', 'ps2', 'ps2xml', 'psc1', 'psc2', 'reg', 'scf', 'scr', 'sct', 'sh', 'shb',
+  'sys', 'url', 'vb', 'vbe', 'vbs', 'vhd', 'vhdx', 'vxd', 'website', 'ws', 'wsc', 'wsf', 'wsh',
+  'xlam', 'xll', 'xlsm',
+])
+const IMAGE_ATTACHMENT_EXTENSIONS = new Set(['bmp', 'gif', 'jpeg', 'jpg', 'png', 'tif', 'tiff', 'webp'])
+const SHEET_ATTACHMENT_EXTENSIONS = new Set(['csv', 'ods', 'xls', 'xlsb', 'xlsm', 'xlsx'])
 
 type MailboxPagingMeta = {
   oldestUid?: number
@@ -211,11 +222,53 @@ function nativeMailboxKey(accountId: string, folder: string) {
   return `${accountId}::${folder}`
 }
 
-function nativeAttachmentKind(contentType: string): MailAttachment['kind'] {
-  if (contentType === 'application/pdf') return 'pdf'
-  if (contentType.includes('spreadsheet') || contentType.includes('excel')) return 'sheet'
-  if (contentType.startsWith('image/')) return 'image'
+function attachmentExtension(fileName: string) {
+  const match = /\.([a-z0-9]{1,12})$/i.exec(fileName.trim())
+  return match?.[1].toLocaleLowerCase('en-US') ?? ''
+}
+
+function isDangerousAttachmentName(fileName: string) {
+  return DANGEROUS_ATTACHMENT_EXTENSIONS.has(attachmentExtension(fileName))
+}
+
+function nativeAttachmentKind(contentType: string, fileName: string): MailAttachment['kind'] {
+  const extension = attachmentExtension(fileName)
+  if (contentType === 'application/pdf' && extension === 'pdf') return 'pdf'
+  if ((contentType.includes('spreadsheet') || contentType.includes('excel')) && SHEET_ATTACHMENT_EXTENSIONS.has(extension)) return 'sheet'
+  if (contentType.startsWith('image/') && IMAGE_ATTACHMENT_EXTENSIONS.has(extension)) return 'image'
   return 'file'
+}
+
+type AttachmentCardProps = {
+  attachment: MailAttachment
+  progress?: number
+  onActivate: () => void
+}
+
+function AttachmentCard({ attachment, progress, onActivate }: AttachmentCardProps) {
+  const extension = attachmentExtension(attachment.name)
+  const dangerous = isDangerousAttachmentName(attachment.name)
+  const detail = progress != null
+    ? `${progress}% · 点击取消`
+    : `${attachment.size} · ${extension ? `.${extension}` : '无扩展名'}${dangerous ? ' · 谨慎打开' : ''}`
+  const glyph = attachment.kind === 'pdf' ? 'PDF' : attachment.kind === 'sheet' ? 'X' : attachment.kind === 'image' ? 'IMG' : 'FILE'
+
+  return (
+    <button
+      type="button"
+      className={`attachment-card${dangerous ? ' is-dangerous' : ''}`}
+      onClick={onActivate}
+      title={dangerous ? `高风险附件类型：${extension ? `.${extension}` : '未知扩展名'}` : attachment.name}
+    >
+      <span className={`file-glyph file-${attachment.kind}`}>{glyph}</span>
+      <span className="attachment-copy">
+        <strong><bdi dir="auto">{attachment.name}</bdi></strong>
+        <small>{detail}</small>
+      </span>
+      {dangerous ? <Icon name="shield" size={16} className="attachment-risk-icon" /> : null}
+      <Icon name={progress != null ? 'close' : 'download'} size={17} />
+    </button>
+  )
 }
 
 function formatStorageBytes(bytes: number) {
@@ -279,7 +332,7 @@ function nativeMessageToUi(message: NativeCachedMessage, account: MailAccount): 
       id: `${message.accountId}:${message.uid}:attachment:${index}`,
       name: attachment.fileName || 'attachment',
       size: attachment.size > 1024 * 1024 ? `${(attachment.size / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(attachment.size / 1024))} KB`,
-      kind: nativeAttachmentKind(attachment.contentType),
+      kind: nativeAttachmentKind(attachment.contentType, attachment.fileName),
       nativeIndex: attachment.index,
     })),
     hasHtml: Boolean(message.htmlBody),
@@ -2636,7 +2689,7 @@ function App() {
               {selectedMail.hasHtml && <div className="content-mode-row"><span>此邮件包含富文本内容{(!remoteImagesEnabled || offlineMode) && ` · ${offlineMode ? '仅离线模式，远程图片已屏蔽' : '远程图片已屏蔽'}`}</span><button type="button" className="text-action" onClick={() => setHtmlMode((value) => !value)}>{isHtmlMode ? '查看纯文本' : '渲染 HTML'} <Icon name="grid" size={14} /></button></div>}
               {isHtmlMode && selectedMail.hasHtml ? <div className="html-rendered" onClick={handleRenderedLinkClick} dangerouslySetInnerHTML={{ __html: sanitizeHtml(selectedMail.htmlBody ?? initialHtml, remoteImagesEnabled && !offlineMode) }} /> : selectedMail.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
             </div>
-            {selectedMail.attachments && selectedMail.attachments.length > 0 && <div className="attachments"><div className="attachments-heading"><span><Icon name="paperclip" size={20} /> {selectedMail.attachments.length} 个附件</span><div><button type="button" onClick={() => { void mapWithConcurrency(selectedMail.attachments ?? [], ATTACHMENT_DOWNLOAD_CONCURRENCY, downloadAttachment) }}><Icon name="download" size={17} /> 全部下载</button></div></div><div className="attachment-grid">{selectedMail.attachments.map((attachment) => { const progress = attachmentProgress[attachment.id]; return <button type="button" className="attachment-card" key={attachment.id} onClick={() => { if (progress != null) cancelAttachment(attachment.id); else void downloadAttachment(attachment) }}><span className={`file-glyph file-${attachment.kind}`}>{attachment.kind === 'pdf' ? 'PDF' : attachment.kind === 'sheet' ? 'X' : 'FILE'}</span><span className="attachment-copy"><strong>{attachment.name}</strong><small>{progress != null ? `${progress}% · 点击取消` : attachment.size}</small></span><Icon name={progress != null ? 'close' : 'download'} size={17} /></button> })}</div></div>}
+            {selectedMail.attachments && selectedMail.attachments.length > 0 && <div className="attachments"><div className="attachments-heading"><span><Icon name="paperclip" size={20} /> {selectedMail.attachments.length} 个附件</span><div><button type="button" onClick={() => { void mapWithConcurrency(selectedMail.attachments ?? [], ATTACHMENT_DOWNLOAD_CONCURRENCY, downloadAttachment) }}><Icon name="download" size={17} /> 全部下载</button></div></div><div className="attachment-grid">{selectedMail.attachments.map((attachment) => { const progress = attachmentProgress[attachment.id]; return <AttachmentCard attachment={attachment} progress={progress} key={attachment.id} onActivate={() => { if (progress != null) cancelAttachment(attachment.id); else void downloadAttachment(attachment) }} /> })}</div></div>}
             <div className="reply-composer"><Avatar message={{ ...selectedMail, avatar: 'OC', accent: '#2a5596' }} size="sm" /><div className="reply-input" onClick={() => openCompose(undefined, 'reply', selectedMail)}>点击回复，或按 R 快速回复<div className="reply-tools"><span><Icon name="paperclip" size={19} /></span><span><Icon name="image" size={19} /></span><span className="reply-emoji">☺</span><span className="reply-a">A</span><button type="button" onClick={(event) => { event.stopPropagation(); openCompose(undefined, 'reply', selectedMail) }}>回复 <span>⌄</span></button></div></div></div>
           </div>
         </section>

@@ -339,13 +339,18 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .attachment-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .attachment-card { min-width: 0; height: 50px; display: flex; align-items: center; gap: 7px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--surface); text-align: left; }
 .attachment-card:hover { border-color: rgba(117, 129, 255, .5); background: var(--surface-hover); }
+.attachment-card.is-dangerous { border-color: color-mix(in srgb, #dc4c4c 42%, var(--line)); }
 .file-glyph { width: 30px; height: 35px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 30px; border-radius: 5px; color: white; font-size: 9px; font-weight: 800; }
 .file-pdf { background: #f15f68; }
 .file-sheet { background: #1eaf77; font-size: 17px; }
+.file-image { background: #5aa98b; }
 .file-file { background: #5a75d9; }
 .attachment-copy { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 4px; }
 .attachment-copy strong { overflow: hidden; color: var(--muted-strong); font-size: 11px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
-.attachment-copy small { color: var(--muted); font-size: 10px; }
+.attachment-copy strong bdi { display: block; overflow: hidden; text-overflow: ellipsis; unicode-bidi: isolate; }
+.attachment-copy small { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-card.is-dangerous .attachment-copy small, .attachment-risk-icon { color: #dc4c4c; }
+.attachment-risk-icon { flex: 0 0 auto; }
 .reply-composer { display: flex; align-items: flex-start; gap: 10px; margin-top: 11px; }
 .reply-input { min-height: 80px; flex: 1; padding: 10px 11px 8px; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--muted); background: var(--surface); font-size: 11px; cursor: text; }
 .reply-tools { display: flex; align-items: center; gap: 10px; margin-top: 20px; color: var(--muted-strong); }
