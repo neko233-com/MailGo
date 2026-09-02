@@ -36,6 +36,7 @@ const MAX_HEADER_FETCH_BATCH: usize = 30;
 const MAX_DISCOVERED_FOLDERS: usize = 64;
 const MAX_UIDS_PER_QUERY: usize = 100_000;
 const MAX_UID_SEARCH_WINDOW: u32 = 100_000;
+const MAX_UID_SEARCH_RANGE_WIDTH: u32 = 8_192;
 const MAX_CACHED_MESSAGES_PER_FOLDER: usize = 5_000;
 const MAX_CACHE_FILE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 256 * 1024;
@@ -189,6 +190,25 @@ pub struct SearchResult {
     pub messages: Vec<CachedMessage>,
     pub truncated: bool,
     pub folders_searched: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UidSearchOrder {
+    Ascending,
+    Descending,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BoundedUidSearch {
+    uids: Vec<u32>,
+    truncated: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LatestUidSelection {
+    selected_uids: Vec<u32>,
+    new_uid_count: Option<usize>,
+    rebase_to_latest: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1157,6 +1177,192 @@ pub fn sync_account(
 /// Search the provider's full mailbox set without requiring the renderer to preload every
 /// message. Results are header-only, bounded, and immediately merged into the encrypted local
 /// folder cache so subsequent offline actions retain UIDVALIDITY context.
+fn highest_mailbox_uid(
+    session: &mut imap::Session<imap::Connection>,
+    uid_next: Option<u32>,
+    exists: u32,
+    context: &str,
+) -> Result<u32> {
+    if let Some(uid_next) = uid_next {
+        return Ok(uid_next.saturating_sub(1));
+    }
+    if exists == 0 {
+        return Ok(0);
+    }
+
+    let fetched = session
+        .fetch(exists.to_string(), "UID")
+        .with_context(|| context.to_string())?;
+    if fetched.len() > 1 {
+        return Err(anyhow!("IMAP highest-UID probe returned too many messages"));
+    }
+    fetched
+        .iter()
+        .filter_map(|item| item.uid)
+        .max()
+        .ok_or_else(|| anyhow!("IMAP server omitted UIDNEXT and the highest message UID"))
+}
+
+fn next_uid_search_range(
+    uid_floor: u32,
+    uid_ceiling: u32,
+    cursor: u32,
+    order: UidSearchOrder,
+) -> Option<(u32, u32, bool)> {
+    if uid_ceiling == 0 || uid_floor == 0 || uid_floor > uid_ceiling {
+        return None;
+    }
+    Some(match order {
+        UidSearchOrder::Ascending => {
+            let range_floor = cursor.max(uid_floor);
+            if range_floor > uid_ceiling {
+                return None;
+            }
+            let range_ceiling = range_floor
+                .saturating_add(MAX_UID_SEARCH_RANGE_WIDTH.saturating_sub(1))
+                .min(uid_ceiling);
+            (range_floor, range_ceiling, range_ceiling < uid_ceiling)
+        }
+        UidSearchOrder::Descending => {
+            let range_ceiling = cursor.min(uid_ceiling);
+            if range_ceiling < uid_floor {
+                return None;
+            }
+            let range_floor = range_ceiling
+                .saturating_sub(MAX_UID_SEARCH_RANGE_WIDTH.saturating_sub(1))
+                .max(uid_floor);
+            (range_floor, range_ceiling, range_floor > uid_floor)
+        }
+    })
+}
+
+fn search_uid_window(
+    session: &mut imap::Session<imap::Connection>,
+    uid_floor: u32,
+    uid_ceiling: u32,
+    criteria: Option<&str>,
+    limit: usize,
+    order: UidSearchOrder,
+    context: &str,
+) -> Result<BoundedUidSearch> {
+    if uid_ceiling == 0 || uid_floor > uid_ceiling {
+        return Ok(BoundedUidSearch::default());
+    }
+    let uid_floor = uid_floor.max(1);
+    let limit = limit.clamp(1, MAX_UIDS_PER_QUERY);
+    let mut uids = Vec::with_capacity(limit.min(MAX_UID_SEARCH_RANGE_WIDTH as usize));
+    let mut cursor = match order {
+        UidSearchOrder::Ascending => uid_floor,
+        UidSearchOrder::Descending => uid_ceiling,
+    };
+    let criteria = criteria.filter(|value| !value.is_empty());
+
+    while let Some((range_floor, range_ceiling, has_another_range)) =
+        next_uid_search_range(uid_floor, uid_ceiling, cursor, order)
+    {
+        let query = match criteria {
+            Some(criteria) => format!("UID {range_floor}:{range_ceiling} {criteria}"),
+            None => format!("UID {range_floor}:{range_ceiling}"),
+        };
+        let batch = session
+            .uid_search(query)
+            .with_context(|| context.to_string())?;
+        let range_width = range_ceiling.saturating_sub(range_floor) as usize + 1;
+        if batch.len() > range_width
+            || batch
+                .iter()
+                .any(|uid| *uid < range_floor || *uid > range_ceiling)
+        {
+            return Err(anyhow!(
+                "IMAP UID search response escaped the requested bounded range"
+            ));
+        }
+        uids.extend(batch);
+
+        if uids.len() >= limit {
+            let truncated = uids.len() > limit || has_another_range;
+            uids.sort_unstable();
+            if order == UidSearchOrder::Descending {
+                uids.reverse();
+            }
+            uids.truncate(limit);
+            return Ok(BoundedUidSearch { uids, truncated });
+        }
+        if !has_another_range {
+            break;
+        }
+        cursor = match order {
+            UidSearchOrder::Ascending => range_ceiling.saturating_add(1),
+            UidSearchOrder::Descending => range_floor.saturating_sub(1),
+        };
+    }
+
+    uids.sort_unstable();
+    if order == UidSearchOrder::Descending {
+        uids.reverse();
+    }
+    Ok(BoundedUidSearch {
+        uids,
+        truncated: false,
+    })
+}
+
+fn select_latest_uids(
+    recent_search: &BoundedUidSearch,
+    uid_search_floor: u32,
+    newest_cached_uid: Option<u32>,
+) -> LatestUidSelection {
+    let Some(newest_uid) = newest_cached_uid else {
+        return LatestUidSelection {
+            selected_uids: recent_search
+                .uids
+                .iter()
+                .copied()
+                .take(MAX_HEADER_MESSAGES)
+                .collect(),
+            new_uid_count: None,
+            rebase_to_latest: true,
+        };
+    };
+
+    let mut new_uids = recent_search
+        .uids
+        .iter()
+        .copied()
+        .filter(|uid| *uid > newest_uid)
+        .collect::<Vec<_>>();
+    let crossed_cached_boundary = recent_search.uids.iter().any(|uid| *uid <= newest_uid);
+    let search_reached_cached_window = uid_search_floor <= newest_uid.saturating_add(1)
+        && (!recent_search.truncated || crossed_cached_boundary);
+    if !new_uids.is_empty() && !search_reached_cached_window {
+        return LatestUidSelection {
+            selected_uids: recent_search
+                .uids
+                .iter()
+                .copied()
+                .take(MAX_HEADER_MESSAGES)
+                .collect(),
+            new_uid_count: None,
+            rebase_to_latest: true,
+        };
+    }
+
+    new_uids.sort_unstable();
+    LatestUidSelection {
+        selected_uids: new_uids.into_iter().take(MAX_HEADER_MESSAGES).collect(),
+        new_uid_count: Some(if search_reached_cached_window {
+            recent_search
+                .uids
+                .iter()
+                .filter(|uid| **uid > newest_uid)
+                .count()
+        } else {
+            MAX_HEADER_MESSAGES + 1
+        }),
+        rebase_to_latest: false,
+    }
+}
+
 pub fn search_account(
     account_id: &str,
     profile: ProviderProfile,
@@ -1212,23 +1418,31 @@ fn search_account_once(
             }
         };
         folders_searched += 1;
-        let uid_floor = mailbox
-            .uid_next
-            .map(|next| next.saturating_sub(MAX_UID_SEARCH_WINDOW).max(1))
-            .unwrap_or(1);
-        let bounded_query = format!("UID {uid_floor}:* {query}");
-        let mut uids = session
-            .uid_search(&bounded_query)
-            .with_context(|| format!("search {folder}"))?
-            .into_iter()
-            .collect::<Vec<_>>();
-        uids.sort_unstable_by(|left, right| right.cmp(left));
         let remaining = limit.saturating_sub(messages.len());
         let folder_limit = remaining.min(MAX_SEARCH_RESULTS_PER_FOLDER);
-        if uids.len() > folder_limit {
-            truncated = true;
+        let highest_uid = highest_mailbox_uid(
+            &mut session,
+            mailbox.uid_next,
+            mailbox.exists,
+            &format!("probe highest UID in {folder}"),
+        )?;
+        if highest_uid == 0 {
+            continue;
         }
-        let selected_uids = uids.into_iter().take(folder_limit).collect::<Vec<_>>();
+        let uid_floor = highest_uid
+            .saturating_sub(MAX_UID_SEARCH_WINDOW.saturating_sub(1))
+            .max(1);
+        let search = search_uid_window(
+            &mut session,
+            uid_floor,
+            highest_uid,
+            Some(&query),
+            folder_limit,
+            UidSearchOrder::Descending,
+            &format!("search {folder}"),
+        )?;
+        truncated |= search.truncated;
+        let selected_uids = search.uids;
         if selected_uids.is_empty() {
             continue;
         }
@@ -1362,6 +1576,7 @@ fn sync_account_once(
             &folder,
             mailbox.uid_validity,
             mailbox.uid_next,
+            mailbox.exists,
             mailbox.highest_mod_seq.or(status_highest_mod_seq),
             incremental_mode,
             cache_root,
@@ -1433,6 +1648,7 @@ fn sync_folder_latest(
     folder: &str,
     uid_validity: Option<u32>,
     uid_next: Option<u32>,
+    exists: u32,
     highest_mod_seq: Option<u64>,
     incremental_mode: Option<IncrementalMode>,
     cache_root: &Path,
@@ -1450,6 +1666,12 @@ fn sync_folder_latest(
     } else if let (Some(mode), Some(current), Some(previous)) =
         (incremental_mode, highest_mod_seq, cached.highest_mod_seq)
     {
+        let highest_possible_uid = highest_mailbox_uid(
+            session,
+            uid_next,
+            exists,
+            &format!("probe highest UID in {folder}"),
+        )?;
         if let Some(delta) = sync_folder_incremental(
             session,
             account_id,
@@ -1457,6 +1679,7 @@ fn sync_folder_latest(
             uid_validity,
             current,
             previous,
+            highest_possible_uid,
             mode,
             &mut cached,
             synced_at.clone(),
@@ -1471,49 +1694,71 @@ fn sync_folder_latest(
     }
 
     let mut delta = MailboxSyncDelta::default();
-
     let newest_cached_uid = cached.messages.iter().map(|message| message.uid).max();
-    let highest_possible_uid = uid_next
-        .and_then(|next| next.checked_sub(1))
-        .or(newest_cached_uid)
-        .unwrap_or(0);
+    let highest_possible_uid = highest_mailbox_uid(
+        session,
+        uid_next,
+        exists,
+        &format!("probe highest UID in {folder}"),
+    )?;
     let uid_search_floor = highest_possible_uid
         .saturating_sub(MAX_UID_SEARCH_WINDOW.saturating_sub(1))
         .max(1);
-    let mut all_uids = if highest_possible_uid == 0 {
-        Vec::new()
+    let recent_search = if highest_possible_uid == 0 {
+        BoundedUidSearch::default()
     } else {
-        session
-            .uid_search(format!("UID {uid_search_floor}:{highest_possible_uid}"))
-            .with_context(|| format!("search {folder}"))?
-            .into_iter()
-            .collect::<Vec<_>>()
+        search_uid_window(
+            session,
+            uid_search_floor,
+            highest_possible_uid,
+            None,
+            MAX_HEADER_MESSAGES + 1,
+            UidSearchOrder::Descending,
+            &format!("search recent UIDs in {folder}"),
+        )?
     };
-    all_uids.sort_unstable();
-    if all_uids.len() > MAX_UIDS_PER_QUERY {
-        all_uids.drain(..all_uids.len() - MAX_UIDS_PER_QUERY);
-    }
-    let current_uids = all_uids.iter().copied().collect::<HashSet<_>>();
-    let total_uids = all_uids.len();
 
-    // The header window is fetched only for a cold cache or UIDs newer than the newest cached
-    // message. Existing bodies/attachments remain untouched and are refreshed through FLAGS.
-    let new_uid_count = newest_cached_uid
-        .map(|newest_uid| all_uids.iter().filter(|uid| **uid > newest_uid).count());
-    let selected_uids = match newest_cached_uid {
-        None => all_uids
+    // A cold cache and a large post-offline backlog both rebase onto the newest visible page.
+    // This avoids waiting through one hundred-message catch-up cycles before showing current mail;
+    // older rows remain server-backed and are recovered by the existing waterfall paginator.
+    let selection = select_latest_uids(&recent_search, uid_search_floor, newest_cached_uid);
+    let rebase_to_latest = selection.rebase_to_latest;
+    let selected_uids = selection.selected_uids;
+    let new_uid_count = selection.new_uid_count;
+
+    let server_has_more;
+    let current_uids;
+    if rebase_to_latest {
+        if newest_cached_uid.is_some() {
+            force_full_rewrite = true;
+            reset_mailbox_sync_window(&mut cached);
+            delta = MailboxSyncDelta::default();
+        }
+        server_has_more = recent_search.truncated || uid_search_floor > 1;
+        current_uids = HashSet::new();
+    } else {
+        server_has_more = cached.has_more;
+        let requested_uids = cached
+            .messages
             .iter()
-            .rev()
-            .take(MAX_HEADER_MESSAGES)
-            .copied()
-            .collect::<Vec<_>>(),
-        Some(newest_uid) => all_uids
-            .iter()
-            .filter(|uid| **uid > newest_uid)
-            .take(MAX_HEADER_MESSAGES)
-            .copied()
-            .collect::<Vec<_>>(),
-    };
+            .map(|message| message.uid)
+            .collect::<HashSet<_>>();
+        current_uids = if let Some(cached_uid_set) = cached_uid_set(&cached) {
+            let uids = session
+                .uid_search(format!("UID {cached_uid_set}"))
+                .with_context(|| format!("check cached UIDs in {folder}"))?;
+            if uids.len() > requested_uids.len()
+                || uids.iter().any(|uid| !requested_uids.contains(uid))
+            {
+                return Err(anyhow!(
+                    "IMAP cached-UID search returned an unrequested message"
+                ));
+            }
+            uids.into_iter().collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
+    }
     let mut fetched_messages = fetch_header_messages(
         session,
         account_id,
@@ -1527,14 +1772,12 @@ fn sync_folder_latest(
         cached
             .messages
             .iter()
-            .filter(|message| {
-                message.uid >= uid_search_floor && !current_uids.contains(&message.uid)
-            })
+            .filter(|message| !current_uids.contains(&message.uid))
             .map(|message| message.uid),
     );
     cached
         .messages
-        .retain(|message| message.uid < uid_search_floor || current_uids.contains(&message.uid));
+        .retain(|message| current_uids.contains(&message.uid));
     let refresh_uids = cached
         .messages
         .iter()
@@ -1596,7 +1839,7 @@ fn sync_folder_latest(
         .messages
         .sort_by_key(|message| std::cmp::Reverse(message.uid));
     cached.oldest_uid = cached.messages.iter().map(|message| message.uid).min();
-    cached.has_more = total_uids > cached.messages.len();
+    cached.has_more = server_has_more;
     let fetched = fetched_messages.len();
     delta.new_messages = fetched_messages;
     Ok(FolderSyncOutcome {
@@ -1644,6 +1887,7 @@ fn sync_folder_incremental(
     uid_validity: Option<u32>,
     current_mod_seq: u64,
     previous_mod_seq: u64,
+    highest_possible_uid: u32,
     mode: IncrementalMode,
     cached: &mut CachedMailbox,
     synced_at: String,
@@ -1661,6 +1905,11 @@ fn sync_folder_incremental(
     let Some(cached_uid_set) = cached_uid_set(cached) else {
         return Ok(None);
     };
+    let requested_uids = cached
+        .messages
+        .iter()
+        .map(|message| message.uid)
+        .collect::<HashSet<_>>();
     let changed = match session.uid_fetch(
         cached_uid_set.clone(),
         delta_fetch_query(mode, previous_mod_seq),
@@ -1675,6 +1924,10 @@ fn sync_folder_incremental(
     let mut header_uids = Vec::new();
     for item in changed.iter() {
         let Some(uid) = item.uid else { continue };
+        if !requested_uids.contains(&uid) {
+            tracing::debug!(folder = %folder, "IMAP incremental fetch returned an unrequested UID; using UID fallback");
+            return Ok(None);
+        }
         let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
         let starred = item
             .flags()
@@ -1706,6 +1959,11 @@ fn sync_folder_incremental(
                 return Ok(None);
             }
         };
+        if uids.len() > requested_uids.len() || uids.iter().any(|uid| !requested_uids.contains(uid))
+        {
+            tracing::debug!(folder = %folder, "IMAP UID existence check returned an unrequested UID; using UID fallback");
+            return Ok(None);
+        }
         current_uids = Some(uids.into_iter().collect::<HashSet<_>>());
     }
 
@@ -1718,17 +1976,31 @@ fn sync_folder_incremental(
     if max_cached_uid == u32::MAX {
         return Ok(None);
     }
-    let new_uids = match session.uid_search(format!("UID {}:*", max_cached_uid + 1)) {
-        Ok(uids) => uids,
+    let new_uid_floor = max_cached_uid + 1;
+    if highest_possible_uid.saturating_sub(new_uid_floor) >= MAX_UID_SEARCH_WINDOW {
+        tracing::debug!(folder = %folder, "IMAP new-UID window is too large; rebasing through bounded UID fallback");
+        return Ok(None);
+    }
+    let new_search = match search_uid_window(
+        session,
+        new_uid_floor,
+        highest_possible_uid,
+        None,
+        MAX_DELTA_HEADER_UIDS + 1,
+        UidSearchOrder::Ascending,
+        &format!("search incremental UIDs in {folder}"),
+    ) {
+        Ok(search) => search,
         Err(error) => {
             tracing::debug!(folder = %folder, "IMAP new-UID delta rejected; using UID fallback: {error}");
             return Ok(None);
         }
     };
-    header_uids.extend(new_uids);
+    let new_uids_complete = !new_search.truncated && new_search.uids.len() <= MAX_DELTA_HEADER_UIDS;
+    header_uids.extend(new_search.uids);
     header_uids.sort_unstable();
     header_uids.dedup();
-    let delta_headers_complete = header_uids.len() <= MAX_DELTA_HEADER_UIDS;
+    let delta_headers_complete = new_uids_complete && header_uids.len() <= MAX_DELTA_HEADER_UIDS;
     header_uids.truncate(MAX_DELTA_HEADER_UIDS);
 
     let fetched_messages = match fetch_header_messages(
@@ -1926,10 +2198,12 @@ fn sync_folder_page_once(
             });
         }
         Some(uid) => uid - 1,
-        None => mailbox
-            .uid_next
-            .and_then(|uid| uid.checked_sub(1))
-            .unwrap_or(0),
+        None => highest_mailbox_uid(
+            &mut session,
+            mailbox.uid_next,
+            mailbox.exists,
+            &format!("probe highest UID in {folder}"),
+        )?,
     };
     if highest_possible_uid == 0 {
         cached.uid_validity = mailbox.uid_validity;
@@ -1960,23 +2234,17 @@ fn sync_folder_page_once(
     let uid_floor = highest_possible_uid
         .saturating_sub(MAX_UID_SEARCH_WINDOW.saturating_sub(1))
         .max(1);
-    let query = format!("UID {uid_floor}:{highest_possible_uid}");
-    let mut uids = session
-        .uid_search(query)
-        .with_context(|| format!("search older messages in {folder}"))?
-        .into_iter()
-        .collect::<Vec<_>>();
-    uids.sort_unstable();
-    if uids.len() > MAX_UIDS_PER_QUERY {
-        uids.drain(..uids.len() - MAX_UIDS_PER_QUERY);
-    }
-    let has_more = uids.len() > page_size || uid_floor > 1;
-    let selected_uids = uids
-        .iter()
-        .rev()
-        .take(page_size)
-        .copied()
-        .collect::<Vec<_>>();
+    let search = search_uid_window(
+        &mut session,
+        uid_floor,
+        highest_possible_uid,
+        None,
+        page_size,
+        UidSearchOrder::Descending,
+        &format!("search older messages in {folder}"),
+    )?;
+    let has_more = search.truncated || uid_floor > 1;
+    let selected_uids = search.uids;
     let mut fetched_messages = fetch_header_messages(
         &mut session,
         account_id,
@@ -4383,6 +4651,112 @@ mod tests {
         assert_eq!(cached_uid_set(&mailbox).as_deref(), Some("7,42"));
         mailbox.messages.clear();
         assert_eq!(cached_uid_set(&mailbox), None);
+    }
+
+    #[test]
+    fn uid_search_windows_are_contiguous_bounded_and_overflow_safe() {
+        fn ranges(floor: u32, ceiling: u32, order: UidSearchOrder) -> Vec<(u32, u32)> {
+            let mut cursor = match order {
+                UidSearchOrder::Ascending => floor,
+                UidSearchOrder::Descending => ceiling,
+            };
+            let mut result = Vec::new();
+            while let Some((range_floor, range_ceiling, has_more)) =
+                next_uid_search_range(floor, ceiling, cursor, order)
+            {
+                assert!(range_ceiling >= range_floor);
+                assert!(range_ceiling - range_floor < MAX_UID_SEARCH_RANGE_WIDTH);
+                result.push((range_floor, range_ceiling));
+                if !has_more {
+                    break;
+                }
+                cursor = match order {
+                    UidSearchOrder::Ascending => range_ceiling.saturating_add(1),
+                    UidSearchOrder::Descending => range_floor.saturating_sub(1),
+                };
+            }
+            result
+        }
+
+        let ascending = ranges(1, MAX_UID_SEARCH_WINDOW, UidSearchOrder::Ascending);
+        assert_eq!(ascending.first(), Some(&(1, MAX_UID_SEARCH_RANGE_WIDTH)));
+        assert_eq!(ascending.last(), Some(&(98_305, 100_000)));
+        for pair in ascending.windows(2) {
+            assert_eq!(pair[0].1 + 1, pair[1].0);
+        }
+
+        let descending = ranges(1, MAX_UID_SEARCH_WINDOW, UidSearchOrder::Descending);
+        assert_eq!(descending.first(), Some(&(91_809, 100_000)));
+        assert_eq!(descending.last(), Some(&(1, 1_696)));
+        for pair in descending.windows(2) {
+            assert_eq!(pair[1].1 + 1, pair[0].0);
+        }
+
+        assert_eq!(
+            ranges(
+                u32::MAX - MAX_UID_SEARCH_RANGE_WIDTH + 1,
+                u32::MAX,
+                UidSearchOrder::Ascending,
+            ),
+            vec![(u32::MAX - MAX_UID_SEARCH_RANGE_WIDTH + 1, u32::MAX)]
+        );
+        assert!(next_uid_search_range(0, 10, 0, UidSearchOrder::Ascending).is_none());
+        assert!(next_uid_search_range(10, 9, 10, UidSearchOrder::Descending).is_none());
+    }
+
+    #[test]
+    fn latest_uid_selection_fast_forwards_large_backlogs_without_skipping_small_deltas() {
+        let normal = select_latest_uids(
+            &BoundedUidSearch {
+                uids: vec![105, 104, 100, 99],
+                truncated: true,
+            },
+            1,
+            Some(100),
+        );
+        assert_eq!(
+            normal,
+            LatestUidSelection {
+                selected_uids: vec![104, 105],
+                new_uid_count: Some(2),
+                rebase_to_latest: false,
+            }
+        );
+
+        let backlog = select_latest_uids(
+            &BoundedUidSearch {
+                uids: (201..=301).rev().collect(),
+                truncated: true,
+            },
+            1,
+            Some(100),
+        );
+        assert!(backlog.rebase_to_latest);
+        assert_eq!(backlog.new_uid_count, None);
+        assert_eq!(backlog.selected_uids.len(), MAX_HEADER_MESSAGES);
+        assert_eq!(backlog.selected_uids.first(), Some(&301));
+        assert_eq!(backlog.selected_uids.last(), Some(&202));
+
+        let outside_window = select_latest_uids(
+            &BoundedUidSearch {
+                uids: vec![200],
+                truncated: false,
+            },
+            150,
+            Some(100),
+        );
+        assert!(outside_window.rebase_to_latest);
+
+        let cold = select_latest_uids(
+            &BoundedUidSearch {
+                uids: vec![3, 2, 1],
+                truncated: false,
+            },
+            1,
+            None,
+        );
+        assert!(cold.rebase_to_latest);
+        assert_eq!(cold.selected_uids, vec![3, 2, 1]);
     }
 
     #[test]

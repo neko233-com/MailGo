@@ -54,6 +54,10 @@ assert(nativeSync.includes('MAX_STARTTLS_LINE_BYTES'), 'STARTTLS plaintext lines
 assert(nativeSync.includes('MAX_STARTTLS_RESPONSE_BYTES'), 'STARTTLS plaintext exchange needs an aggregate byte budget')
 assert(nativeSync.includes('STARTTLS_EXCHANGE_TIMEOUT'), 'STARTTLS plaintext exchange needs an absolute deadline')
 assert(!nativeSync.includes(".read_until(b'\\n', &mut line)"), 'STARTTLS must not allocate through an unbounded delimiter read')
+assert(nativeSync.includes('MAX_UID_SEARCH_RANGE_WIDTH'), 'IMAP UID searches need a fixed response-range ceiling')
+assert(nativeSync.includes('search_uid_window('), 'IMAP UID range scans must use the bounded window helper')
+assert(!nativeSync.includes('format!("UID {uid_floor}:*'), 'provider search must not request an unbounded UID result set')
+assert(!nativeSync.includes('format!("UID {}:*"'), 'incremental sync must not request an unbounded UID result set')
 
 assert(!tray.includes('FindWindowW'), 'single-instance activation must not trust a window title alone')
 assert(tray.includes('QueryFullProcessImageNameW'), 'single-instance activation must verify the owning executable')
