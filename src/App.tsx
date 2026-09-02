@@ -29,6 +29,7 @@ const MailRuleManager = lazy(async () => ({ default: (await import('./components
 const OutboxDetail = lazy(async () => ({ default: (await import('./components/OutboxDetail')).OutboxDetail }))
 const ComposeModal = lazy(async () => ({ default: (await import('./components/ComposeModal')).ComposeModal }))
 const AccountModal = lazy(async () => ({ default: (await import('./components/AccountModal')).AccountModal }))
+const AuthorizationPanel = lazy(async () => ({ default: (await import('./components/AuthorizationPanel')).AuthorizationPanel }))
 const HelpModal = lazy(async () => ({ default: (await import('./components/HelpModal')).HelpModal }))
 const SettingsPopover = lazy(async () => ({ default: (await import('./components/SettingsPopover')).SettingsPopover }))
 
@@ -583,6 +584,10 @@ function DeferredPaneLoading({ label }: { label: string }) {
   return <div className="deferred-pane-loading" role="status" aria-live="polite"><span className="loading-spinner" aria-hidden="true" /><span>{label}</span></div>
 }
 
+function DeferredAuthorizationPanelLoading({ isMobileOpen }: { isMobileOpen: boolean }) {
+  return <aside className={`auth-panel deferred-auth-panel-loading ${isMobileOpen ? 'is-mobile-open' : ''}`} role="status" aria-live="polite"><span className="loading-spinner" aria-hidden="true" /><span>正在打开授权码助手…</span></aside>
+}
+
 function DeferredSettingsPopoverLoading() {
   return <div className="settings-popover deferred-settings-popover-loading" role="status" aria-live="polite"><span className="loading-spinner loading-spinner-small" aria-hidden="true" /><span>正在载入偏好设置…</span></div>
 }
@@ -1063,6 +1068,21 @@ function App() {
     setCustomSmtpHost('smtp.example.com')
     setCustomSmtpPort('465')
     setCustomSmtpSecurity('tls')
+    setAccountModalOpen(true)
+  }
+
+  const openExistingAccount = (account: MailAccount) => {
+    setEditingAccountId(account.id)
+    changeProvider(account.provider)
+    setAccountEmail(account.email)
+    setShowAuthorizationCode(false)
+    setCustomImapHost(account.imapHost ?? 'imap.example.com')
+    setCustomImapPort(String(account.imapPort ?? 993))
+    setCustomImapSecurity(account.imapSecurity ?? 'tls')
+    setCustomSmtpHost(account.smtpHost ?? 'smtp.example.com')
+    setCustomSmtpPort(String(account.smtpPort ?? 465))
+    setCustomSmtpSecurity(account.smtpSecurity ?? 'tls')
+    setCustomAuthentication(account.authentication ?? (account.provider === 'outlook' ? 'oauth2' : 'app-password'))
     setAccountModalOpen(true)
   }
 
@@ -3309,14 +3329,7 @@ function App() {
         </section>
 
         <AnimatePresence initial={false}>
-          {isAuthPanelOpen && <motion.aside className={`auth-panel ${isMobileAuthOpen ? 'is-mobile-open' : ''}`} initial={prefersReducedMotion ? false : { x: 24, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: 24, opacity: 0 }} transition={{ duration: 0.24 }}>
-            <div className="auth-panel-header"><div><Icon name="key" size={20} /><strong>授权码助手</strong></div><TooltipButton label="关闭授权码助手" onClick={() => { setAuthPanelOpen(false); setMobileAuthOpen(false) }}><Icon name="close" size={18} /></TooltipButton></div>
-            <div className="auth-tabs"><button type="button" className="is-active"><Icon name="lock" size={16} />授权码</button><button type="button" onClick={openNewAccount}><Icon name="settings" size={16} />设置</button></div>
-            <div className="auth-card"><div className="auth-illustration"><Icon name="shieldCheck" size={40} /></div><h2>快速获取授权码</h2><p>用于第三方服务登录验证</p><button className="gradient-button" type="button" onClick={openNewAccount}><Icon name="copy" size={17} />管理授权码</button><div className="auth-validity"><Icon name="clock" size={16} />授权码仅保存在本机安全存储</div></div>
-            <div className="auth-panel-section"><div className="panel-section-title">账户</div>{accounts.map((account) => <button type="button" className="auth-account-row" key={account.id} onClick={() => { setEditingAccountId(account.id); changeProvider(account.provider); setAccountEmail(account.email); setCustomImapHost(account.imapHost ?? 'imap.example.com'); setCustomImapPort(String(account.imapPort ?? 993)); setCustomImapSecurity(account.imapSecurity ?? 'tls'); setCustomSmtpHost(account.smtpHost ?? 'smtp.example.com'); setCustomSmtpPort(String(account.smtpPort ?? 465)); setCustomSmtpSecurity(account.smtpSecurity ?? 'tls'); setCustomAuthentication(account.authentication ?? (account.provider === 'outlook' ? 'oauth2' : 'app-password')); setAccountModalOpen(true) }}><ProviderMark provider={account.provider} size="sm" /><span><strong>{account.label}</strong><small>{account.email}</small></span><span className="auth-chevron">›</span></button>)}</div>
-            <div className="auth-note"><Icon name="info" size={18} /><span>授权码仅用于登录验证<br />不会存储或同步到云端</span></div>
-            <div className="auth-panel-foot"><button type="button" onClick={handleOpenProvider}><Icon name="link" size={15} />打开 {selectedProvider.label} 设置</button></div>
-          </motion.aside>}
+          {isAuthPanelOpen && <Suspense fallback={<DeferredAuthorizationPanelLoading isMobileOpen={isMobileAuthOpen} />}><AuthorizationPanel accounts={accounts} isMobileOpen={isMobileAuthOpen} reduceMotion={Boolean(prefersReducedMotion)} providerLabel={selectedProvider.label} onClose={() => { setAuthPanelOpen(false); setMobileAuthOpen(false) }} onManageAuthorization={openNewAccount} onEditAccount={openExistingAccount} onOpenProvider={() => { void handleOpenProvider() }} /></Suspense>}
         </AnimatePresence>
         {!isAuthPanelOpen && <button className="auth-panel-reopen" type="button" onClick={() => { setAuthPanelOpen(true); setMobileAuthOpen(true) }}><Icon name="key" size={18} />授权码助手</button>}
       </div>

@@ -445,20 +445,22 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .auth-card p { margin: 6px 0 14px; color: var(--muted); font-size: 11px; }
 .auth-card .gradient-button { width: 100%; min-height: 42px; font-size: 12px; }
 .auth-validity { display: inline-flex; align-items: center; gap: 6px; margin-top: 15px; color: var(--muted); font-size: 10px; }
-.auth-panel-section { margin-top: 22px; }
+.auth-panel-section { min-height: 0; flex: 1 1 auto; overflow: auto; margin-top: 22px; }
 .panel-section-title { margin: 0 8px 10px; color: var(--muted); font-size: 11px; font-weight: 600; }
 .auth-account-row { width: 100%; min-height: 56px; display: flex; align-items: center; gap: 9px; padding: 6px 8px; border: 1px solid var(--line); border-bottom: 0; color: var(--muted); background: var(--surface); text-align: left; }
 .auth-account-row:first-of-type { border-radius: 8px 8px 0 0; }
 .auth-account-row:last-child { border-bottom: 1px solid var(--line); border-radius: 0 0 8px 8px; }
 .auth-account-row:hover { background: var(--surface-hover); }
 .auth-account-row > span:nth-child(2) { min-width: 0; flex: 1; }
+.auth-account-empty { display: flex; align-items: center; gap: 8px; min-height: 46px; padding: 9px; border: 1px dashed var(--line-strong); border-radius: 8px; color: var(--muted); font-size: 10px; line-height: 1.4; }
 .auth-chevron { color: var(--muted); font-size: 24px; line-height: 1; }
-.auth-note { display: flex; gap: 10px; margin-top: auto; padding: 13px 10px; border-radius: 8px; color: var(--muted); background: var(--surface); font-size: 10px; line-height: 1.55; }
+.auth-note { display: flex; flex: 0 0 auto; gap: 10px; margin-top: 12px; padding: 13px 10px; border-radius: 8px; color: var(--muted); background: var(--surface); font-size: 10px; line-height: 1.55; }
 .auth-note > svg { flex: 0 0 auto; color: #75a3e9; }
 .auth-panel-foot { padding: 15px 0 14px; border-top: 1px solid var(--line); text-align: center; }
 .auth-panel-foot button, .auth-panel-reopen { display: inline-flex; align-items: center; gap: 6px; color: #9da6f3; background: transparent; font-size: 11px; }
 .auth-panel-foot button:hover, .auth-panel-reopen:hover { color: var(--text); }
 .auth-panel-reopen { display: none; }
+.deferred-auth-panel-loading { align-items: center; justify-content: center; gap: 8px; color: var(--muted); font-size: 10px; }
 
 .modal-backdrop { position: fixed; inset: 0; z-index: 30; display: grid; place-items: center; padding: 18px; background: rgba(2, 6, 17, .68); backdrop-filter: blur(10px); }
 .deferred-modal-backdrop { backdrop-filter: blur(4px); }
@@ -901,6 +903,20 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .app-shell.is-compact-density .reply-input { min-height: 52px; padding-block: 6px 5px; }
 .app-shell.is-compact-density .reply-tools { margin-top: 8px; }
 .app-shell.is-compact-density .auth-panel { top: 34px; }
+.app-shell.is-compact-density .auth-panel-header { height: 42px; }
+.app-shell.is-compact-density .auth-panel-header strong { font-size: 14px; }
+.app-shell.is-compact-density .auth-tabs { height: 34px; }
+.app-shell.is-compact-density .auth-card { margin-top: 10px; padding: 11px; border-radius: 10px; }
+.app-shell.is-compact-density .auth-illustration { width: 46px; height: 46px; margin: 0 auto 7px; border-radius: 14px; }
+.app-shell.is-compact-density .auth-card h2 { font-size: 14px; }
+.app-shell.is-compact-density .auth-card p { margin: 3px 0 9px; font-size: 9.5px; }
+.app-shell.is-compact-density .auth-card .gradient-button { min-height: 32px; font-size: 10.5px; }
+.app-shell.is-compact-density .auth-validity { margin-top: 8px; font-size: 9px; }
+.app-shell.is-compact-density .auth-panel-section { margin-top: 11px; }
+.app-shell.is-compact-density .panel-section-title { margin-bottom: 6px; }
+.app-shell.is-compact-density .auth-account-row { min-height: 40px; padding-block: 3px; }
+.app-shell.is-compact-density .auth-note { gap: 7px; margin-top: 8px; padding: 8px; font-size: 9px; }
+.app-shell.is-compact-density .auth-panel-foot { padding-block: 9px; }
 .app-shell.is-compact-density .compose-modal { width: min(520px, calc(100vw - 32px)); }
 .app-shell.is-compact-density .compose-header { height: 36px; padding-left: 12px; }
 .app-shell.is-compact-density .compose-modal > label,
