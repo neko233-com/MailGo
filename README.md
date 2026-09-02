@@ -9,7 +9,7 @@ The current foundation includes:
 - `motion` transitions with `prefers-reduced-motion` support.
 - Tree-shakeable `reicon-react` icon components.
 - Multiple accounts, including multiple QQ accounts, account switching, and import/export with redacted credentials.
-- Windows desktop also supports password-protected account migration: encrypted export/import keeps provider credentials inside an Argon2id + ChaCha20-Poly1305 bundle and writes them back only to Windows Credential Manager.
+- Account migration is metadata-only: exports are redacted and every imported mailbox requires provider reauthorization on the destination computer.
 - Local-first UI state with offline cache indicators and a Rust IPC boundary for durable state.
 - Native startup enters the mailbox as soon as local state is available; cache hydration, per-account synchronization, and queue telemetry continue independently in the background with local loading/error states instead of a full-window blocking spinner.
 - The message list is virtualized and renders only its visible window. Startup decrypts a 48-message local page per account, while older cached or remote messages load in bounded waterfall pages from the list edge without rebuilding the whole mailbox view.
@@ -22,10 +22,10 @@ The current foundation includes:
 - Optional offline-only mode is enforced by the native boundary: cached mail remains readable, network sync/search are paused, outgoing mail is queued encrypted, and local flag/move mutations replay when online mode is restored.
 - Provider quick links and guided authorization-code onboarding.
 - Safe HTML preview mode, attachments, smart categories (including Apple Connect and Apple advertising), search, unread filter, star, reply, compose, theme switching, and user CSS overrides.
-- Local-only advertising classification can optionally hide ads from normal lists while keeping Apple Connect security mail and smart-category access visible.
+- Local-only advertising classification can optionally hide ads from normal lists while keeping likely Apple Connect notifications and smart-category access visible; the category is heuristic and never presented as sender authentication.
 - Rust `neko233-com/rdesktop` WebView2 shell with custom frameless title bar and preserved WebView data directory under `%LOCALAPPDATA%\\MailGo\\WebView2`.
 - The renderer uses Windows system fonts rather than remote web fonts, so the packaged UI has no implicit font-network dependency in offline mode.
-- Windows Credential Manager integration through `keyring` for authorization-code storage; secrets never enter `state.json` or redacted account exports. Encrypted transfer bundles are the explicit exception and require a user-chosen passphrase.
+- Windows Credential Manager integration through `keyring` for authorization-code storage; secrets never enter `state.json` or account exports. Imported account metadata always requires provider reauthorization on the destination computer.
 - Theme changes are written to the native state after startup hydration, and user CSS is capped at 64 KiB with a session-only fallback when WebView storage is unavailable.
 - Packaged native RPC calls are accepted only from the exact local app origin, carry a 48-character per-launch capability that is removed from browser history immediately after bootstrap, and pass bounded envelope/concurrency checks before dispatch; forged, navigated-away, oversized, or flood traffic is rejected before any account, credential, filesystem, or network operation.
 - Native IMAP sync uses capability-driven `QRESYNC`/`CONDSTORE` deltas when a server exposes them (including `HIGHESTMODSEQ` cursors, `VANISHED` deletions, and UID-only new-mail discovery), with a UID-based incremental header fallback across provider folder mappings. Bounded `UID FLAGS` refreshes, lazy full-message retrieval, replayable offline flag mutations, local flag updates, and protected mailbox/attachment caches keep the offline view safe: hot SQLite rows use the credential-store-backed XChaCha20-Poly1305 envelope, while standalone Windows drafts, queues, and attachment files retain direct DPAPI protection for rollback compatibility. Attachment downloads use bounded start/chunk/cancel IPC with progress and cancellation support.
@@ -51,7 +51,7 @@ The current foundation includes:
 - Provider-shaped raw-message corpus tests cover Gmail folded encoded headers and tracking HTML, QQ GB18030 text/HTML plus encoded Chinese attachment names, and Outlook multipart/related CID images with RFC 2231 calendar filenames. List previews normalize whitespace with an early 240-character stop instead of allocating a full-body word vector and joined copy.
 - Native mode also surfaces those encrypted local drafts in the 草稿箱 list, with per-account counts, draft-specific continue-editing actions, and an explicit discard action.
 - Draft persistence is serialized across concurrent compose autosaves, preventing two windows from corrupting or losing each other's encrypted draft store.
-- Encrypted account imports validate the combined account count before touching Credential Manager, so replacing existing accounts cannot silently exceed the 64-account ceiling.
+- Redacted account imports validate the combined account count before removing stale credentials, so replacing existing accounts cannot silently exceed the 64-account ceiling.
 - Redacted account imports preflight every record and commit the state change only after cache and credential cleanup succeeds; a failed import restores the prior in-memory state and credentials.
 - Missing credentials are treated as an expected reauthorization state during redacted import, while unexpected Credential Manager failures abort the import before state is committed.
 - Account reauthorization now commits the new credential and metadata as one recoverable operation; a persistence failure restores the previous account state and credential, and outbox-resume errors cannot falsely report the account as unsaved.
@@ -82,7 +82,7 @@ For safety, configured Google and Outlook redirect URIs must remain explicit loo
 
 The per-user `MailGo-rdesktop-updater` scheduled task installs only the manually reviewed immutable commit recorded in `config/rdesktop-trusted-revision.txt`, through the already validated `%LOCALAPPDATA%\MailGo\cargo-target` Cargo directory. It never follows the upstream default branch automatically; maintainers must review and bump the pin deliberately.
 
-Use the settings panel's encrypted account transfer actions when moving fully configured accounts between Windows machines. Choose a strong transfer password of at least 12 characters; the password is never stored, and a bundle cannot be recovered if it is forgotten. The browser preview intentionally disables credential-bearing transfer actions.
+Use the settings panel's redacted export/import actions when moving account definitions between Windows machines. Authorization codes, passwords, OAuth tokens, and refresh tokens never enter the file; every imported account is visibly marked for reauthorization.
 
 ## Run the browser development surface
 
@@ -119,15 +119,16 @@ npm run package:windows
 Extract the archive and launch `MailGo.exe`. The package expects a compatible WebView2 runtime on Windows. The installed rdesktop 0.1.8 CLI currently emits a small NSIS placeholder from `rdesktop bundle`; do not distribute that generated file as an installer. Generate the portable archive on a release build host where the Windows application-control policy permits Cargo Release build scripts; this repository intentionally does not ship an unsigned or placeholder installer.
 The Windows npm scripts place Cargo's target directory under `%LOCALAPPDATA%\MailGo\cargo-target` so application-control policies do not block dependency build scripts in the repository checkout.
 
-For a user-level portable installation, pass the release ZIP and its adjacent manifest to the recoverable installer. It verifies the manifest hash, rejects unsafe/oversized archives, checks WebView2, creates a Start Menu shortcut, and keeps the previous install as a backup:
+Portable installation is restricted to local source-build verification because an adjacent ZIP manifest cannot authenticate the whole renderer bundle. The recoverable installer still verifies hash, path, size, PE metadata, WebView2, shortcut, and rollback behavior, but it fails closed unless the development-only switch is explicit. Never distribute this artifact:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-portable.ps1 `
   -ArchivePath artifacts\MailGo-0.1.0-windows-x64.zip `
-  -ManifestPath artifacts\MailGo-0.1.0-windows-x64.manifest.json
+  -ManifestPath artifacts\MailGo-0.1.0-windows-x64.manifest.json `
+  -AllowUnsignedDevelopmentBuild
 ```
 
-Build a signed MSIX on a Windows release host with the Windows SDK (`makeappx.exe` and `signtool.exe`) and a trusted production certificate. The command fails closed without those tools and a certificate; it does not create an unsigned production installer:
+Build a signed MSIX on a Windows release host with the Windows SDK (`makeappx.exe` and `signtool.exe`) and a trusted production certificate. Its package signature covers the executable and renderer resources. The command fails closed without those tools and a certificate; it does not create an unsigned production installer:
 
 ```powershell
 $env:MAILGO_SIGNING_PFX_PASSWORD = "use-a-secret-manager-value"
@@ -144,10 +145,4 @@ This repository has no GitHub Actions. Releases and publication are intentionall
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1
 ```
 
-Only an explicit tag plus `-Publish` calls the GitHub CLI:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Publish -Tag v0.1.0
-```
-
-The default gate rejects a dirty working tree; use `-AllowDirty` only for a deliberate local build. There is no scheduled or automated release path.
+The release gate never publishes portable ZIPs. A production release must first be built and verified as a signed MSIX, then uploaded manually only after the user explicitly authorizes that exact release. The default gate rejects a dirty working tree; use `-AllowDirty` only for a deliberate local build. There is no scheduled or automated release path.

@@ -4,6 +4,7 @@ param(
     [string]$ArchivePath,
     [string]$ManifestPath,
     [string]$InstallDirectory = (Join-Path $env:LOCALAPPDATA 'Programs\MailGo'),
+    [switch]$AllowUnsignedDevelopmentBuild,
     [switch]$SkipWebView2Check,
     [switch]$CreateDesktopShortcut,
     [switch]$DryRun
@@ -105,6 +106,10 @@ try {
     if ($subsystem -ne 2) { throw "MailGo.exe uses PE subsystem $subsystem; refusing to install a desktop build that opens a console window" }
     $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($stagedExecutable)
     if ($versionInfo.ProductName -ne 'MailGo') { throw 'MailGo.exe is missing the embedded MailGo Windows resource metadata and application icon' }
+    if (!$AllowUnsignedDevelopmentBuild) {
+        throw 'portable ZIP installation is restricted to local source-build verification; use a verified signed MSIX for production, or pass -AllowUnsignedDevelopmentBuild for local development only'
+    }
+    Write-Warning 'Installing an unauthenticated local development build. Portable ZIPs must not be distributed; production installs require a verified signed MSIX.'
     if (!(Test-Path -LiteralPath (Join-Path $stagingRoot 'dist\index.html') -PathType Leaf)) { throw 'portable archive is missing the renderer' }
     if (!(Test-Path -LiteralPath (Join-Path $stagingRoot 'resources\icons\mailgo.ico') -PathType Leaf)) { throw 'portable archive is missing the tray icon' }
 

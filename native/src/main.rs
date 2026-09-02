@@ -21,6 +21,7 @@ use rdesktop_core::renderer::Renderer;
 use rdesktop_webview::WebViewRenderer;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 mod cache_db;
@@ -34,10 +35,10 @@ mod providers;
 mod send;
 mod storage;
 mod sync;
-mod transfer;
 mod tray;
 
 const APP_SERVICE: &str = "MailGo";
+const CREDENTIAL_ENVELOPE_PREFIX: &str = "mailgo-credential-v1:";
 const STATE_SCHEMA_VERSION: u32 = 1;
 const ATTACHMENT_CHUNK_BYTES: usize = 192 * 1024;
 const LOG_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
@@ -556,6 +557,82 @@ fn credential_entry(account_id: &str) -> Result<keyring::Entry> {
         .map_err(|error| anyhow!("credential store unavailable: {error}"))
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredCredential {
+    schema_version: u32,
+    binding: String,
+    credential: Zeroizing<String>,
+}
+
+fn credential_binding(account: &PersistedAccount) -> Result<String> {
+    let profile = profile_for_account(account)?;
+    let canonical = serde_json::to_vec(&json!({
+        "schemaVersion": 1,
+        "accountId": account.id.to_ascii_lowercase(),
+        "provider": profile.provider.as_str(),
+        "email": account.email.trim().to_ascii_lowercase(),
+        "authentication": profile.authentication,
+        "imap": {
+            "host": profile.imap.host.trim().to_ascii_lowercase(),
+            "port": profile.imap.port,
+            "security": profile.imap.security,
+        },
+        "smtp": {
+            "host": profile.smtp.host.trim().to_ascii_lowercase(),
+            "port": profile.smtp.port,
+            "security": profile.smtp.security,
+        },
+    }))?;
+    Ok(STANDARD.encode(Sha256::digest(canonical)))
+}
+
+fn encode_stored_credential(
+    account: &PersistedAccount,
+    credential: &str,
+) -> Result<Zeroizing<String>> {
+    let envelope = StoredCredential {
+        schema_version: 1,
+        binding: credential_binding(account)?,
+        credential: Zeroizing::new(credential.to_string()),
+    };
+    let serialized = Zeroizing::new(serde_json::to_string(&envelope)?);
+    let mut stored = Zeroizing::new(String::with_capacity(
+        CREDENTIAL_ENVELOPE_PREFIX.len() + serialized.len(),
+    ));
+    stored.push_str(CREDENTIAL_ENVELOPE_PREFIX);
+    stored.push_str(serialized.as_str());
+    Ok(stored)
+}
+
+fn decode_stored_credential(
+    account: &PersistedAccount,
+    stored: &str,
+) -> Result<Option<Zeroizing<String>>> {
+    let Some(serialized) = stored.strip_prefix(CREDENTIAL_ENVELOPE_PREFIX) else {
+        return Ok(None);
+    };
+    let envelope: StoredCredential = serde_json::from_str(serialized)
+        .map_err(|_| anyhow!("stored credential is unreadable; reauthorization required"))?;
+    if envelope.schema_version != 1 || envelope.binding != credential_binding(account)? {
+        return Err(anyhow!(
+            "account connection settings changed; reauthorization required"
+        ));
+    }
+    Ok(Some(envelope.credential))
+}
+
+fn store_credential(account: &PersistedAccount, credential: &str) -> Result<()> {
+    let stored = encode_stored_credential(account, credential)?;
+    credential_entry(&account.id)?
+        .set_password(stored.as_str())
+        .map_err(|error| anyhow!("save credential: {error}"))
+}
+
+fn legacy_credential_migration_allowed(account: &PersistedAccount) -> Result<bool> {
+    Ok(providers::ProviderKind::parse(&account.provider)? != providers::ProviderKind::Other)
+}
+
 fn snapshot_credential(account_id: &str) -> Result<Option<Zeroizing<String>>> {
     match credential_entry(account_id)?.get_password() {
         Ok(value) => Ok(Some(Zeroizing::new(value))),
@@ -573,17 +650,30 @@ fn delete_credential_if_present(account_id: &str) -> Result<()> {
 
 fn load_credential(account: &PersistedAccount) -> Result<Zeroizing<String>> {
     let entry = credential_entry(&account.id)?;
-    let raw = Zeroizing::new(entry.get_password().map_err(|error| match error {
+    let stored = Zeroizing::new(entry.get_password().map_err(|error| match error {
         keyring::Error::NoEntry => {
             anyhow!("account credential is missing; reauthorization required")
         }
         error => anyhow!("credential store unavailable: {error}"),
     })?);
+    let (raw, requires_envelope_migration) =
+        match decode_stored_credential(account, stored.as_str())? {
+            Some(credential) => (credential, false),
+            None if legacy_credential_migration_allowed(account)? => {
+                (Zeroizing::new(stored.to_string()), true)
+            }
+            None => {
+                return Err(anyhow!(
+                    "legacy custom account credentials require reauthorization before connecting"
+                ))
+            }
+        };
     let provider = providers::ProviderKind::parse(&account.provider)?;
     let refreshed = oauth::refresh_if_needed(provider, raw.as_str())?;
-    if refreshed.as_str() != raw.as_str() {
+    if refreshed.as_str() != raw.as_str() || requires_envelope_migration {
+        let encoded = encode_stored_credential(account, refreshed.as_str())?;
         entry
-            .set_password(refreshed.as_str())
+            .set_password(encoded.as_str())
             .map_err(|error| anyhow!("save refreshed credential: {error}"))?;
     }
     Ok(refreshed)
@@ -917,20 +1007,6 @@ fn has_existing_account_identity_change(
     })
 }
 
-fn validate_transfer_account(account: &transfer::TransferAccount) -> Result<()> {
-    if !valid_account_id(&account.account.id)
-        || account.account.label.len() > MAX_ACCOUNT_LABEL_LENGTH
-        || account.credential.is_empty()
-        || account.credential.len() > 64 * 1024
-    {
-        return Err(anyhow!("invalid encrypted account record"));
-    }
-    providers::ProviderKind::parse(&account.account.provider)?;
-    providers::validate_email(&account.account.email)?;
-    profile_for_account(&account.account)?;
-    Ok(())
-}
-
 fn clear_credential_snapshots(previous: &mut [(String, Option<Zeroizing<String>>)]) {
     for (_, credential) in previous {
         if let Some(value) = credential {
@@ -1056,7 +1132,7 @@ fn account_capacity_available(accounts: &[PersistedAccount], id: &str) -> bool {
     accounts.iter().any(|account| account.id == id) || accounts.len() < MAX_IMPORTED_ACCOUNTS
 }
 
-fn transfer_fits_account_capacity(
+fn import_fits_account_capacity(
     existing: &[PersistedAccount],
     incoming_ids: &HashSet<String>,
 ) -> bool {
@@ -1480,9 +1556,7 @@ fn handle_ipc(
                 let previous_folders = app.state.folder_names.clone();
                 let mut previous_credentials = vec![(id.clone(), snapshot_credential(&id)?)];
                 let commit_result = (|| -> Result<()> {
-                    credential_entry(&id)?
-                        .set_password(credential.as_str())
-                        .map_err(|error| anyhow!("save credential: {error}"))?;
+                    store_credential(&new_account, credential.as_str())?;
                     app.state.accounts.retain(|account| account.id != id);
                     app.state.accounts.push(new_account);
                     app.state.folder_names.remove(&id);
@@ -1615,7 +1689,7 @@ fn handle_ipc(
                         "one or more imported accounts are syncing; retry after synchronization finishes"
                     ));
                 }
-                if !transfer_fits_account_capacity(&app.state.accounts, &incoming_ids) {
+                if !import_fits_account_capacity(&app.state.accounts, &incoming_ids) {
                     return Err(anyhow!(
                         "importing these accounts would exceed the {MAX_IMPORTED_ACCOUNTS}-account limit"
                     ));
@@ -1711,163 +1785,6 @@ fn handle_ipc(
                         "authentication": account.authentication,
                         "status": "requires-reauth", "secretRef": format!("mailgo://{}", account.id),
                     })).collect::<Vec<_>>(),
-                }))
-            }
-            "accounts.export_encrypted" => {
-                let passphrase = message
-                    .payload
-                    .get("passphrase")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("transfer passphrase is required"))?;
-                let accounts = shared
-                    .lock()
-                    .map_err(|_| anyhow!("state lock poisoned"))?
-                    .state
-                    .accounts
-                    .clone();
-                let mut records = Vec::with_capacity(accounts.len());
-                for account in accounts {
-                    let credential = load_credential(&account)
-                        .context("one or more accounts need reauthorization")?;
-                    records.push(transfer::TransferAccount {
-                        account,
-                        credential,
-                    });
-                }
-                let account_count = records.len();
-                let encrypted = transfer::encrypt_accounts(&records, passphrase);
-                transfer::clear_credentials(&mut records);
-                Ok(json!({
-                    "bundle": encrypted?,
-                    "accountCount": account_count,
-                }))
-            }
-            "accounts.import_encrypted" => {
-                let bundle = string_field(&message.payload, "bundle")?;
-                let passphrase = message
-                    .payload
-                    .get("passphrase")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("transfer passphrase is required"))?;
-                let mut records = transfer::decrypt_accounts(&bundle, passphrase)?;
-                let import_result = (|| -> Result<u32> {
-                    let mut seen = HashSet::new();
-                    for record in &records {
-                        validate_transfer_account(record)?;
-                        if !seen.insert(record.account.id.to_ascii_lowercase()) {
-                            return Err(anyhow!("duplicate account in encrypted bundle"));
-                        }
-                    }
-
-                    let incoming_ids = records
-                        .iter()
-                        .map(|record| record.account.id.clone())
-                        .collect::<HashSet<_>>();
-                    let _sync_leases = {
-                        let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-                        if records.iter().any(|record| {
-                            has_case_variant_account_id(&app.state.accounts, &record.account.id)
-                        }) {
-                            return Err(anyhow!(
-                                "imported account id differs only by case from an existing account"
-                            ));
-                        }
-                        let imported_accounts = records
-                            .iter()
-                            .map(|record| record.account.clone())
-                            .collect::<Vec<_>>();
-                        if has_existing_account_identity_change(
-                            &app.state.accounts,
-                            &imported_accounts,
-                        ) {
-                            return Err(anyhow!(
-                                "imported account identity differs from the existing mailbox"
-                            ));
-                        }
-                        if has_new_mailbox_identity_conflict(
-                            &app.state.accounts,
-                            &imported_accounts,
-                        ) {
-                            return Err(anyhow!(
-                                "one or more imported mailboxes are already configured"
-                            ));
-                        }
-                        if !transfer_fits_account_capacity(&app.state.accounts, &incoming_ids) {
-                            return Err(anyhow!(
-                                "importing these accounts would exceed the {MAX_IMPORTED_ACCOUNTS}-account limit"
-                            ));
-                        }
-                        let existing_ids = records
-                            .iter()
-                            .filter(|record| {
-                                app.state
-                                    .accounts
-                                    .iter()
-                                    .any(|account| account.id == record.account.id)
-                            })
-                            .map(|record| record.account.id.clone())
-                            .collect::<Vec<_>>();
-                        let mut leases = Vec::with_capacity(existing_ids.len());
-                        for account_id in existing_ids {
-                            reserve_account_sync(&mut app, &account_id)?;
-                            leases.push(AccountSyncLease {
-                                shared: Arc::clone(shared),
-                                account_id,
-                            });
-                        }
-                        leases
-                    };
-
-                    let mut previous = records
-                        .iter()
-                        .map(|record| {
-                            let existing = credential_entry(&record.account.id)
-                                .ok()
-                                .and_then(|entry| entry.get_password().ok().map(Zeroizing::new));
-                            (record.account.id.clone(), existing)
-                        })
-                        .collect::<Vec<_>>();
-                    for record in &records {
-                        if let Err(error) = credential_entry(&record.account.id).and_then(|entry| {
-                            entry
-                                .set_password(record.credential.as_str())
-                                .map_err(anyhow::Error::from)
-                        }) {
-                            restore_credentials(&mut previous);
-                            return Err(error).context("save imported account credential");
-                        }
-                    }
-
-                    let state_result = (|| -> Result<u32> {
-                        for record in &records {
-                            sync::remove_account_cache(&cache_dir(), &record.account.id)?;
-                            let _ = drafts::remove_account(&cache_dir(), &record.account.id);
-                            outbox::remove_account(&cache_dir(), &record.account.id)?;
-                        }
-                        let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-                        for record in &records {
-                            let mut account = record.account.clone();
-                            account.unread = 0;
-                            account.status = "synced".to_string();
-                            account.last_sync = "等待首次同步".to_string();
-                            app.state.accounts.retain(|item| item.id != account.id);
-                            app.state.accounts.push(account);
-                            app.state.folder_names.remove(&record.account.id);
-                        }
-                        app.save()?;
-                        Ok(records.len() as u32)
-                    })();
-                    if state_result.is_err() {
-                        restore_credentials(&mut previous);
-                    } else {
-                        clear_credential_snapshots(&mut previous);
-                    }
-                    state_result
-                })();
-                transfer::clear_credentials(&mut records);
-                Ok(json!({
-                    "imported": import_result?,
-                    "requiresReauth": false,
                 }))
             }
             "drafts.list" => {
@@ -3413,6 +3330,48 @@ mod tests {
     }
 
     #[test]
+    fn stored_credentials_are_bound_to_mailbox_identity_and_endpoints() {
+        let account = PersistedAccount {
+            id: "custom-bound-account".into(),
+            provider: "other".into(),
+            label: "Custom".into(),
+            email: "person@example.invalid".into(),
+            unread: 0,
+            accent: "#111".into(),
+            status: "offline".into(),
+            last_sync: "never".into(),
+            imap_host: Some("imap.example.invalid".into()),
+            imap_port: Some(993),
+            imap_security: Some("tls".into()),
+            smtp_host: Some("smtp.example.invalid".into()),
+            smtp_port: Some(465),
+            smtp_security: Some("tls".into()),
+            authentication: Some("password".into()),
+        };
+        let stored = encode_stored_credential(&account, "development-secret")
+            .expect("encode bound credential");
+        let decoded = decode_stored_credential(&account, stored.as_str())
+            .expect("decode bound credential")
+            .expect("bound envelope");
+        assert_eq!(decoded.as_str(), "development-secret");
+
+        let mut renamed = account.clone();
+        renamed.label = "Renamed".into();
+        assert!(decode_stored_credential(&renamed, stored.as_str()).is_ok());
+
+        let mut redirected = account.clone();
+        redirected.imap_host = Some("attacker.example.invalid".into());
+        let error = decode_stored_credential(&redirected, stored.as_str())
+            .expect_err("endpoint changes must require reauthorization");
+        assert!(error.to_string().contains("reauthorization required"));
+
+        assert!(!legacy_credential_migration_allowed(&account).unwrap());
+        let mut qq = account;
+        qq.provider = "qq".into();
+        assert!(legacy_credential_migration_allowed(&qq).unwrap());
+    }
+
+    #[test]
     fn account_ids_are_compared_case_insensitively() {
         let account = PersistedAccount {
             id: "Account-1".into(),
@@ -3483,7 +3442,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_import_respects_account_capacity_when_replacing_accounts() {
+    fn redacted_import_respects_account_capacity_when_replacing_accounts() {
         let existing = (0..MAX_IMPORTED_ACCOUNTS)
             .map(|index| PersistedAccount {
                 id: format!("account-{index}"),
@@ -3503,11 +3462,11 @@ mod tests {
                 authentication: None,
             })
             .collect::<Vec<_>>();
-        assert!(!transfer_fits_account_capacity(
+        assert!(!import_fits_account_capacity(
             &existing,
             &HashSet::from(["new-account".to_string()])
         ));
-        assert!(transfer_fits_account_capacity(
+        assert!(import_fits_account_capacity(
             &existing,
             &HashSet::from(["account-0".to_string()])
         ));

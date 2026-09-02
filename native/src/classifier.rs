@@ -20,7 +20,8 @@ pub struct Classification {
 
 /// Deterministic, local-only classification. It intentionally never uploads message content or
 /// uses a remote model. The rules are conservative: advertising is tagged and can be hidden by
-/// the UI, while security notices remain visible in Apple Connect.
+/// the UI, while likely Apple notices remain visible in a neutral heuristic category. The From
+/// header is not an authenticated identity and the presentation must not imply verification.
 pub fn classify(sender: &str, subject: &str, has_list_unsubscribe: bool) -> Classification {
     let sender = sender.trim().to_ascii_lowercase();
     let subject = subject.trim().to_ascii_lowercase();

@@ -7,21 +7,24 @@ mod windows_tray {
     use std::thread;
     use std::time::Duration;
 
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+    use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
     use windows_sys::Win32::UI::Shell::{
         Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD,
         NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-        DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, PeekMessageW,
-        PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
-        SetWindowLongPtrW, ShowWindow, TrackPopupMenu, TranslateMessage, GWLP_WNDPROC,
-        HWND_MESSAGE, IMAGE_ICON, LR_LOADFROMFILE, MF_STRING, PM_REMOVE, SW_HIDE, SW_RESTORE,
-        SW_SHOW, TPM_RIGHTALIGN, WM_APP, WM_CLOSE, WM_COMMAND, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
-        WM_RBUTTONUP, WNDCLASSW, WNDPROC,
+        DestroyMenu, DestroyWindow, DispatchMessageW, EnumWindows, GetCursorPos, GetWindowTextW,
+        GetWindowThreadProcessId, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
+        RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TrackPopupMenu,
+        TranslateMessage, GWLP_WNDPROC, HWND_MESSAGE, IMAGE_ICON, LR_LOADFROMFILE, MF_STRING,
+        PM_REMOVE, SW_HIDE, SW_RESTORE, SW_SHOW, TPM_RIGHTALIGN, WM_APP, WM_CLOSE, WM_COMMAND,
+        WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WNDPROC,
     };
 
     const TRAY_CALLBACK: u32 = WM_APP + 73;
@@ -38,6 +41,12 @@ mod windows_tray {
     static PREVIOUS_WNDPROC: AtomicIsize = AtomicIsize::new(0);
     static MINIMIZE_TO_TRAY: AtomicBool = AtomicBool::new(true);
     static ALLOW_CLOSE: AtomicBool = AtomicBool::new(false);
+
+    struct WindowSearch {
+        expected_process_id: Option<u32>,
+        expected_executable: Option<String>,
+        found: HWND,
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum TrayAction {
@@ -149,18 +158,9 @@ mod windows_tray {
     }
 
     unsafe fn attach_main_window() {
-        let hwnd = FindWindowW(null(), WINDOW_TITLE.as_ptr());
+        let hwnd = find_main_window_for_process(GetCurrentProcessId());
         if hwnd == 0 {
             thread::sleep(Duration::from_millis(250));
-            return;
-        }
-
-        let mut process_id = 0u32;
-        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
-            hwnd,
-            &mut process_id,
-        );
-        if process_id != GetCurrentProcessId() {
             return;
         }
         if TARGET_WINDOW
@@ -366,8 +366,95 @@ mod windows_tray {
         if attached != 0 {
             attached
         } else {
-            FindWindowW(null(), WINDOW_TITLE.as_ptr())
+            find_main_window_for_current_executable()
         }
+    }
+
+    unsafe fn find_main_window_for_process(process_id: u32) -> HWND {
+        let mut search = WindowSearch {
+            expected_process_id: Some(process_id),
+            expected_executable: None,
+            found: 0,
+        };
+        EnumWindows(
+            Some(find_main_window_callback),
+            &mut search as *mut WindowSearch as LPARAM,
+        );
+        search.found
+    }
+
+    unsafe fn find_main_window_for_current_executable() -> HWND {
+        let Some(executable) = process_executable_path(GetCurrentProcessId()) else {
+            return 0;
+        };
+        let mut search = WindowSearch {
+            expected_process_id: None,
+            expected_executable: Some(executable),
+            found: 0,
+        };
+        EnumWindows(
+            Some(find_main_window_callback),
+            &mut search as *mut WindowSearch as LPARAM,
+        );
+        search.found
+    }
+
+    unsafe extern "system" fn find_main_window_callback(hwnd: HWND, context: LPARAM) -> BOOL {
+        let search = &mut *(context as *mut WindowSearch);
+        if !window_title_matches(hwnd) {
+            return 1;
+        }
+
+        let mut process_id = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut process_id);
+        if process_id == 0 {
+            return 1;
+        }
+        let owner_matches = if let Some(expected_process_id) = search.expected_process_id {
+            process_id == expected_process_id
+        } else if let Some(expected_executable) = search.expected_executable.as_deref() {
+            process_executable_path(process_id)
+                .as_deref()
+                .is_some_and(|path| path == expected_executable)
+        } else {
+            false
+        };
+        if !owner_matches {
+            return 1;
+        }
+
+        search.found = hwnd;
+        0
+    }
+
+    unsafe fn window_title_matches(hwnd: HWND) -> bool {
+        let mut title = [0u16; 64];
+        let length = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+        length > 0 && title[..length as usize] == WINDOW_TITLE[..WINDOW_TITLE.len() - 1]
+    }
+
+    unsafe fn process_executable_path(process_id: u32) -> Option<String> {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
+        if process == 0 {
+            return None;
+        }
+        let mut path = vec![0u16; 32_768];
+        let mut length = path.len() as u32;
+        let queried = QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length);
+        CloseHandle(process);
+        if queried == 0 || length == 0 {
+            return None;
+        }
+        Some(normalize_executable_path(&String::from_utf16_lossy(
+            &path[..length as usize],
+        )))
+    }
+
+    fn normalize_executable_path(path: &str) -> String {
+        path.strip_prefix(r"\\?\")
+            .unwrap_or(path)
+            .replace('/', "\\")
+            .to_lowercase()
     }
 
     unsafe fn show_menu(hwnd: HWND) {
@@ -400,11 +487,11 @@ mod windows_tray {
             77, 97, 105, 108, 71, 111, 32, 84, 114, 97, 121, 32, 84, 101, 115, 116, 0,
         ];
 
-        unsafe fn create_test_window() -> HWND {
+        unsafe fn create_test_window_with_title(title: &[u16]) -> HWND {
             CreateWindowExW(
                 0,
                 STATIC_CLASS.as_ptr(),
-                TEST_TITLE.as_ptr(),
+                title.as_ptr(),
                 WS_OVERLAPPEDWINDOW,
                 -32_000,
                 -32_000,
@@ -415,6 +502,34 @@ mod windows_tray {
                 GetModuleHandleW(null()),
                 null(),
             )
+        }
+
+        unsafe fn create_test_window() -> HWND {
+            create_test_window_with_title(TEST_TITLE)
+        }
+
+        #[test]
+        fn executable_paths_are_compared_case_insensitively_without_extended_prefixes() {
+            assert_eq!(
+                normalize_executable_path(r"\\?\C:/Program Files/MailGo/MAILGO.EXE"),
+                r"c:\program files\mailgo\mailgo.exe"
+            );
+        }
+
+        #[test]
+        fn trusted_main_window_search_requires_the_expected_owner() {
+            let _guard = TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("lock tray fixture");
+            unsafe {
+                let hwnd = create_test_window_with_title(WINDOW_TITLE);
+                assert_ne!(hwnd, 0);
+                assert_eq!(find_main_window_for_process(GetCurrentProcessId()), hwnd);
+                assert!(process_executable_path(GetCurrentProcessId()).is_some());
+                assert_eq!(find_main_window_for_current_executable(), hwnd);
+                DestroyWindow(hwnd);
+            }
         }
 
         #[test]

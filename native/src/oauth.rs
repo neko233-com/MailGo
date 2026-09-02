@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -20,6 +20,7 @@ const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:8765/oauth/callback";
 const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const HTTP_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const CALLBACK_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
+const CALLBACK_REQUEST_DEADLINE: Duration = Duration::from_secs(3);
 const MAX_PENDING_CALLBACKS: usize = 16;
 const MAX_CALLBACK_REQUEST_BYTES: usize = 16 * 1024;
 
@@ -756,9 +757,17 @@ fn run_loopback_listener(listener: TcpListener, state: Arc<LoopbackListener>) {
 }
 
 fn read_request_target(stream: &mut TcpStream) -> Option<String> {
+    read_request_target_until(stream, Instant::now() + CALLBACK_REQUEST_DEADLINE)
+}
+
+fn read_request_target_until(stream: &mut TcpStream, deadline: Instant) -> Option<String> {
     let mut buffer = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        stream
+            .set_read_timeout(Some(remaining.min(CALLBACK_SOCKET_TIMEOUT)))
+            .ok()?;
         let size = stream.read(&mut chunk).ok()?;
         if size == 0 {
             break;
@@ -939,6 +948,28 @@ mod tests {
             read_request_target(&mut stream).as_deref(),
             Some("/oauth/callback?code=abc&state=xyz")
         );
+        writer.join().expect("callback fixture writer");
+    }
+
+    #[test]
+    fn request_target_has_one_absolute_deadline_for_trickle_clients() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("callback fixture listener");
+        let address = listener.local_addr().expect("callback fixture address");
+        let writer = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("callback fixture connection");
+            for _ in 0..10 {
+                if stream.write_all(b"G").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(35));
+            }
+        });
+        let (mut stream, _) = listener.accept().expect("callback fixture accept");
+        let started = Instant::now();
+        assert!(
+            read_request_target_until(&mut stream, started + Duration::from_millis(120)).is_none()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
         writer.join().expect("callback fixture writer");
     }
 }

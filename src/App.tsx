@@ -14,7 +14,6 @@ type ToastTone = 'info' | 'success' | 'error'
 type Toast = { id: number; message: string; tone: ToastTone }
 type DeviceFlowState = { sessionId: string; userCode: string; verificationUri: string; message?: string; retryAfter: number; status: 'pending' | 'complete' | 'error' }
 type ActionMenu = 'bulk' | 'message'
-type TransferMode = 'export-encrypted' | 'import-encrypted'
 type MobilePane = 'list' | 'reading'
 type MailMoveTarget = { folder: string; label: string; icon: IconName }
 type VirtualMailItem =
@@ -37,7 +36,7 @@ type MailboxPagingMeta = {
 }
 
 const smartCategories: { id: SmartCategory; label: string; icon: IconName; color: string }[] = [
-  { id: 'apple-connect', label: 'Apple Connect', icon: 'shieldCheck', color: '#9ca6ba' },
+  { id: 'apple-connect', label: 'Apple Connect 通知', icon: 'bell', color: '#8b95aa' },
   { id: 'apple-ads', label: 'Apple 广告', icon: 'grid', color: '#ed7191' },
   { id: 'social', label: '社交通知', icon: 'message', color: '#46cfa1' },
   { id: 'ads', label: '其他广告', icon: 'bell', color: '#f0a868' },
@@ -46,7 +45,7 @@ const smartCategories: { id: SmartCategory; label: string; icon: IconName; color
 const inboxTabs: { id: string; label: string; icon: IconName; category: SmartCategory | null }[] = [
   { id: 'primary', label: '主要', icon: 'inbox', category: null },
   { id: 'updates', label: '动态', icon: 'bell', category: 'social' },
-  { id: 'apple-connect', label: 'Apple Connect', icon: 'shieldCheck', category: 'apple-connect' },
+  { id: 'apple-connect', label: 'Apple 通知', icon: 'bell', category: 'apple-connect' },
   { id: 'promotions', label: '推广', icon: 'grid', category: 'ads' },
 ]
 
@@ -546,8 +545,6 @@ function App() {
   const [selectedNativeFolder, setSelectedNativeFolder] = useState<{ accountId: string; name: string } | null>(null)
   const [isHtmlMode, setHtmlMode] = useState(false)
   const [isImporting, setImporting] = useState(false)
-  const [transferMode, setTransferMode] = useState<TransferMode | null>(null)
-  const [transferFile, setTransferFile] = useState<File | null>(null)
   const [toasts, setToasts] = useState<Toast[]>([])
   const [minimizeToTray, setMinimizeToTray] = useState(true)
   const [offlineMode, setOfflineMode] = useState(loadOfflineMode)
@@ -598,7 +595,6 @@ function App() {
     })
   }, [])
   const importInputRef = useRef<HTMLInputElement>(null)
-  const encryptedTransferInputRef = useRef<HTMLInputElement>(null)
   const accountPrefillRef = useRef<string | null>(null)
   const oauthSessionIdRef = useRef('')
   const authAttemptRef = useRef(0)
@@ -2302,70 +2298,6 @@ function App() {
     }
   }
 
-  const openEncryptedExport = () => {
-    if (!isNativeRuntime) {
-      pushToast('浏览器预览不读取凭据；请在 Windows 桌面端导出加密配置', 'info')
-      return
-    }
-    setSettingsOpen(false)
-    setTransferFile(null)
-    setTransferMode('export-encrypted')
-  }
-
-  const openEncryptedImport = () => {
-    if (!isNativeRuntime) {
-      pushToast('浏览器预览不导入凭据；请在 Windows 桌面端导入加密配置', 'info')
-      return
-    }
-    setSettingsOpen(false)
-    encryptedTransferInputRef.current?.click()
-  }
-
-  const selectEncryptedTransferFile = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0]
-    event.target.value = ''
-    if (!file) return
-    setTransferFile(file)
-    setTransferMode('import-encrypted')
-  }
-
-  const handleEncryptedTransfer = async (passphrase: string) => {
-    if (!transferMode || !isNativeRuntime) return
-    setImporting(true)
-    try {
-      if (transferMode === 'export-encrypted') {
-        const result = await invoke<{ bundle: string; accountCount: number }>('accounts.export_encrypted', { passphrase }, 30_000)
-        const blob = new Blob([result.bundle], { type: 'application/json' })
-        const url = URL.createObjectURL(blob)
-        const anchor = document.createElement('a')
-        anchor.href = url
-        anchor.download = `mailgo-accounts-encrypted-${new Date().toISOString().slice(0, 10)}.json`
-        anchor.click()
-        URL.revokeObjectURL(url)
-        pushToast(`已导出 ${result.accountCount} 个加密账户配置`, 'success')
-      } else {
-        if (!transferFile || transferFile.size > 8 * 1024 * 1024) throw new Error('加密配置文件必须小于 8 MB')
-        const bundle = await transferFile.text()
-        const result = await invoke<{ imported: number }>('accounts.import_encrypted', { bundle, passphrase }, 30_000)
-        const nativeState = await readNativeState()
-        if (nativeState) {
-          setAccounts(nativeState.accounts)
-          setNativeFolders(nativeState.folders ?? {})
-          setNativeFolderLabels(nativeState.folderLabels ?? {})
-          setMails((current) => current.filter((mail) => nativeState.accounts.some((account) => account.id === mail.accountId)))
-          void refreshNativeDrafts(nativeState.accounts)
-        }
-        pushToast(`已导入 ${result.imported} 个账户，首次同步前缓存已清理`, 'success')
-      }
-      setTransferMode(null)
-      setTransferFile(null)
-    } catch (error) {
-      pushToast(error instanceof Error ? error.message : '加密账户配置处理失败', 'error')
-    } finally {
-      setImporting(false)
-    }
-  }
-
   const handleCloseWindow = () => {
     if (minimizeToTray) {
       if (isNativeRuntime) {
@@ -2652,39 +2584,19 @@ function App() {
       </div>
 
       <AnimatePresence>
-        {isSettingsOpen && <motion.div className="settings-popover" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}><div className="settings-title"><span><Icon name="settings" size={17} />偏好设置</span><TooltipButton label="关闭设置" onClick={() => setSettingsOpen(false)}><Icon name="close" size={17} /></TooltipButton></div><div className="settings-row"><span><Icon name={theme === 'dark' ? 'moon' : 'theme'} size={17} /><span>外观主题<small>{theme === 'dark' ? '深色 · 午夜蓝' : '浅色 · 雪白'}</small></span></span><button type="button" className="theme-switch" onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}><span className={theme === 'light' ? 'is-light' : ''}>{theme === 'dark' ? '深' : '浅'}</span></button></div><label className="settings-row css-row"><span><Icon name="brush" size={17} /><span>用户 CSS<small>{sanitizedCustomCss.removedUnsafeSyntax ? '已过滤外部资源与危险语法' : '可覆盖 MailGo 视觉变量；不加载外部资源'}</small></span></span><textarea value={customCss} onChange={(event) => setCustomCss(event.target.value)} placeholder="例如：:root { --accent: #ff6b8a; }" /></label><div className="settings-row"><span><Icon name="cloud" size={17} /><span>关闭时后台运行<small>最小化到系统托盘并继续同步</small></span></span><button type="button" className={`toggle-switch ${minimizeToTray ? 'is-on' : ''}`} onClick={() => { const next = !minimizeToTray; setMinimizeToTray(next); void invoke('app.set_minimize_to_tray', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-row"><span><Icon name="image" size={17} /><span>加载远程图片<small>{remoteImagesEnabled ? '已允许 HTTPS 图片，可能包含追踪像素' : '默认屏蔽，保护隐私；CID 内嵌图片不受影响'}</small></span></span><button type="button" aria-label="加载远程图片" className={`toggle-switch ${remoteImagesEnabled ? 'is-on' : ''}`} onClick={() => { const next = !remoteImagesEnabled; setRemoteImagesEnabled(next); void invoke('app.set_remote_images', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-row"><span><Icon name="bell" size={17} /><span>后台新邮件提醒<small>窗口隐藏时发送 Windows 托盘通知</small></span></span><button type="button" aria-label="后台新邮件提醒" className={`toggle-switch ${notificationsEnabled ? 'is-on' : ''}`} onClick={() => { const next = !notificationsEnabled; setNotificationsEnabled(next); void invoke('app.set_notifications', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-actions"><button type="button" onClick={exportAccounts}><Icon name="download" size={16} />导出脱敏配置</button><button type="button" onClick={() => importInputRef.current?.click()} disabled={isImporting}><Icon name="folder" size={16} />{isImporting ? '导入中…' : '导入脱敏配置'}</button><button type="button" className="secure-transfer-button" onClick={openEncryptedExport} disabled={!isNativeRuntime || isImporting}><Icon name="shieldCheck" size={16} />导出加密配置</button><button type="button" className="secure-transfer-button" onClick={openEncryptedImport} disabled={!isNativeRuntime || isImporting}><Icon name="key" size={16} />导入加密配置</button></div><input ref={importInputRef} type="file" accept="application/json,.json" hidden onChange={importAccounts} /><input ref={encryptedTransferInputRef} type="file" accept="application/json,.json" hidden onChange={selectEncryptedTransferFile} /></motion.div>}
+        {isSettingsOpen && <motion.div className="settings-popover" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}><div className="settings-title"><span><Icon name="settings" size={17} />偏好设置</span><TooltipButton label="关闭设置" onClick={() => setSettingsOpen(false)}><Icon name="close" size={17} /></TooltipButton></div><div className="settings-row"><span><Icon name={theme === 'dark' ? 'moon' : 'theme'} size={17} /><span>外观主题<small>{theme === 'dark' ? '深色 · 午夜蓝' : '浅色 · 雪白'}</small></span></span><button type="button" className="theme-switch" onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}><span className={theme === 'light' ? 'is-light' : ''}>{theme === 'dark' ? '深' : '浅'}</span></button></div><label className="settings-row css-row"><span><Icon name="brush" size={17} /><span>用户 CSS<small>{sanitizedCustomCss.removedUnsafeSyntax ? '已过滤外部资源与危险语法' : '可覆盖 MailGo 视觉变量；不加载外部资源'}</small></span></span><textarea value={customCss} onChange={(event) => setCustomCss(event.target.value)} placeholder="例如：:root { --accent: #ff6b8a; }" /></label><div className="settings-row"><span><Icon name="cloud" size={17} /><span>关闭时后台运行<small>最小化到系统托盘并继续同步</small></span></span><button type="button" className={`toggle-switch ${minimizeToTray ? 'is-on' : ''}`} onClick={() => { const next = !minimizeToTray; setMinimizeToTray(next); void invoke('app.set_minimize_to_tray', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-row"><span><Icon name="image" size={17} /><span>加载远程图片<small>{remoteImagesEnabled ? '已允许 HTTPS 图片，可能包含追踪像素' : '默认屏蔽，保护隐私；CID 内嵌图片不受影响'}</small></span></span><button type="button" aria-label="加载远程图片" className={`toggle-switch ${remoteImagesEnabled ? 'is-on' : ''}`} onClick={() => { const next = !remoteImagesEnabled; setRemoteImagesEnabled(next); void invoke('app.set_remote_images', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-row"><span><Icon name="bell" size={17} /><span>后台新邮件提醒<small>窗口隐藏时发送 Windows 托盘通知</small></span></span><button type="button" aria-label="后台新邮件提醒" className={`toggle-switch ${notificationsEnabled ? 'is-on' : ''}`} onClick={() => { const next = !notificationsEnabled; setNotificationsEnabled(next); void invoke('app.set_notifications', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-actions"><button type="button" onClick={exportAccounts}><Icon name="download" size={16} />导出脱敏配置</button><button type="button" onClick={() => importInputRef.current?.click()} disabled={isImporting}><Icon name="folder" size={16} />{isImporting ? '导入中…' : '导入脱敏配置'}</button></div><div className="settings-security-note"><Icon name="shieldCheck" size={15} /><span>导出文件不包含授权码或令牌；导入后需重新授权。</span></div><input ref={importInputRef} type="file" accept="application/json,.json" hidden onChange={importAccounts} /></motion.div>}
       </AnimatePresence>
 
       <AnimatePresence>{isHelpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}</AnimatePresence>
       <AnimatePresence>{isComposeOpen && <ComposeModal mode={composeMode} source={composeSource} accountId={composeSource?.accountId ?? selectedAccountId ?? accounts[0]?.id} senderEmail={accounts.find((account) => account.id === (composeSource?.accountId ?? selectedAccountId))?.email ?? accounts[0]?.email} draftId={composeDraftId} onDraftChanged={handleDraftChanged} onDraftRemoved={handleDraftRemoved} onClose={() => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts() }} onSent={(queued) => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts(); void refreshOutbox(); pushToast(queued ? '网络暂不可用，邮件已加入发件箱，联网后自动重试' : '邮件已发送', 'success') }} onError={(message) => pushToast(message, 'error')} />}</AnimatePresence>
       <AnimatePresence>{isAccountModalOpen && <AccountModal editingAccountId={editingAccountId} provider={provider} setProvider={changeProvider} providerDefinition={selectedProvider} accountEmail={accountEmail} setAccountEmail={setAccountEmail} authorizationCode={authorizationCode} setAuthorizationCode={setAuthorizationCode} showAuthorizationCode={showAuthorizationCode} setShowAuthorizationCode={setShowAuthorizationCode} customImapHost={customImapHost} setCustomImapHost={setCustomImapHost} customImapPort={customImapPort} setCustomImapPort={setCustomImapPort} customImapSecurity={customImapSecurity} setCustomImapSecurity={setCustomImapSecurity} customSmtpHost={customSmtpHost} setCustomSmtpHost={setCustomSmtpHost} customSmtpPort={customSmtpPort} setCustomSmtpPort={setCustomSmtpPort} customSmtpSecurity={customSmtpSecurity} setCustomSmtpSecurity={setCustomSmtpSecurity} customAuthentication={customAuthentication} setCustomAuthentication={setCustomAuthentication} deviceFlow={deviceFlow} isBusy={isAddingAccount} onClose={closeAccountModal} onOpenProvider={() => { void handleOpenProvider() }} onCopy={handleCopy} onAdd={handleAddAccount} onRemove={handleRemoveAccount} />}</AnimatePresence>
-      <AnimatePresence>{transferMode && <TransferModal mode={transferMode} fileName={transferFile?.name} isBusy={isImporting} onClose={() => { if (!isImporting) { setTransferMode(null); setTransferFile(null) } }} onSubmit={handleEncryptedTransfer} />}</AnimatePresence>
       <div className="toast-stack" aria-live="polite">{toasts.map((toast) => <motion.div key={toast.id} className={`toast toast-${toast.tone}`} initial={{ opacity: 0, y: 12, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 12 }}><Icon name={toast.tone === 'success' ? 'checkCircle' : toast.tone === 'error' ? 'info' : 'bell'} size={17} /><span>{toast.message}</span></motion.div>)}</div>
     </div>
   )
 }
 
-function TransferModal({ mode, fileName, isBusy, onClose, onSubmit }: { mode: TransferMode; fileName?: string; isBusy: boolean; onClose: () => void; onSubmit: (passphrase: string) => void }) {
-  const [passphrase, setPassphrase] = useState('')
-  const [showPassphrase, setShowPassphrase] = useState(false)
-  const [validationError, setValidationError] = useState('')
-  const isExport = mode === 'export-encrypted'
-
-  const submit = (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    if (passphrase.length < 12) {
-      setValidationError('请使用至少 12 个字符的转移密码')
-      return
-    }
-    setValidationError('')
-    onSubmit(passphrase)
-  }
-
-  return <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget && !isBusy) onClose() }}><motion.div className="transfer-modal" initial={{ opacity: 0, y: 14, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 8, scale: 0.98 }} role="dialog" aria-modal="true" aria-labelledby="transfer-modal-title"><div className="modal-header"><div><Icon name="shieldCheck" size={21} /><h2 id="transfer-modal-title">{isExport ? '导出加密账户配置' : '导入加密账户配置'}</h2></div><TooltipButton label="关闭" onClick={onClose}><Icon name="close" size={18} /></TooltipButton></div><form className="transfer-modal-body" onSubmit={submit}>{!isExport && <div className="transfer-file"><Icon name="folder" size={18} /><span><strong>{fileName || '已选择配置文件'}</strong><small>凭据将在本机解密并写入 Windows Credential Manager</small></span></div>}<p>{isExport ? '账户元数据与 Windows Credential Manager 中的凭据会打包为加密文件，可迁移到另一台 MailGo。' : '请输入创建加密文件时使用的转移密码。解密成功后，账户会写入本机安全存储。'}</p><label>转移密码<span className="secret-input"><input autoFocus required minLength={12} type={showPassphrase ? 'text' : 'password'} value={passphrase} onChange={(event) => { setPassphrase(event.target.value); setValidationError('') }} placeholder="至少 12 个字符" autoComplete="new-password" /><button type="button" onClick={() => setShowPassphrase((value) => !value)} aria-label={showPassphrase ? '隐藏转移密码' : '显示转移密码'}><Icon name={showPassphrase ? 'eyeSlash' : 'eye'} size={17} /></button></span></label>{validationError && <div className="transfer-error" role="alert"><Icon name="info" size={15} />{validationError}</div>}<div className="transfer-warning"><Icon name="shieldCheck" size={16} /><span>密码不会保存到 MailGo。忘记密码无法恢复加密包；请使用可信位置保存文件。</span></div><div className="modal-footer"><span><Icon name="key" size={17} />Argon2id + ChaCha20-Poly1305</span><div><button className="secondary-button" type="button" onClick={onClose} disabled={isBusy}>取消</button><button className="gradient-button" type="submit" disabled={isBusy}>{isBusy ? '处理中…' : (isExport ? '生成加密包' : '解密并导入')}<Icon name={isExport ? 'download' : 'folder'} size={17} /></button></div></div></form></motion.div></motion.div>
-}
-
 function HelpModal({ onClose }: { onClose: () => void }) {
-  return <motion.div className="modal-backdrop help-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="help-modal" initial={{ opacity: 0, y: 14, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 8, scale: 0.98 }} role="dialog" aria-modal="true" aria-labelledby="help-title"><div className="modal-header"><div><Icon name="help" size={21} /><h2 id="help-title">MailGo 帮助中心</h2></div><TooltipButton label="关闭帮助中心" onClick={onClose}><Icon name="close" size={19} /></TooltipButton></div><div className="help-modal-body"><section><h3>常用快捷键</h3><div className="shortcut-row"><span>写邮件</span><kbd>C</kbd></div><div className="shortcut-row"><span>聚焦搜索</span><kbd>Ctrl K</kbd></div><div className="shortcut-row"><span>回复当前邮件</span><kbd>R</kbd></div><div className="shortcut-row"><span>关闭弹窗</span><kbd>Esc</kbd></div></section><section><h3>账户与同步</h3><p>Google 与 Outlook 优先使用 OAuth 安全授权；QQ 邮箱和自定义 IMAP/SMTP 使用服务商生成的授权码或应用密码。</p><p>同步失败时，邮件仍保留在本地缓存；离线状态下的归档、删除和已读操作会在恢复连接后重放。</p></section><section><h3>隐私与安全</h3><p>授权凭据只交给本机安全存储。普通导出不包含授权码；Windows 桌面端可使用加密账户迁移包转移完整配置。HTML 邮件默认屏蔽远程图片，避免追踪像素；需要时可在设置中显式开启。</p></section></div><div className="modal-footer"><span><Icon name="shieldCheck" size={17} />MailGo 运行在本机，数据由你控制</span><button className="gradient-button" type="button" onClick={onClose}>知道了</button></div></motion.div></motion.div>
+  return <motion.div className="modal-backdrop help-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="help-modal" initial={{ opacity: 0, y: 14, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 8, scale: 0.98 }} role="dialog" aria-modal="true" aria-labelledby="help-title"><div className="modal-header"><div><Icon name="help" size={21} /><h2 id="help-title">MailGo 帮助中心</h2></div><TooltipButton label="关闭帮助中心" onClick={onClose}><Icon name="close" size={19} /></TooltipButton></div><div className="help-modal-body"><section><h3>常用快捷键</h3><div className="shortcut-row"><span>写邮件</span><kbd>C</kbd></div><div className="shortcut-row"><span>聚焦搜索</span><kbd>Ctrl K</kbd></div><div className="shortcut-row"><span>回复当前邮件</span><kbd>R</kbd></div><div className="shortcut-row"><span>关闭弹窗</span><kbd>Esc</kbd></div></section><section><h3>账户与同步</h3><p>Google 与 Outlook 优先使用 OAuth 安全授权；QQ 邮箱和自定义 IMAP/SMTP 使用服务商生成的授权码或应用密码。</p><p>同步失败时，邮件仍保留在本地缓存；离线状态下的归档、删除和已读操作会在恢复连接后重放。</p></section><section><h3>隐私与安全</h3><p>授权凭据只交给本机安全存储。账户导出只包含脱敏元数据，导入另一台电脑后必须重新授权。HTML 邮件默认屏蔽远程图片，避免追踪像素；需要时可在设置中显式开启。</p></section></div><div className="modal-footer"><span><Icon name="shieldCheck" size={17} />MailGo 运行在本机，数据由你控制</span><button className="gradient-button" type="button" onClick={onClose}>知道了</button></div></motion.div></motion.div>
 }
 
 function AccountModal({ editingAccountId, provider, setProvider, providerDefinition, accountEmail, setAccountEmail, authorizationCode, setAuthorizationCode, showAuthorizationCode, setShowAuthorizationCode, customImapHost, setCustomImapHost, customImapPort, setCustomImapPort, customImapSecurity, setCustomImapSecurity, customSmtpHost, setCustomSmtpHost, customSmtpPort, setCustomSmtpPort, customSmtpSecurity, setCustomSmtpSecurity, customAuthentication, setCustomAuthentication, deviceFlow, isBusy, onClose, onOpenProvider, onCopy, onAdd, onRemove }: { editingAccountId: string | null; provider: Provider; setProvider: (provider: Provider) => void; providerDefinition: ReturnType<typeof providerFor>; accountEmail: string; setAccountEmail: (value: string) => void; authorizationCode: string; setAuthorizationCode: (value: string) => void; showAuthorizationCode: boolean; setShowAuthorizationCode: (value: boolean) => void; customImapHost: string; setCustomImapHost: (value: string) => void; customImapPort: string; setCustomImapPort: (value: string) => void; customImapSecurity: string; setCustomImapSecurity: (value: string) => void; customSmtpHost: string; setCustomSmtpHost: (value: string) => void; customSmtpPort: string; setCustomSmtpPort: (value: string) => void; customSmtpSecurity: string; setCustomSmtpSecurity: (value: string) => void; customAuthentication: string; setCustomAuthentication: (value: string) => void; deviceFlow: DeviceFlowState | null; isBusy: boolean; onClose: () => void; onOpenProvider: () => void; onCopy: () => void; onAdd: () => void; onRemove: () => void }) {

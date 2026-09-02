@@ -1,9 +1,6 @@
 [CmdletBinding()]
 param(
     [string]$OutputDirectory,
-    [switch]$Publish,
-    [string]$Tag,
-    [string]$NotesFile,
     [switch]$AllowDirty
 )
 
@@ -32,10 +29,6 @@ $OutputDirectory = if ($OutputDirectory) {
     Join-Path $projectRoot 'artifacts'
 }
 
-if ($Publish -and [string]::IsNullOrWhiteSpace($Tag)) {
-    throw 'publishing requires an explicit -Tag (for example: -Tag v0.1.0)'
-}
-
 Push-Location $projectRoot
 try {
     if (-not $AllowDirty) {
@@ -58,6 +51,9 @@ try {
 
     & npm run test:ipc-capability
     if ($LASTEXITCODE -ne 0) { throw "packaged IPC capability checks failed with exit code $LASTEXITCODE" }
+
+    & npm run test:security-policy
+    if ($LASTEXITCODE -ne 0) { throw "security policy checks failed with exit code $LASTEXITCODE" }
 
     & npm run test:threading
     if ($LASTEXITCODE -ne 0) { throw "conversation threading checks failed with exit code $LASTEXITCODE" }
@@ -100,23 +96,7 @@ try {
     Write-Host "SHA-256: $($manifest.sha256)"
     Write-Host "Manifest: $manifestPath"
 
-    if ($Publish) {
-        $gh = Get-Command gh -ErrorAction Stop
-        & $gh.Source auth status
-        if ($LASTEXITCODE -ne 0) { throw 'GitHub CLI is not authenticated; release was not published' }
-        $releaseArgs = @('release', 'create', $Tag, $archive.FullName, '--title', "MailGo $version")
-        if ($NotesFile) {
-            if (-not (Test-Path -LiteralPath $NotesFile)) { throw "release notes file is missing: $NotesFile" }
-            $releaseArgs += @('--notes-file', (Resolve-Path -LiteralPath $NotesFile).Path)
-        } else {
-            $releaseArgs += @('--generate-notes')
-        }
-        & $gh.Source @releaseArgs
-        if ($LASTEXITCODE -ne 0) { throw "GitHub release publication failed with exit code $LASTEXITCODE" }
-        Write-Host "Published release $Tag manually."
-    } else {
-        Write-Host 'Publication skipped. Re-run with an explicit -Publish -Tag <tag> to publish.'
-    }
+    Write-Host 'Publication skipped. Portable ZIPs are local-development artifacts; publish only a separately verified signed MSIX after explicit user approval.'
 } finally {
     Pop-Location
 }
