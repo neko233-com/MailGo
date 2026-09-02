@@ -15,6 +15,7 @@ import { mapWithConcurrency } from './lib/asyncPool'
 import { invoke, readNativeState } from './lib/ipc'
 import { inspectExternalLink, type ExternalLinkInspection } from './linkSafety'
 import { applyMailRules, domainFromSender } from './mailRules'
+import { countUnreadFixedFolders, isSameNativeFolder, nativeFolderName } from './mailboxCounts'
 import { mailNeedsBodyHydration, selectBodyHydrationCandidates } from './messageHydration'
 import { normalizeAccountSignature } from './signature'
 import { formatScheduledAt } from './scheduleSend'
@@ -149,25 +150,10 @@ function uiFolderForNative(folder: string): FolderId {
   return 'archive'
 }
 
-function nativeFolderName(account: MailAccount, folder: FolderId): string {
-  if (folder === 'outbox') return '__MAILGO_LOCAL_OUTBOX__'
-  if (folder === 'snoozed') return '__MAILGO_LOCAL_SNOOZED__'
-  if (folder === 'inbox') return 'INBOX'
-  if (folder === 'sent') return account.provider === 'google' ? '[Gmail]/Sent Mail' : account.provider === 'outlook' ? 'Sent Items' : 'Sent Messages'
-  if (folder === 'drafts') return account.provider === 'google' ? '[Gmail]/Drafts' : 'Drafts'
-  if (folder === 'spam') return account.provider === 'google' ? '[Gmail]/Spam' : account.provider === 'outlook' ? 'Junk Email' : 'Spam'
-  if (folder === 'trash') return account.provider === 'google' ? '[Gmail]/Trash' : account.provider === 'outlook' ? 'Deleted Items' : 'Trash'
-  return account.provider === 'google' ? '[Gmail]/All Mail' : 'Archive'
-}
-
 function nativeFolderLabel(folder: string, displayName?: string) {
   const source = displayName?.trim() || folder
   const parts = source.split(/[\\/]/).filter(Boolean)
   return parts[parts.length - 1] || source
-}
-
-function isSameNativeFolder(left: string, right: string) {
-  return left.toLocaleLowerCase() === right.toLocaleLowerCase()
 }
 
 function customNativeFolders(account: MailAccount, folders: string[] | undefined) {
@@ -1553,15 +1539,7 @@ function App() {
         : folder.id === 'inbox'
           ? { ...folder, unread: Math.max(0, folder.unread - snoozedMails.filter((mail) => mail.unread).length) }
           : folder)
-    const matchesFixedFolder = (mail: MailMessage, folder: FolderId) => {
-      if (folder === 'starred') return mail.starred
-      if (folder === 'snoozed') return Boolean(mail.snoozedUntil)
-      if (folder === 'outbox') return mail.folder === 'outbox'
-      const account = accountsById.get(mail.accountId)
-      return mail.nativeFolder && account
-        ? isSameNativeFolder(mail.nativeFolder, nativeFolderName(account, folder))
-        : mail.folder === folder
-    }
+    const unreadCounts = countUnreadFixedFolders(allMails, accounts)
     return folderLabels.map((folder) => ({
       ...folder,
       unread: folder.id === 'outbox'
@@ -1570,9 +1548,9 @@ function App() {
           ? snoozedMails.length
         : folder.id === 'drafts'
           ? visibleNativeDrafts.length
-        : allMails.filter((mail) => !mail.blocked && mail.snoozedUntil == null && matchesFixedFolder(mail, folder.id) && mail.unread).length,
+        : unreadCounts.get(folder.id) ?? 0,
     }))
-  }, [accountsById, allMails, isNativeRuntime, nativeOutboxItems.length, snoozedMails.length, visibleNativeDrafts.length])
+  }, [accounts, allMails, isNativeRuntime, nativeOutboxItems.length, snoozedMails, visibleNativeDrafts.length])
   const displayedAccountUnreadCounts = useMemo(() => {
     const hiddenUnread = new Map<string, number>()
     for (const mail of allMails) {
@@ -1617,8 +1595,16 @@ function App() {
   }, [accountsById, allMails, deferredQuery, filterUnread, hideAds, nativeSearchResultIds, selectedAccountId, selectedCategory, selectedFolder, selectedNativeFolder])
 
   const visibleThreads = useMemo(() => buildMailThreads(visibleMails), [visibleMails])
+  const visibleMailsById = useMemo(() => new Map(visibleMails.map((mail) => [mail.id, mail])), [visibleMails])
+  const visibleThreadsByMessageId = useMemo(() => {
+    const index = new Map<string, MailThread>()
+    for (const thread of visibleThreads) {
+      for (const mail of thread.messages) index.set(mail.id, thread)
+    }
+    return index
+  }, [visibleThreads])
 
-  const selectedMail = visibleMails.find((mail) => mail.id === selectedMailId) ?? visibleMails[0] ?? {
+  const selectedMail = visibleMailsById.get(selectedMailId) ?? visibleMails[0] ?? {
     id: 'empty-mail',
     accountId: '',
     folder: selectedFolder,
@@ -1638,7 +1624,7 @@ function App() {
   useEffect(() => {
     setHtmlMode(Boolean(selectedMail.hasHtml))
   }, [selectedMail.hasHtml, selectedMail.id])
-  const selectedThread = visibleThreads.find((thread) => thread.messages.some((mail) => mail.id === selectedMail.id)) ?? visibleThreads[0]
+  const selectedThread = visibleThreadsByMessageId.get(selectedMail.id) ?? visibleThreads[0]
   const selectedMailAccount = accountsById.get(selectedMail.accountId)
   const selectedOutboxItem = selectedMail.outboxId
     ? nativeOutboxItems.find((item) => item.id === selectedMail.outboxId && item.accountId === selectedMail.accountId)
@@ -1680,9 +1666,10 @@ function App() {
     mailListVirtualizer.measure()
   }, [isCompactDensity, isMobileLayout, mailListVirtualizer])
 
+  const selectedMailIdSet = useMemo(() => new Set(selectedMailIds), [selectedMailIds])
   const selectedVisibleMails = useMemo(
-    () => visibleMails.filter((mail) => selectedMailIds.includes(mail.id)),
-    [selectedMailIds, visibleMails],
+    () => visibleMails.filter((mail) => selectedMailIdSet.has(mail.id)),
+    [selectedMailIdSet, visibleMails],
   )
   const allVisibleSelected = visibleMails.length > 0 && selectedVisibleMails.length === visibleMails.length
 
@@ -3264,7 +3251,7 @@ function App() {
                   {item.type === 'group'
                     ? <div className="mail-group-label">{item.label}</div>
                     : <div className={`mail-row ${latest?.outboxId ? 'is-outbox-row' : ''} ${latest?.snoozedUntil ? 'is-snoozed-row' : ''} ${item.thread.messages.some((mail) => mail.id === selectedMailId) ? 'is-selected' : ''} ${item.thread.unreadCount > 0 ? 'is-unread' : ''}`} onClick={() => { void selectMail(item.thread.latest) }}>
-                        {latest?.outboxId ? <span className={`outbox-row-state is-${latest.outboxState}`} title={latest.outboxState === 'paused' ? '需要处理' : latest.outboxState === 'scheduled' ? latest.outboxScheduledAt ? '定时发送' : '等待撤销窗口' : latest.outboxState === 'retrying' ? '自动重试中' : '等待发送'}><Icon name={latest.outboxState === 'paused' ? 'info' : latest.outboxState === 'scheduled' ? 'clock' : 'rotate'} size={15} /></span> : <><label className="checkbox-wrap row-checkbox" onClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`选择会话 ${latest?.subject}`} checked={item.thread.messages.every((mail) => selectedMailIds.includes(mail.id))} onChange={() => toggleThreadSelection(item.thread)} /><span /></label><button type="button" className={`star-button ${latest?.starred ? 'is-starred' : ''}`} aria-label={latest?.starred ? '取消最新邮件星标' : '为最新邮件添加星标'} onClick={(event) => { event.stopPropagation(); if (latest) toggleStar(latest) }}><Icon name="star" size={18} weight={latest?.starred ? 'Filled' : 'Outline'} /></button></>}
+                        {latest?.outboxId ? <span className={`outbox-row-state is-${latest.outboxState}`} title={latest.outboxState === 'paused' ? '需要处理' : latest.outboxState === 'scheduled' ? latest.outboxScheduledAt ? '定时发送' : '等待撤销窗口' : latest.outboxState === 'retrying' ? '自动重试中' : '等待发送'}><Icon name={latest.outboxState === 'paused' ? 'info' : latest.outboxState === 'scheduled' ? 'clock' : 'rotate'} size={15} /></span> : <><label className="checkbox-wrap row-checkbox" onClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`选择会话 ${latest?.subject}`} checked={item.thread.messages.every((mail) => selectedMailIdSet.has(mail.id))} onChange={() => toggleThreadSelection(item.thread)} /><span /></label><button type="button" className={`star-button ${latest?.starred ? 'is-starred' : ''}`} aria-label={latest?.starred ? '取消最新邮件星标' : '为最新邮件添加星标'} onClick={(event) => { event.stopPropagation(); if (latest) toggleStar(latest) }}><Icon name="star" size={18} weight={latest?.starred ? 'Filled' : 'Outline'} /></button></>}
                         <div className="mail-row-copy"><div className="mail-row-top"><strong>{item.thread.participants.join('、') || latest?.senderName}{item.thread.messages.length > 1 && <span className="thread-count">{item.thread.messages.length}</span>}</strong><time>{latest?.timestamp}</time></div><div className="mail-row-subject">{latest?.subject}</div><p>{latest?.preview}</p></div>
                       </div>}
                 </div>
