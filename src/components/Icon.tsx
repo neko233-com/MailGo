@@ -5,6 +5,7 @@ import ArrowRotate from 'reicon-react/icons/ArrowRotate'
 import AttachCircle from 'reicon-react/icons/AttachCircle'
 import AtSign from 'reicon-react/icons/AtSign'
 import Bell from 'reicon-react/icons/Bell'
+import Bold from 'reicon-react/icons/Bold'
 import Brush from 'reicon-react/icons/Brush'
 import Check from 'reicon-react/icons/Check'
 import CheckCircle from 'reicon-react/icons/CheckCircle'
@@ -34,6 +35,7 @@ import Menu from 'reicon-react/icons/Menu'
 import Message from 'reicon-react/icons/Message'
 import More from 'reicon-react/icons/More'
 import Moon from 'reicon-react/icons/Moon'
+import OrderedList from 'reicon-react/icons/OrderedList'
 import Paperclip from 'reicon-react/icons/Paperclip'
 import Refresh from 'reicon-react/icons/Refresh'
 import Reply from 'reicon-react/icons/Reply'
@@ -44,6 +46,10 @@ import Shield from 'reicon-react/icons/Shield'
 import ShieldCheck from 'reicon-react/icons/ShieldCheck'
 import Star from 'reicon-react/icons/Star'
 import Trash from 'reicon-react/icons/Trash'
+import TextUnderline from 'reicon-react/icons/TextUnderline'
+import Italic from 'reicon-react/icons/Italic'
+import UnorderedList from 'reicon-react/icons/UnorderedList'
+import QuoteDown from 'reicon-react/icons/QuoteDown'
 import User from 'reicon-react/icons/User'
 
 const icons = {
@@ -54,6 +60,7 @@ const icons = {
   attachment: AttachCircle,
   at: AtSign,
   bell: Bell,
+  bold: Bold,
   brush: Brush,
   check: Check,
   checkCircle: CheckCircle,
@@ -73,6 +80,7 @@ const icons = {
   grid: Grid,
   help: Help,
   image: Image,
+  italic: Italic,
   inbox: Inbox,
   info: InfoCircle,
   key: Key,
@@ -83,6 +91,7 @@ const icons = {
   message: Message,
   more: More,
   moon: Moon,
+  orderedList: OrderedList,
   paperclip: Paperclip,
   refresh: Refresh,
   reply: Reply,
@@ -93,6 +102,9 @@ const icons = {
   shieldCheck: ShieldCheck,
   star: Star,
   trash: Trash,
+  underline: TextUnderline,
+  unorderedList: UnorderedList,
+  quote: QuoteDown,
   user: User,
 } as const
 

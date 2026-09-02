@@ -262,6 +262,7 @@ export interface NativeDraft {
   subject: string
   body: string
   htmlMode: boolean
+  htmlBody?: string
   inReplyTo?: string
   references: string[]
   attachments: NativeDraftAttachment[]

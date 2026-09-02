@@ -8,12 +8,14 @@ import { ExternalLinkDialog } from './components/ExternalLinkDialog'
 import { Icon, type IconName } from './components/Icon'
 import { OutboxDetail } from './components/OutboxDetail'
 import { RecipientInput } from './components/RecipientInput'
+import { RichTextEditor } from './components/RichTextEditor'
 import { buildComposeThreadHeaders, type ComposeMode } from './compose-thread'
 import { sanitizeCustomCss } from './customCss'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails, sampleOutboxItems } from './data'
 import { mapWithConcurrency } from './lib/asyncPool'
 import { invoke, readNativeState } from './lib/ipc'
 import { inspectExternalLink, type ExternalLinkInspection } from './linkSafety'
+import { appendSignatureToComposeHtml, plainTextToComposeHtml, sanitizeComposeHtml } from './richText'
 import { appendAccountSignature, normalizeAccountSignature } from './signature'
 import { buildMailThreads, type MailThread } from './threading'
 import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeConnectionDiagnostic, NativeConnectionDiagnosticChannel, NativeDeviceStartResponse, NativeDraft, NativeDraftAttachment, NativeLocalSearchResponse, NativeMailboxResponse, NativeMessageResponse, NativeOutboxActionResponse, NativeOutboxItem, NativeOutboxRecallResponse, NativeOutboxSnapshot, NativeQueueStatus, NativeSearchResponse, NativeSendResponse, NativeSyncItem, NativeSyncResponse, NativeUndoSendResponse, Provider, SmartCategory, ThemeMode } from './types'
@@ -31,6 +33,7 @@ type ConnectionDiagnosticViewState =
 type ActionMenu = 'bulk' | 'message'
 type MobilePane = 'list' | 'reading'
 type DisplayDensity = 'compact' | 'comfortable'
+type MailContentScale = 80 | 90 | 100 | 110
 type MailMoveTarget = { folder: string; label: string; icon: IconName }
 type OutboxAction = { id: string; kind: 'edit' | 'retry' | 'discard' }
 type VirtualMailItem =
@@ -43,6 +46,8 @@ const ACCOUNT_IPC_CONCURRENCY = 4
 const BULK_ACTION_IPC_CONCURRENCY = 6
 const ATTACHMENT_DOWNLOAD_CONCURRENCY = 3
 const DEFAULT_UNDO_SEND_SECONDS: UndoSendSeconds = 10
+const MAIL_CONTENT_SCALES: MailContentScale[] = [80, 90, 100, 110]
+const DEFAULT_MAIL_CONTENT_SCALE: MailContentScale = 90
 const MOBILE_LAYOUT_QUERY = '(max-width: 900px)'
 const COMPACT_DENSITY_QUERY = '(max-height: 820px), (max-width: 1366px)'
 const AUTO_COLLAPSE_SIDEBAR_QUERY = '(max-width: 1366px) and (min-width: 901px)'
@@ -560,14 +565,15 @@ function sameMailboxIdentity(left: MailAccount, right: MailAccount) {
     && normalize(left.smtpSecurity) === normalize(right.smtpSecurity)
 }
 
-function composeHtmlBody(body: string, inlineImages: ComposeInlineImage[]) {
-  const textBlock = body.trim()
-    ? `<div>${escapeHtml(body).replace(/\r?\n/g, '<br>')}</div>`
-    : '<div></div>'
+function composeHtmlBody(body: string, inlineImages: ComposeInlineImage[], richBody?: string, signature = '') {
+  const textBlock = richBody?.trim()
+    ? sanitizeComposeHtml(richBody)
+    : plainTextToComposeHtml(body)
+  const signedBody = appendSignatureToComposeHtml(textBlock, signature)
   const imageBlocks = inlineImages.map(({ fileName, contentId }) => (
-    `<p><img src="cid:${escapeHtml(contentId)}" alt="${escapeHtml(fileName)}" style="max-width:100%;height:auto"></p>`
+    `<p><img src="cid:${escapeHtml(contentId)}" alt="${escapeHtml(fileName)}"></p>`
   )).join('')
-  return textBlock + imageBlocks
+  return sanitizeComposeHtml(signedBody + imageBlocks)
 }
 
 function readLocalStorageValue(key: string) {
@@ -593,6 +599,13 @@ function loadTheme(): ThemeMode {
 
 function loadDisplayDensity(): DisplayDensity {
   return readLocalStorageValue('mailgo-display-density-v2') === 'comfortable' ? 'comfortable' : 'compact'
+}
+
+function loadMailContentScale(): MailContentScale {
+  const stored = Number(readLocalStorageValue('mailgo-mail-content-scale'))
+  return MAIL_CONTENT_SCALES.includes(stored as MailContentScale)
+    ? stored as MailContentScale
+    : DEFAULT_MAIL_CONTENT_SCALE
 }
 
 function loadRemoteImages() {
@@ -706,6 +719,7 @@ function App() {
   const [displayDensity, setDisplayDensity] = useState<DisplayDensity>(loadDisplayDensity)
   const [viewportRequiresCompactDensity, setViewportRequiresCompactDensity] = useState(() => window.matchMedia(COMPACT_DENSITY_QUERY).matches)
   const isCompactDensity = displayDensity === 'compact' || viewportRequiresCompactDensity
+  const [mailContentScale, setMailContentScale] = useState<MailContentScale>(loadMailContentScale)
   const [isMobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [isSidebarCollapsed, setSidebarCollapsed] = useState(() => window.matchMedia(AUTO_COLLAPSE_SIDEBAR_QUERY).matches)
   const [isMobileAuthOpen, setMobileAuthOpen] = useState(false)
@@ -1062,6 +1076,10 @@ function App() {
   useEffect(() => {
     writeLocalStorageValue('mailgo-display-density-v2', displayDensity)
   }, [displayDensity])
+
+  useEffect(() => {
+    writeLocalStorageValue('mailgo-mail-content-scale', String(mailContentScale))
+  }, [mailContentScale])
 
   useEffect(() => {
     writeLocalStorageValue('mailgo-offline-mode', String(offlineMode))
@@ -3056,15 +3074,22 @@ function App() {
           /> : <>
           <div className="reading-toolbar">
             <div className="reading-actions"><TooltipButton label="返回邮件列表" className="mobile-only-button reading-back-button" onClick={() => setMobilePane('list')}><span className="mobile-back-label">列表</span></TooltipButton><TooltipButton label="回复" onClick={() => openCompose(undefined, 'reply', selectedMail)}><Icon name="reply" size={18} /></TooltipButton><span>回复</span><TooltipButton label="回复全部" onClick={() => openCompose(undefined, 'reply-all', selectedMail)}><Icon name="reply" size={18} /></TooltipButton><span>回复全部</span><TooltipButton label="转发" onClick={() => openCompose(undefined, 'forward', selectedMail)}><Icon name="forward" size={18} /></TooltipButton><span>转发</span><TooltipButton label="归档" onClick={() => { void runMove(selectedMail, 'archive') }}><Icon name="archive" size={18} /></TooltipButton><span>归档</span><TooltipButton label="删除" onClick={() => { void runMove(selectedMail, 'delete') }}><Icon name="trash" size={18} /></TooltipButton><span>删除</span><TooltipButton label="移入垃圾邮件" onClick={() => { void runMove(selectedMail, 'spam') }}><Icon name="shield" size={18} /></TooltipButton><span>垃圾邮件</span></div>
-            <div className="menu-anchor">
-              <TooltipButton label="更多邮件操作" active={openMenu === 'message'} ariaExpanded={openMenu === 'message'} onClick={() => setOpenMenu((current) => current === 'message' ? null : 'message')}><Icon name="more" size={19} /></TooltipButton>
-              {openMenu === 'message' && <div className="action-menu" role="menu" aria-label="更多邮件操作">
-                <button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail'} onClick={() => { void markSelectedMessageUnread() }}><Icon name="message" size={16} />标为未读</button>
-                {selectedMail.folder !== 'inbox' && <button type="button" role="menuitem" onClick={() => { setOpenMenu(null); void runMove(selectedMail, 'inbox') }}><Icon name="inbox" size={16} />移回收件箱</button>}
-                {selectedMailMoveTargets.length > 0 && <div className="action-menu-section"><span className="action-menu-label">移动到</span>{selectedMailMoveTargets.map((target) => <button key={target.folder} type="button" role="menuitem" onClick={() => { setOpenMenu(null); void runMoveToFolder(selectedMail, target) }}><Icon name={target.icon} size={16} />{target.label}</button>)}</div>}
-                <button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail'} onClick={() => { void copySelectedMessage() }}><Icon name="copy" size={16} />复制邮件正文</button>
-                <button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail'} onClick={() => { setOpenMenu(null); window.print() }}><Icon name="document" size={16} />打印邮件</button>
-              </div>}
+            <div className="reading-toolbar-tail">
+              <div className="mail-content-scale" role="group" aria-label="邮件正文显示比例">
+                <button type="button" aria-label="缩小邮件正文" title="缩小邮件正文" disabled={mailContentScale === MAIL_CONTENT_SCALES[0]} onClick={() => setMailContentScale((current) => MAIL_CONTENT_SCALES[Math.max(0, MAIL_CONTENT_SCALES.indexOf(current) - 1)])}>A−</button>
+                <output aria-live="polite" aria-label={`邮件正文 ${mailContentScale}%`}>{mailContentScale}%</output>
+                <button type="button" aria-label="放大邮件正文" title="放大邮件正文" disabled={mailContentScale === MAIL_CONTENT_SCALES.at(-1)} onClick={() => setMailContentScale((current) => MAIL_CONTENT_SCALES[Math.min(MAIL_CONTENT_SCALES.length - 1, MAIL_CONTENT_SCALES.indexOf(current) + 1)])}>A+</button>
+              </div>
+              <div className="menu-anchor">
+                <TooltipButton label="更多邮件操作" active={openMenu === 'message'} ariaExpanded={openMenu === 'message'} onClick={() => setOpenMenu((current) => current === 'message' ? null : 'message')}><Icon name="more" size={19} /></TooltipButton>
+                {openMenu === 'message' && <div className="action-menu" role="menu" aria-label="更多邮件操作">
+                  <button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail'} onClick={() => { void markSelectedMessageUnread() }}><Icon name="message" size={16} />标为未读</button>
+                  {selectedMail.folder !== 'inbox' && <button type="button" role="menuitem" onClick={() => { setOpenMenu(null); void runMove(selectedMail, 'inbox') }}><Icon name="inbox" size={16} />移回收件箱</button>}
+                  {selectedMailMoveTargets.length > 0 && <div className="action-menu-section"><span className="action-menu-label">移动到</span>{selectedMailMoveTargets.map((target) => <button key={target.folder} type="button" role="menuitem" onClick={() => { setOpenMenu(null); void runMoveToFolder(selectedMail, target) }}><Icon name={target.icon} size={16} />{target.label}</button>)}</div>}
+                  <button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail'} onClick={() => { void copySelectedMessage() }}><Icon name="copy" size={16} />复制邮件正文</button>
+                  <button type="button" role="menuitem" disabled={selectedMail.id === 'empty-mail'} onClick={() => { setOpenMenu(null); window.print() }}><Icon name="document" size={16} />打印邮件</button>
+                </div>}
+              </div>
             </div>
           </div>
           <div className="reading-scroll">
@@ -3072,7 +3097,7 @@ function App() {
             <ConversationStack thread={selectedThread} selectedId={selectedMail.id} loadingId={loadingMessageId} onSelect={(mail) => { void selectMail(mail) }} />
             <div className="sender-row"><Avatar message={selectedMail} size="lg" /><div className="sender-copy"><div><strong>{selectedMail.senderName}</strong> <span>&lt;{selectedMail.from}&gt;</span></div><div className="recipient">收件人： {selectedMailAccount?.label ?? '当前账户'} &lt;{selectedMailAccount?.email ?? '—'}&gt;</div></div><time>{selectedMail.timestamp}<br /><span>今天</span></time><TooltipButton label="发件人更多信息"><Icon name="more" size={19} /></TooltipButton></div>
             {loadingMessageId === selectedMail.id && <div className="reading-loading-strip" role="status"><span className="loading-spinner" aria-hidden="true" /><span><strong>正在补全邮件正文</strong>列表和已缓存摘要仍可继续浏览</span></div>}
-            <div className="message-content">
+            <div className="message-content" style={{ '--mail-content-font-size': `${((isCompactDensity ? 11.5 : 13) * mailContentScale / 100).toFixed(2)}px` } as React.CSSProperties}>
               {selectedMail.hasHtml && <div className="content-mode-row"><span>此邮件包含富文本内容{(!remoteImagesEnabled || offlineMode) && ` · ${offlineMode ? '仅离线模式，远程图片已屏蔽' : '远程图片已屏蔽'}`}</span><button type="button" className="text-action" onClick={() => setHtmlMode((value) => !value)}>{isHtmlMode ? '查看纯文本' : '渲染 HTML'} <Icon name="grid" size={14} /></button></div>}
               {isHtmlMode && selectedMail.hasHtml ? <div className="html-rendered" onClick={handleRenderedLinkClick} dangerouslySetInnerHTML={{ __html: sanitizeHtml(selectedMail.htmlBody ?? initialHtml, remoteImagesEnabled && !offlineMode) }} /> : selectedMail.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
             </div>
@@ -3212,6 +3237,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
   const [showCopyFields, setShowCopyFields] = useState(false)
   const [subject, setSubject] = useState('')
   const [body, setBody] = useState('')
+  const [richBody, setRichBody] = useState('')
   const [htmlMode, setHtmlMode] = useState(false)
   const [inReplyTo, setInReplyTo] = useState<string | undefined>()
   const [references, setReferences] = useState<string[]>([])
@@ -3273,6 +3299,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
         subject,
         body,
         htmlMode,
+        ...(htmlMode && richBody.trim() ? { htmlBody: richBody } : {}),
         ...(inReplyTo ? { inReplyTo } : {}),
         ...(references.length ? { references } : {}),
       }, 30_000)
@@ -3285,7 +3312,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
     const request = pendingDraftSaveRef.current.catch(() => undefined).then(save)
     pendingDraftSaveRef.current = request
     return request
-  }, [accountId, bcc, body, cc, draftReady, htmlMode, inReplyTo, isNativeRuntime, isSending, onDraftChanged, references, subject, to])
+  }, [accountId, bcc, body, cc, draftReady, htmlMode, inReplyTo, isNativeRuntime, isSending, onDraftChanged, references, richBody, subject, to])
 
   const waitForAttachmentJobs = useCallback(async () => {
     while (pendingAttachmentJobsRef.current.size > 0) {
@@ -3352,6 +3379,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
     setShowCopyFields(Boolean(seed.cc))
     setSubject(seed.subject)
     setBody(seed.body)
+    setRichBody('')
     setHtmlMode(false)
     setInReplyTo(threadHeaders.inReplyTo)
     setReferences(threadHeaders.references)
@@ -3373,6 +3401,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
       setShowCopyFields(Boolean(draft.cc || draft.bcc))
       setSubject(draft.subject)
       setBody(draft.body)
+      setRichBody(draft.htmlBody || (draft.htmlMode ? plainTextToComposeHtml(draft.body) : ''))
       setHtmlMode(draft.htmlMode)
       setInReplyTo(draft.inReplyTo)
       setReferences(draft.references)
@@ -3432,7 +3461,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
       void saveDraftSnapshot().catch(() => setDraftStatus('草稿保存失败，将在下次输入时重试'))
     }, 700)
     return () => window.clearTimeout(timer)
-  }, [accountId, bcc, body, cc, draftReady, htmlMode, inReplyTo, isNativeRuntime, isSending, references, saveDraftSnapshot, subject, to])
+  }, [accountId, bcc, body, cc, draftReady, htmlMode, inReplyTo, isNativeRuntime, isSending, references, richBody, saveDraftSnapshot, subject, to])
 
   const addFiles = (event: React.ChangeEvent<HTMLInputElement>) => {
     const incoming = Array.from(event.target.files ?? [])
@@ -3766,6 +3795,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
   useEffect(() => {
     const handleEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return
+      if (event.target instanceof HTMLElement && event.target.closest('.rich-compose-link')) return
       event.preventDefault()
       event.stopImmediatePropagation()
       void requestClose()
@@ -3845,7 +3875,9 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
           textBody: outgoingBody,
           ...(inReplyTo ? { inReplyTo } : {}),
           ...(references.length ? { references } : {}),
-          ...(effectiveHtml && (outgoingBody.trim() || currentInlineImages.length) ? { htmlBody: composeHtmlBody(outgoingBody, currentInlineImages) } : {}),
+          ...(effectiveHtml && (outgoingBody.trim() || currentInlineImages.length) ? {
+            htmlBody: composeHtmlBody(body, currentInlineImages, htmlMode ? richBody : undefined, accountSignature),
+          } : {}),
           ...(uploadIds.length ? { attachmentIds: uploadIds } : {}),
           ...(currentDraftId ? { draftId: currentDraftId } : {}),
           ...(persistedIds.length ? { draftAttachmentIds: persistedIds } : {}),
@@ -3885,14 +3917,16 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
       <div className="compose-recipient-row"><RecipientInput fieldId="compose-to" label="收件人" autoFocus value={to} onChange={setTo} accountId={accountId} senderEmail={senderEmail} placeholder="姓名或邮箱，可用逗号分隔多个地址" /><button type="button" className="copy-fields-button" onClick={() => setShowCopyFields((value) => !value)} aria-expanded={showCopyFields}>{showCopyFields ? '隐藏抄送' : '抄送 / 密送'}</button></div>
       {showCopyFields && <><RecipientInput fieldId="compose-cc" label="抄送" value={cc} onChange={setCc} accountId={accountId} senderEmail={senderEmail} placeholder="输入姓名或邮箱" /><RecipientInput fieldId="compose-bcc" label="密送" value={bcc} onChange={setBcc} accountId={accountId} senderEmail={senderEmail} placeholder="输入姓名或邮箱" /></>}
       <label>主题<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="主题" /></label>
-      <textarea className="compose-body" value={body} onChange={(event) => setBody(event.target.value)} placeholder={htmlEnabled ? '输入内容，将以 HTML + 纯文本双格式发送…' : '写下你的邮件…'} />
+      {htmlEnabled
+        ? <RichTextEditor value={richBody || plainTextToComposeHtml(body)} placeholder="输入内容，将以 HTML + 纯文本双格式发送…" onChange={(html, plainText) => { setRichBody(html); setBody(plainText) }} onError={onError} />
+        : <textarea className="compose-body" value={body} onChange={(event) => setBody(event.target.value)} placeholder="写下你的邮件…" />}
       {accountSignature && <div className="compose-signature-preview"><span>账户签名 · 发送时自动加入</span><p>{accountSignature}</p></div>}
       {draftStatus && <div className="compose-draft-status" aria-live="polite"><Icon name="cloud" size={14} />{draftStatus}</div>}
       {htmlEnabled && <div className="compose-format-note"><Icon name="grid" size={14} />将发送安全的 HTML + 纯文本版本{inlineImages.length > 0 ? '，内嵌图片会显示在正文末尾' : ''}</div>}
       {inlineImages.length > 0 && <div className="compose-inline-images" aria-label="待发送内嵌图片">{inlineImages.map((image) => <div className={`compose-inline-image is-${image.status}`} key={image.localId}>{image.previewUrl ? <img src={image.previewUrl} alt={image.fileName} /> : <span className="compose-inline-placeholder"><Icon name="image" size={22} /></span>}<span>{image.fileName}<small>{image.status === 'saving' ? '加密保存中…' : image.status === 'failed' ? '保存失败' : image.status === 'removing' ? '移除中…' : '已保存'}</small></span><button type="button" disabled={image.status === 'saving' || image.status === 'removing'} onClick={() => { trackAttachmentJob(removeComposeAttachment(image, true)) }} aria-label={'移除内嵌图片 ' + image.fileName}>×</button></div>)}</div>}
       {attachments.length > 0 && <div className="compose-attachments" aria-label="待发送附件">{attachments.map((attachment) => <div className={`compose-attachment is-${attachment.status}`} key={attachment.localId}><span>{attachment.fileName}</span><small>{Math.max(1, Math.round(attachment.size / 1024))} KB · {attachment.status === 'saving' ? '加密保存中…' : attachment.status === 'failed' ? '保存失败' : attachment.status === 'removing' ? '移除中…' : '已保存'}</small><button type="button" disabled={attachment.status === 'saving' || attachment.status === 'removing'} onClick={() => { trackAttachmentJob(removeComposeAttachment(attachment, false)) }} aria-label={'移除附件 ' + attachment.fileName}>×</button></div>)}</div>}
       {uploadingName && <div className="compose-uploading" aria-live="polite"><Icon name="rotate" size={14} />{uploadingName}</div>}
-      <div className="compose-footer"><div><TooltipButton label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={19} /></TooltipButton><input ref={fileInputRef} type="file" multiple hidden onChange={addFiles} /><TooltipButton label="插入图片" onClick={() => imageInputRef.current?.click()}><Icon name="image" size={19} /></TooltipButton><input ref={imageInputRef} type="file" accept="image/*" multiple hidden onChange={addInlineImages} /><TooltipButton label={htmlEnabled ? (inlineImages.length > 0 ? '内嵌图片需要 HTML 格式' : '关闭 HTML 格式') : '启用 HTML 格式'} active={htmlEnabled} onClick={() => { if (inlineImages.length > 0) { onError('已插入内嵌图片，HTML 格式必须保持开启'); return } setHtmlMode((value) => !value) }}><span className="reply-a">A</span></TooltipButton></div><div className="compose-send-actions">{draftId && <button type="button" className="danger-button" onClick={() => { void discard() }} disabled={isSending}><Icon name="trash" size={16} />丢弃草稿</button>}<button type="button" className="gradient-button" onClick={send} disabled={isSending || (isNativeRuntime && !draftReady)}>{isSending ? (uploadingName || '发送中…') : isNativeRuntime && !draftReady ? '准备中…' : '发送'}<Icon name="send" size={17} /></button></div></div>
+      <div className="compose-footer"><div><TooltipButton label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={19} /></TooltipButton><input ref={fileInputRef} type="file" multiple hidden onChange={addFiles} /><TooltipButton label="插入图片" onClick={() => imageInputRef.current?.click()}><Icon name="image" size={19} /></TooltipButton><input ref={imageInputRef} type="file" accept="image/*" multiple hidden onChange={addInlineImages} /><TooltipButton label={htmlEnabled ? (inlineImages.length > 0 ? '内嵌图片需要 HTML 格式' : '切换为纯文本（移除格式）') : '启用富文本格式'} active={htmlEnabled} onClick={() => { if (inlineImages.length > 0) { onError('已插入内嵌图片，HTML 格式必须保持开启'); return } if (htmlMode) { setRichBody(''); setHtmlMode(false) } else { setRichBody(plainTextToComposeHtml(body)); setHtmlMode(true) } }}><span className="reply-a">A</span></TooltipButton></div><div className="compose-send-actions">{draftId && <button type="button" className="danger-button" onClick={() => { void discard() }} disabled={isSending}><Icon name="trash" size={16} />丢弃草稿</button>}<button type="button" className="gradient-button" onClick={send} disabled={isSending || (isNativeRuntime && !draftReady)}>{isSending ? (uploadingName || '发送中…') : isNativeRuntime && !draftReady ? '准备中…' : '发送'}<Icon name="send" size={17} /></button></div></div>
     </motion.div>
   </motion.div>
 }

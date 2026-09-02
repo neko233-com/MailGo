@@ -1073,6 +1073,23 @@ fn optional_bounded_string_field(
     Ok(Some(value))
 }
 
+fn optional_sanitized_html_field(
+    payload: &Value,
+    name: &str,
+    max_bytes: usize,
+) -> Result<Option<String>> {
+    let Some(value) = optional_bounded_string_field(payload, name, max_bytes)? else {
+        return Ok(None);
+    };
+    let sanitized = mail::sanitize_outgoing_html(&value);
+    if sanitized.len() > max_bytes {
+        return Err(anyhow!(
+            "field {name} exceeds the safe size limit after sanitization"
+        ));
+    }
+    Ok((!sanitized.trim().is_empty()).then_some(sanitized))
+}
+
 fn thread_header_fields(payload: &Value) -> Result<(Option<String>, Vec<String>)> {
     let in_reply_to =
         optional_bounded_string_field(payload, "inReplyTo", mail::MAX_MESSAGE_ID_BYTES)?
@@ -2147,6 +2164,11 @@ fn handle_ipc(
                         .get("htmlMode")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    html_body: optional_sanitized_html_field(
+                        &message.payload,
+                        "htmlBody",
+                        MAX_MESSAGE_BODY_BYTES,
+                    )?,
                     in_reply_to,
                     references,
                     attachments: Vec::new(),
@@ -3192,7 +3214,7 @@ fn handle_ipc(
                 let subject = bounded_string_field(&message.payload, "subject", MAX_SUBJECT_BYTES)?;
                 let text_body =
                     bounded_string_field(&message.payload, "textBody", MAX_MESSAGE_BODY_BYTES)?;
-                let html_body = optional_bounded_string_field(
+                let html_body = optional_sanitized_html_field(
                     &message.payload,
                     "htmlBody",
                     MAX_MESSAGE_BODY_BYTES,
@@ -3516,6 +3538,20 @@ mod tests {
         assert!(optional_bounded_string_field(&json!({}), "htmlBody", 5)
             .unwrap()
             .is_none());
+
+        let sanitized = optional_sanitized_html_field(
+            &json!({
+                "htmlBody": "<strong>safe</strong><script>bad()</script><img src=\"https://tracker.example/pixel\"><img src=\"cid:local-image\">"
+            }),
+            "htmlBody",
+            512,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(sanitized.contains("<strong>safe</strong>"));
+        assert!(sanitized.contains("cid:local-image"));
+        assert!(!sanitized.contains("script"));
+        assert!(!sanitized.contains("tracker.example"));
     }
 
     #[test]

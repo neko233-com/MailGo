@@ -702,13 +702,24 @@ fn part_bytes(part: &mail_parser::MessagePart<'_>) -> Vec<u8> {
 /// the renderer blocks them by default. Inline `cid:` images are resolved only from the same MIME
 /// message.
 pub fn sanitize_html(input: &str) -> String {
+    sanitize_html_with_image_policy(input, true)
+}
+
+/// Outgoing rich text uses the same structural allowlist as received mail, but remote image URLs
+/// are removed. Composer images must be same-message CID attachments, so a forged renderer IPC
+/// request cannot turn an encrypted draft into a remote tracking beacon.
+pub fn sanitize_outgoing_html(input: &str) -> String {
+    sanitize_html_with_image_policy(input, false)
+}
+
+fn sanitize_html_with_image_policy(input: &str, allow_https_images: bool) -> String {
     let mut allowed_schemes = HashSet::new();
     allowed_schemes.insert("cid");
     allowed_schemes.insert("https");
     allowed_schemes.insert("mailto");
     Builder::default()
         .url_schemes(allowed_schemes)
-        .attribute_filter(|element, attribute, value| {
+        .attribute_filter(move |element, attribute, value| {
             let element = element.to_ascii_lowercase();
             let attribute = attribute.to_ascii_lowercase();
             if (element == "img" && attribute == "srcset")
@@ -733,7 +744,9 @@ pub fn sanitize_html(input: &str) -> String {
             }
             if element == "img" && attribute == "src" {
                 let normalized = value.to_ascii_lowercase();
-                if normalized.starts_with("cid:") || normalized.starts_with("https://") {
+                if normalized.starts_with("cid:")
+                    || (allow_https_images && normalized.starts_with("https://"))
+                {
                     return Some(Cow::Borrowed(value));
                 }
                 return None;
@@ -1079,6 +1092,16 @@ mod tests {
         assert!(!html.contains("data:text/html"));
         assert!(!html.contains("javascript:"));
         assert!(html.contains("ok"));
+    }
+
+    #[test]
+    fn outgoing_html_keeps_cid_images_but_removes_remote_tracking_images() {
+        let html = sanitize_outgoing_html(
+            r#"<p><strong>Hello</strong><img src="cid:local-image"><img src="https://tracker.example/pixel"></p>"#,
+        );
+        assert!(html.contains("<strong>Hello</strong>"));
+        assert!(html.contains("cid:local-image"));
+        assert!(!html.contains("tracker.example"));
     }
 
     #[test]

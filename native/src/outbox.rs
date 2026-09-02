@@ -420,6 +420,7 @@ pub fn recall_to_draft(
                 subject: message.subject.clone(),
                 body: message.text_body.clone(),
                 html_mode: message.html_body.is_some(),
+                html_body: message.html_body.clone(),
                 in_reply_to: message.in_reply_to.clone(),
                 references: message.references.clone(),
                 attachments: Vec::new(),
@@ -1117,6 +1118,7 @@ mod tests {
             subject: "Queued message".into(),
             body: body.into(),
             html_mode: false,
+            html_body: None,
             in_reply_to: None,
             references: Vec::new(),
             attachments: Vec::new(),
@@ -1169,6 +1171,7 @@ mod tests {
         assert_eq!(result.status, RecallOutboxStatus::Recalled);
         let draft = result.draft.expect("reconstructed draft");
         assert_eq!(draft.id, "draft-fixture");
+        assert_eq!(draft.html_body.as_deref(), Some("<p>body</p>"));
         assert_eq!(draft.attachments.len(), 1);
         let attachment =
             crate::drafts::load_attachment(&root, "account-1", &draft.id, &draft.attachments[0].id)

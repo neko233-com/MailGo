@@ -88,6 +88,9 @@ try {
     & npm run test:conditional-refresh
     if ($LASTEXITCODE -ne 0) { throw "conditional mailbox refresh checks failed with exit code $LASTEXITCODE" }
 
+    & npm run test:rich-compose
+    if ($LASTEXITCODE -ne 0) { throw "rich compose checks failed with exit code $LASTEXITCODE" }
+
     & cargo fmt --manifest-path 'native\Cargo.toml' -- --check
     if ($LASTEXITCODE -ne 0) { throw "cargo fmt check failed with exit code $LASTEXITCODE" }
 

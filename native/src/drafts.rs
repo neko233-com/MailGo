@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const STORE_SCHEMA_VERSION: u32 = 2;
+const STORE_SCHEMA_VERSION: u32 = 3;
 const STORE_FILE: &str = "drafts.bin";
 const STORE_BACKUP_FILE: &str = "drafts.bin.bak";
 const STORE_TEMP_FILE: &str = "drafts.bin.tmp";
@@ -70,6 +70,8 @@ pub struct Draft {
     pub body: String,
     #[serde(default)]
     pub html_mode: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_body: Option<String>,
     #[serde(default)]
     pub in_reply_to: Option<String>,
     #[serde(default)]
@@ -101,6 +103,11 @@ pub fn list(cache_root: &Path, account_id: &str) -> Result<Vec<Draft>> {
 /// Saves draft text while preserving attachment metadata already committed by the native layer.
 pub fn save(cache_root: &Path, mut draft: Draft) -> Result<Draft> {
     let _drafts_guard = drafts_guard();
+    draft.html_body = draft.html_body.take().and_then(|html| {
+        let sanitized = crate::mail::sanitize_outgoing_html(&html);
+        (!sanitized.trim().is_empty()).then_some(sanitized)
+    });
+    draft.html_mode |= draft.html_body.is_some();
     validate(&draft)?;
     if draft.id.is_empty() {
         draft.id = format!("draft-{:016x}", rand::random::<u64>());
@@ -343,6 +350,9 @@ fn validate(draft: &Draft) -> Result<()> {
     validate_text(&draft.bcc, MAX_RECIPIENT_BYTES, "bcc")?;
     validate_text(&draft.subject, MAX_SUBJECT_BYTES, "subject")?;
     validate_text(&draft.body, MAX_BODY_BYTES, "body")?;
+    if let Some(html) = &draft.html_body {
+        validate_text(html, MAX_BODY_BYTES, "body")?;
+    }
     crate::send::validate_thread_headers(draft.in_reply_to.as_deref(), &draft.references)?;
     if draft.attachments.len() > MAX_ATTACHMENTS {
         return Err(anyhow!("draft contains too many attachments"));
@@ -626,6 +636,7 @@ mod tests {
             subject: "Draft subject".into(),
             body: "Draft body".into(),
             html_mode: false,
+            html_body: None,
             in_reply_to: Some("parent@example.com".into()),
             references: vec!["root@example.com".into(), "parent@example.com".into()],
             attachments: Vec::new(),
@@ -655,6 +666,30 @@ mod tests {
         assert!(list(&root, "account-2").unwrap().is_empty());
         assert!(remove(&root, "account-1", &saved.id).unwrap());
         assert!(list(&root, "account-1").unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rich_html_drafts_are_sanitized_encrypted_and_restored() {
+        let root = test_root("rich-html");
+        let mut draft = fixture();
+        draft.html_mode = true;
+        draft.html_body = Some(
+            r#"<p onclick="alert(1)"><strong>Formatted</strong><img src="https://tracker.example/pixel"><img src="cid:local-image"></p><script>bad()</script>"#.into(),
+        );
+        let saved = save(&root, draft).expect("save rich draft");
+        let html = saved.html_body.as_deref().expect("sanitized rich body");
+        assert!(html.contains("<strong>Formatted</strong>"));
+        assert!(html.contains("cid:local-image"));
+        assert!(!html.contains("onclick"));
+        assert!(!html.contains("tracker.example"));
+        assert!(!html.contains("script"));
+        let encrypted = fs::read(root.join(STORE_FILE)).expect("encrypted draft store");
+        assert!(!String::from_utf8_lossy(&encrypted).contains("Formatted"));
+        assert_eq!(
+            list(&root, "account-1").unwrap()[0].html_body.as_deref(),
+            Some(html)
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -944,6 +979,7 @@ mod tests {
         assert!(draft.in_reply_to.is_none());
         assert!(draft.references.is_empty());
         assert!(draft.attachments.is_empty());
+        assert!(draft.html_body.is_none());
         validate(&draft).expect("legacy draft remains valid");
 
         let payload = serde_json::json!({
