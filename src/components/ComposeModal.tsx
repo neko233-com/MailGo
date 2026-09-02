@@ -4,6 +4,7 @@ import { Icon } from './Icon'
 import { RecipientInput } from './RecipientInput'
 import { RichTextEditor } from './RichTextEditor'
 import { ScheduleSendControl } from './ScheduleSendControl'
+import { TooltipButton } from './TooltipButton'
 import { buildComposeThreadHeaders, type ComposeMode } from '../compose-thread'
 import { mapWithConcurrency } from '../lib/asyncPool'
 import { invoke } from '../lib/ipc'
@@ -31,14 +32,6 @@ function bytesToBase64(bytes: Uint8Array) {
     binary += String.fromCharCode(...bytes.subarray(offset, offset + blockSize))
   }
   return btoa(binary)
-}
-
-function TooltipButton({ label, onClick, children, active = false, className = '', ariaExpanded, disabled = false }: { label: string; onClick?: () => void; children: React.ReactNode; active?: boolean; className?: string; ariaExpanded?: boolean; disabled?: boolean }) {
-  return (
-    <button className={`icon-button ${active ? 'is-active' : ''} ${className}`} onClick={onClick} aria-label={label} aria-expanded={ariaExpanded} title={label} type="button" disabled={disabled}>
-      {children}
-    </button>
-  )
 }
 
 type ComposeAttachmentStatus = 'saving' | 'saved' | 'failed' | 'removing'

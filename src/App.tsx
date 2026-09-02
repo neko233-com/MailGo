@@ -2,8 +2,11 @@ import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { lazy, startTransition, Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import appIconUrl from '../resources/icons/mailgo-64.png'
+import type { ConnectionDiagnosticViewState, DeviceFlowState } from './components/AccountModal'
 import { Icon, type IconName } from './components/Icon'
+import { ProviderMark } from './components/ProviderMark'
 import { SnoozeControl } from './components/SnoozeControl'
+import { TooltipButton } from './components/TooltipButton'
 import type { ComposeMode } from './compose-thread'
 import { sanitizeCustomCss } from './customCss'
 import { folderLabels, providerDefinitions } from './data'
@@ -17,7 +20,7 @@ import { formatScheduledAt } from './scheduleSend'
 import { formatSnoozeTime } from './snooze'
 import { buildMailThreads, type MailThread } from './threading'
 import { sanitizeHtml } from './htmlSafety'
-import type { FolderId, MailAccount, MailAttachment, MailMessage, MailRuleKind, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeConnectionDiagnostic, NativeConnectionDiagnosticChannel, NativeDeviceStartResponse, NativeDraft, NativeLocalSearchResponse, NativeMailboxResponse, NativeMailRule, NativeMailRuleSnapshot, NativeMessageResponse, NativeOutboxActionResponse, NativeOutboxItem, NativeOutboxRecallResponse, NativeOutboxSnapshot, NativeQueueStatus, NativeSearchResponse, NativeSendResponse, NativeSnoozeSnapshot, NativeSyncItem, NativeSyncResponse, NativeUndoSendResponse, Provider, SmartCategory, ThemeMode } from './types'
+import type { FolderId, MailAccount, MailAttachment, MailMessage, MailRuleKind, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeConnectionDiagnostic, NativeDeviceStartResponse, NativeDraft, NativeLocalSearchResponse, NativeMailboxResponse, NativeMailRule, NativeMailRuleSnapshot, NativeMessageResponse, NativeOutboxActionResponse, NativeOutboxItem, NativeOutboxRecallResponse, NativeOutboxSnapshot, NativeQueueStatus, NativeSearchResponse, NativeSendResponse, NativeSnoozeSnapshot, NativeSyncItem, NativeSyncResponse, NativeUndoSendResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 const AccountSignatureSettings = lazy(async () => ({ default: (await import('./components/AccountSignatureSettings')).AccountSignatureSettings }))
 const ConfirmDialog = lazy(async () => ({ default: (await import('./components/ConfirmDialog')).ConfirmDialog }))
@@ -25,17 +28,14 @@ const ExternalLinkDialog = lazy(async () => ({ default: (await import('./compone
 const MailRuleManager = lazy(async () => ({ default: (await import('./components/MailRuleManager')).MailRuleManager }))
 const OutboxDetail = lazy(async () => ({ default: (await import('./components/OutboxDetail')).OutboxDetail }))
 const ComposeModal = lazy(async () => ({ default: (await import('./components/ComposeModal')).ComposeModal }))
+const AccountModal = lazy(async () => ({ default: (await import('./components/AccountModal')).AccountModal }))
+const HelpModal = lazy(async () => ({ default: (await import('./components/HelpModal')).HelpModal }))
 
 type ToastTone = 'info' | 'success' | 'error'
 type UndoSendSeconds = 0 | 5 | 10 | 20 | 30
 type ToastAction = { kind: 'undo-send'; accountId: string; outboxId: string; draftId?: string }
 type Toast = { id: number; message: string; tone: ToastTone; durationMs: number; action?: ToastAction }
 type ToastOptions = { action?: ToastAction; durationMs?: number; onExpire?: () => void }
-type DeviceFlowState = { sessionId: string; userCode: string; verificationUri: string; message?: string; retryAfter: number; status: 'pending' | 'complete' | 'error' }
-type ConnectionDiagnosticViewState =
-  | { phase: 'checking' }
-  | { phase: 'ready'; result: NativeConnectionDiagnostic }
-  | { phase: 'error'; message: string }
 type ActionMenu = 'bulk' | 'message'
 type MobilePane = 'list' | 'reading'
 type DisplayDensity = 'compact' | 'comfortable'
@@ -129,15 +129,6 @@ function connectionDiagnosticError(error: unknown) {
   if (/auth|credential|login|password|authorization/i.test(message)) return '当前凭据不可用，请重新授权后再检测'
   return '暂时无法完成连接检测，请检查网络后重试'
 }
-
-const diagnosticStatusLabels = {
-  ok: '连接正常',
-  authentication: '需要重新授权',
-  'rate-limit': '服务商暂时限流',
-  network: '网络不可达',
-  tls: '安全连接失败',
-  provider: '服务商拒绝连接',
-} as const
 
 function formatCount(value: number) {
   return value > 99 ? '99+' : String(value)
@@ -528,14 +519,6 @@ function loadCustomCss() {
   return sanitizeCustomCss(stored).css
 }
 
-function ProviderMark({ provider, size = 'md' }: { provider: Provider; size?: 'sm' | 'md' | 'lg' }) {
-  const definition = providerFor(provider)
-  return (
-    <span className={`provider-mark provider-${provider} provider-mark-${size}`} style={{ '--provider-accent': definition.accent } as React.CSSProperties}>
-      {provider === 'google' ? <span className="google-mark">G</span> : provider === 'outlook' ? <span className="outlook-mark">O</span> : provider === 'qq' ? <span className="qq-mark">Q</span> : '@'}
-    </span>
-  )
-}
 
 function BrandMark() {
   return (
@@ -545,13 +528,6 @@ function BrandMark() {
   )
 }
 
-function TooltipButton({ label, onClick, children, active = false, className = '', ariaExpanded, disabled = false }: { label: string; onClick?: () => void; children: React.ReactNode; active?: boolean; className?: string; ariaExpanded?: boolean; disabled?: boolean }) {
-  return (
-    <button className={`icon-button ${active ? 'is-active' : ''} ${className}`} onClick={onClick} aria-label={label} aria-expanded={ariaExpanded} title={label} type="button" disabled={disabled}>
-      {children}
-    </button>
-  )
-}
 
 function OfflineModeQuickSetting({ enabled, onToggle }: { enabled: boolean; onToggle: () => void }) {
   return (
@@ -3364,7 +3340,7 @@ function App() {
         </motion.div>}
       </AnimatePresence>
 
-      <AnimatePresence>{isHelpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}</AnimatePresence>
+      <AnimatePresence>{isHelpOpen && <Suspense fallback={<DeferredModalLoading label="正在载入帮助中心…" />}><HelpModal onClose={() => setHelpOpen(false)} /></Suspense>}</AnimatePresence>
       <AnimatePresence>{isMailRulesOpen && <Suspense fallback={<DeferredModalLoading label="正在载入屏蔽规则…" />}><MailRuleManager accounts={accounts} rules={mailRules} initialAccountId={selectedAccountId} busyKey={mailRuleBusyKey} externalError={mailRuleError} onAdd={addMailRule} onRemove={removeMailRule} onClose={() => { if (!mailRuleBusyKey) setMailRulesOpen(false) }} /></Suspense>}</AnimatePresence>
       <AnimatePresence>{pendingExternalLink && <Suspense fallback={<DeferredModalLoading label="正在检查外部链接…" />}><ExternalLinkDialog inspection={pendingExternalLink} onClose={() => setPendingExternalLink(null)} onOpen={openExternalUrl} onError={(message) => pushToast(message, 'error')} /></Suspense>}</AnimatePresence>
       <AnimatePresence>{pendingOutboxDiscard && <Suspense fallback={<DeferredModalLoading label="正在准备确认信息…" />}><ConfirmDialog
@@ -3388,75 +3364,10 @@ function App() {
         onSent={handleComposeSent}
         onError={(message) => pushToast(message, 'error')}
       /></Suspense>}</AnimatePresence>
-      <AnimatePresence>{isAccountModalOpen && <AccountModal editingAccountId={editingAccountId} provider={provider} setProvider={changeProvider} providerDefinition={selectedProvider} accountEmail={accountEmail} setAccountEmail={setAccountEmail} authorizationCode={authorizationCode} setAuthorizationCode={setAuthorizationCode} showAuthorizationCode={showAuthorizationCode} setShowAuthorizationCode={setShowAuthorizationCode} customImapHost={customImapHost} setCustomImapHost={setCustomImapHost} customImapPort={customImapPort} setCustomImapPort={setCustomImapPort} customImapSecurity={customImapSecurity} setCustomImapSecurity={setCustomImapSecurity} customSmtpHost={customSmtpHost} setCustomSmtpHost={setCustomSmtpHost} customSmtpPort={customSmtpPort} setCustomSmtpPort={setCustomSmtpPort} customSmtpSecurity={customSmtpSecurity} setCustomSmtpSecurity={setCustomSmtpSecurity} customAuthentication={customAuthentication} setCustomAuthentication={setCustomAuthentication} deviceFlow={deviceFlow} diagnostic={editingAccountId ? connectionDiagnostics[editingAccountId] : undefined} isBusy={isAddingAccount} onClose={closeAccountModal} onOpenProvider={() => { void handleOpenProvider() }} onCopy={handleCopy} onAdd={handleAddAccount} onRemove={handleRemoveAccount} onDiagnose={() => { void handleDiagnoseAccount() }} />}</AnimatePresence>
+      <AnimatePresence>{isAccountModalOpen && <Suspense fallback={<DeferredModalLoading label="正在打开账户设置…" />}><AccountModal editingAccountId={editingAccountId} provider={provider} setProvider={changeProvider} providerDefinition={selectedProvider} accountEmail={accountEmail} setAccountEmail={setAccountEmail} authorizationCode={authorizationCode} setAuthorizationCode={setAuthorizationCode} showAuthorizationCode={showAuthorizationCode} setShowAuthorizationCode={setShowAuthorizationCode} customImapHost={customImapHost} setCustomImapHost={setCustomImapHost} customImapPort={customImapPort} setCustomImapPort={setCustomImapPort} customImapSecurity={customImapSecurity} setCustomImapSecurity={setCustomImapSecurity} customSmtpHost={customSmtpHost} setCustomSmtpHost={setCustomSmtpHost} customSmtpPort={customSmtpPort} setCustomSmtpPort={setCustomSmtpPort} customSmtpSecurity={customSmtpSecurity} setCustomSmtpSecurity={setCustomSmtpSecurity} customAuthentication={customAuthentication} setCustomAuthentication={setCustomAuthentication} deviceFlow={deviceFlow} diagnostic={editingAccountId ? connectionDiagnostics[editingAccountId] : undefined} isBusy={isAddingAccount} onClose={closeAccountModal} onOpenProvider={() => { void handleOpenProvider() }} onCopy={handleCopy} onAdd={handleAddAccount} onRemove={handleRemoveAccount} onDiagnose={() => { void handleDiagnoseAccount() }} /></Suspense>}</AnimatePresence>
       <div className="toast-stack" aria-live="polite">{toasts.map((toast) => <ToastView key={toast.id} toast={toast} onAction={(item) => { void handleUndoSend(item) }} />)}</div>
     </div>
   )
 }
-
-function HelpModal({ onClose }: { onClose: () => void }) {
-  return <motion.div className="modal-backdrop help-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="help-modal" initial={{ opacity: 0, y: 14, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 8, scale: 0.98 }} role="dialog" aria-modal="true" aria-labelledby="help-title"><div className="modal-header"><div><Icon name="help" size={21} /><h2 id="help-title">MailGo 帮助中心</h2></div><TooltipButton label="关闭帮助中心" onClick={onClose}><Icon name="close" size={19} /></TooltipButton></div><div className="help-modal-body"><section><h3>常用快捷键</h3><div className="shortcut-row"><span>写邮件</span><kbd>C</kbd></div><div className="shortcut-row"><span>聚焦搜索</span><kbd>Ctrl K</kbd></div><div className="shortcut-row"><span>回复当前邮件</span><kbd>R</kbd></div><div className="shortcut-row"><span>关闭弹窗</span><kbd>Esc</kbd></div></section><section><h3>账户与同步</h3><p>Google 与 Outlook 优先使用 OAuth 安全授权；QQ 邮箱和自定义 IMAP/SMTP 使用服务商生成的授权码或应用密码。</p><p>同步失败时，邮件仍保留在本地缓存；离线状态下的归档、删除和已读操作会在恢复连接后重放。</p></section><section><h3>隐私与安全</h3><p>授权凭据只交给本机安全存储。账户导出只包含脱敏元数据，导入另一台电脑后必须重新授权。HTML 邮件默认屏蔽远程图片，避免追踪像素；需要时可在设置中显式开启。</p></section></div><div className="modal-footer"><span><Icon name="shieldCheck" size={17} />MailGo 运行在本机，数据由你控制</span><button className="gradient-button" type="button" onClick={onClose}>知道了</button></div></motion.div></motion.div>
-}
-
-function ConnectionDiagnosticChannelRow({ label, icon, phase, channel }: { label: string; icon: IconName; phase: ConnectionDiagnosticViewState['phase'] | 'idle'; channel?: NativeConnectionDiagnosticChannel }) {
-  const status = channel?.status ?? phase
-  const labelText = channel ? diagnosticStatusLabels[channel.status] : phase === 'checking' ? '检测中…' : '尚未检测'
-  return <div className={`connection-diagnostic-channel is-${status}`}><span className="connection-diagnostic-icon"><Icon name={icon} size={17} /></span><span><strong>{label}</strong><small>{labelText}{channel ? ` · ${Math.max(0, Math.round(channel.latencyMs))} ms` : ''}</small></span>{channel?.ok && <Icon name="checkCircle" size={17} />}{phase === 'checking' && !channel && <span className="loading-spinner loading-spinner-small" aria-hidden="true" />}</div>
-}
-
-function ConnectionDiagnosticCard({ diagnostic, disabled, onDiagnose }: { diagnostic?: ConnectionDiagnosticViewState; disabled: boolean; onDiagnose: () => void }) {
-  const phase = diagnostic?.phase ?? 'idle'
-  const result = diagnostic?.phase === 'ready' ? diagnostic.result : undefined
-  return <section className={`connection-diagnostic is-${phase}`} aria-label="收发连接检测"><div className="connection-diagnostic-heading"><span><Icon name="cloud" size={16} /><span><strong>收发连接检测</strong><small>只登录并发送 NOOP，不会发送邮件</small></span></span><button type="button" onClick={onDiagnose} disabled={disabled || phase === 'checking'}><Icon name="rotate" size={14} />{phase === 'checking' ? '检测中…' : '开始检测'}</button></div><div className="connection-diagnostic-grid"><ConnectionDiagnosticChannelRow label="IMAP 收件" icon="inbox" phase={phase} channel={result?.incoming} /><ConnectionDiagnosticChannelRow label="SMTP 发件" icon="send" phase={phase} channel={result?.outgoing} /></div>{diagnostic?.phase === 'error' && <p role="alert"><Icon name="info" size={14} />{diagnostic.message}</p>}</section>
-}
-
-interface AccountModalProps {
-  editingAccountId: string | null
-  provider: Provider
-  setProvider: (provider: Provider) => void
-  providerDefinition: ReturnType<typeof providerFor>
-  accountEmail: string
-  setAccountEmail: (value: string) => void
-  authorizationCode: string
-  setAuthorizationCode: (value: string) => void
-  showAuthorizationCode: boolean
-  setShowAuthorizationCode: (value: boolean) => void
-  customImapHost: string
-  setCustomImapHost: (value: string) => void
-  customImapPort: string
-  setCustomImapPort: (value: string) => void
-  customImapSecurity: string
-  setCustomImapSecurity: (value: string) => void
-  customSmtpHost: string
-  setCustomSmtpHost: (value: string) => void
-  customSmtpPort: string
-  setCustomSmtpPort: (value: string) => void
-  customSmtpSecurity: string
-  setCustomSmtpSecurity: (value: string) => void
-  customAuthentication: string
-  setCustomAuthentication: (value: string) => void
-  deviceFlow: DeviceFlowState | null
-  diagnostic?: ConnectionDiagnosticViewState
-  isBusy: boolean
-  onClose: () => void
-  onOpenProvider: () => void
-  onCopy: () => void
-  onAdd: () => void
-  onRemove: () => void
-  onDiagnose: () => void
-}
-
-function AccountModal({ editingAccountId, provider, setProvider, providerDefinition, accountEmail, setAccountEmail, authorizationCode, setAuthorizationCode, showAuthorizationCode, setShowAuthorizationCode, customImapHost, setCustomImapHost, customImapPort, setCustomImapPort, customImapSecurity, setCustomImapSecurity, customSmtpHost, setCustomSmtpHost, customSmtpPort, setCustomSmtpPort, customSmtpSecurity, setCustomSmtpSecurity, customAuthentication, setCustomAuthentication, deviceFlow, diagnostic, isBusy, onClose, onOpenProvider, onCopy, onAdd, onRemove, onDiagnose }: AccountModalProps) {
-  const isOAuth = customAuthentication === 'oauth2'
-  const credentialLabel = isBusy ? '正在保存…' : isOAuth ? '手动授权码（可选）' : providerDefinition.requiresAuthCode ? '授权码' : '登录凭据'
-  const guideTitle = isOAuth ? '如何完成安全授权？' : '如何获取授权码？'
-  const guide = isOAuth
-    ? provider === 'outlook'
-      ? ['打开 Microsoft 设备验证页面', '输入 MailGo 显示的设备代码', '完成账户授权后返回 MailGo']
-      : ['点击开始授权并打开服务商登录页', '在服务商页面确认 MailGo 的访问权限', '完成后返回 MailGo，系统会自动保存令牌']
-    : providerDefinition.guide
-  return <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="account-modal" initial={{ opacity: 0, y: 14, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 8, scale: 0.98 }} role="dialog" aria-modal="true" aria-labelledby="account-modal-title"><div className="modal-header"><div><Icon name="user" size={21} /><h2 id="account-modal-title">{editingAccountId ? '重新授权账户' : '添加账户'}</h2></div><TooltipButton label="关闭" onClick={onClose} disabled={isBusy}><Icon name="close" size={19} /></TooltipButton></div><div className="account-modal-body"><div className="provider-chooser">{providerDefinitions.map((item) => <button key={item.id} type="button" className={`provider-option ${provider === item.id ? 'is-selected' : ''}`} onClick={() => setProvider(item.id)} disabled={isBusy}><ProviderMark provider={item.id} size="md" /><span><strong>{item.label}</strong><small>{item.description}</small></span>{provider === item.id && <Icon name="checkCircle" size={19} />}</button>)}</div><div className="account-form"><label>邮箱地址<input type="email" value={accountEmail} onChange={(event) => setAccountEmail(event.target.value)} placeholder={provider === 'qq' ? 'yourname@qq.com' : 'name@example.com'} autoFocus disabled={isBusy} /></label>{(provider === 'google' || provider === 'outlook') && <label>认证方式<select value={customAuthentication} onChange={(event) => setCustomAuthentication(event.target.value)} disabled={isBusy}><option value="oauth2">OAuth2 安全授权</option>{provider === 'google' && <option value="app-password">应用专用密码</option>}</select></label>}<label><span className="label-with-action">{credentialLabel}<button type="button" onClick={onOpenProvider} disabled={isBusy}>{isOAuth ? '打开授权页面' : '如何获取授权码？'} <Icon name="link" size={13} /></button></span><span className="secret-input"><input type={showAuthorizationCode ? 'text' : 'password'} value={authorizationCode} onChange={(event) => setAuthorizationCode(event.target.value)} placeholder={isOAuth ? 'OAuth 授权完成后无需粘贴' : '粘贴邮箱授权码'} disabled={isBusy} /><button type="button" onClick={() => setShowAuthorizationCode(!showAuthorizationCode)} aria-label={showAuthorizationCode ? '隐藏授权码' : '显示授权码'} disabled={isBusy}><Icon name={showAuthorizationCode ? 'eyeSlash' : 'eye'} size={17} /></button><button type="button" onClick={onCopy} aria-label="复制授权码" disabled={isBusy}><Icon name="copy" size={17} /></button></span></label>{deviceFlow && <div className="device-flow-box"><div className="device-flow-heading"><span><Icon name="shieldCheck" size={16} />Outlook 设备授权</span><strong>{deviceFlow.status === 'complete' ? '已完成' : deviceFlow.status === 'error' ? '需要重试' : '等待验证'}</strong></div><code>{deviceFlow.userCode}</code><p>{deviceFlow.status === 'complete' ? '设备验证已完成，可以开始同步。' : (deviceFlow.message || '请打开验证页完成 Microsoft 账户授权。')}</p><small>{deviceFlow.verificationUri}</small>{deviceFlow.status !== 'complete' && <button type="button" onClick={onOpenProvider} disabled={isBusy}>{deviceFlow.status === 'error' ? '重新开始授权' : '重新打开验证页'} <Icon name="link" size={13} /></button>}</div>}{provider === 'other' && <div className="custom-transport-fields"><div className="transport-heading"><Icon name="settings" size={15} />自定义服务器</div><div className="transport-row"><label>IMAP 主机<input value={customImapHost} onChange={(event) => setCustomImapHost(event.target.value)} placeholder="imap.example.com" disabled={isBusy} /></label><label>端口<input type="number" min="1" max="65535" value={customImapPort} onChange={(event) => setCustomImapPort(event.target.value)} disabled={isBusy} /></label><label>安全<input value={customImapSecurity} onChange={(event) => setCustomImapSecurity(event.target.value)} placeholder="tls / starttls" disabled={isBusy} /></label></div><div className="transport-row"><label>SMTP 主机<input value={customSmtpHost} onChange={(event) => setCustomSmtpHost(event.target.value)} placeholder="smtp.example.com" disabled={isBusy} /></label><label>端口<input type="number" min="1" max="65535" value={customSmtpPort} onChange={(event) => setCustomSmtpPort(event.target.value)} disabled={isBusy} /></label><label>安全<input value={customSmtpSecurity} onChange={(event) => setCustomSmtpSecurity(event.target.value)} placeholder="tls / starttls" disabled={isBusy} /></label></div><label>认证方式<select value={customAuthentication} onChange={(event) => setCustomAuthentication(event.target.value)} disabled={isBusy}><option value="password">密码 / 授权码</option><option value="app-password">应用专用密码</option><option value="oauth2">OAuth2 Bearer Token</option></select></label></div>}{editingAccountId && <ConnectionDiagnosticCard diagnostic={diagnostic} disabled={isBusy} onDiagnose={onDiagnose} />}<div className="guide-box"><div className="guide-heading"><span><Icon name="key" size={17} />{guideTitle}</span><em>{providerDefinition.label}</em></div>{guide.map((step, index) => <div className="guide-step" key={step}><span className="step-number">{index + 1}</span><span><strong>{step}</strong><small>{isOAuth ? (index === 0 ? 'MailGo 会在本机发起安全授权流程' : index === 1 ? '只授予邮件同步所需的账户权限' : '令牌仅保存到本机系统安全存储') : (index === 0 ? `登录 ${providerDefinition.label}，打开设置页面` : index === 1 ? '找到第三方客户端或账户安全选项' : '复制生成的授权凭据，返回此处粘贴')}</small></span>{index === 0 && <button type="button" onClick={onOpenProvider} disabled={isBusy}>{isOAuth ? '开始授权' : '前往设置'} <Icon name="link" size={13} /></button>}</div>)}</div></div></div><div className="modal-footer"><span><Icon name="shieldCheck" size={17} />凭据仅存本机 · 邮件后台同步</span><div>{editingAccountId && <button className="danger-button" type="button" onClick={onRemove} disabled={isBusy}><Icon name="trash" size={16} />移除账户</button>}<button className="secondary-button" type="button" onClick={onClose} disabled={isBusy}>取消</button><button className="gradient-button" type="button" onClick={onAdd} disabled={isBusy}><Icon name="rotate" size={17} />{isBusy ? '正在保存…' : editingAccountId ? '保存并进入' : '添加并进入'}</button></div></div></motion.div></motion.div>
-}
-
 
 export default App

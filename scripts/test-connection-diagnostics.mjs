@@ -5,6 +5,7 @@ const mainSource = readFileSync(new URL('../native/src/main.rs', import.meta.url
 const syncSource = readFileSync(new URL('../native/src/sync.rs', import.meta.url), 'utf8')
 const sendSource = readFileSync(new URL('../native/src/send.rs', import.meta.url), 'utf8')
 const appSource = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8')
+const accountModalSource = readFileSync(new URL('../src/components/AccountModal.tsx', import.meta.url), 'utf8')
 
 function sourceSlice(source, startMarker, endMarker) {
   const start = source.indexOf(startMarker)
@@ -35,7 +36,7 @@ assert.doesNotMatch(smtpDiagnostic, /\.send\(/)
 assert.doesNotMatch(smtpDiagnostic, /build_message/)
 
 assert.match(appSource, /invoke<NativeConnectionDiagnostic>\('accounts\.diagnose'/)
-assert.match(appSource, /只登录并发送 NOOP，不会发送邮件/)
+assert.match(accountModalSource, /只登录并发送 NOOP，不会发送邮件/)
 assert.match(appSource, /connectionDiagnostics\[editingAccountId\]/)
 
 console.log('Connection diagnostics are parallel, account-scoped, privacy-safe, and non-sending.')
