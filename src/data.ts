@@ -53,6 +53,7 @@ export const sampleAccounts: MailAccount[] = [
     accent: '#4285f4',
     status: 'synced',
     lastSync: '刚刚同步',
+    signature: '',
   },
   {
     id: 'qq-personal',
@@ -63,6 +64,7 @@ export const sampleAccounts: MailAccount[] = [
     accent: '#43a5f5',
     status: 'synced',
     lastSync: '2 分钟前',
+    signature: '',
   },
   {
     id: 'outlook-projects',
@@ -73,6 +75,7 @@ export const sampleAccounts: MailAccount[] = [
     accent: '#2489d8',
     status: 'offline',
     lastSync: '离线缓存 · 16:42',
+    signature: '',
   },
 ]
 

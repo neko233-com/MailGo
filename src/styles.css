@@ -508,8 +508,12 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .compose-recipient-row > label { display: flex; align-items: center; gap: 9px; height: 48px; padding: 0 0 0 17px; color: var(--muted); font-size: 11px; }
 .compose-modal > label input { height: 30px; padding: 0; border: 0; background: transparent; box-shadow: none; font-size: 12px; }
 .compose-recipient-row input { height: 30px; padding: 0; border: 0; background: transparent; box-shadow: none; font-size: 12px; }
+.compose-modal > label > input, .compose-recipient-row > label > input { width: auto; min-width: 0; flex: 1; }
 .compose-body { width: 100%; min-height: 245px; display: block; resize: vertical; padding: 17px; border: 0; outline: 0; color: var(--text); background: transparent; font-size: 13px; line-height: 1.7; }
 .compose-body::placeholder { color: var(--muted); }
+.compose-signature-preview { max-height: 92px; overflow: auto; padding: 0 17px 11px; color: var(--muted); font-size: 10px; }
+.compose-signature-preview > span { display: block; margin-bottom: 5px; color: var(--accent); font-size: 9px; }
+.compose-signature-preview p { margin: 0; padding-left: 9px; border-left: 2px solid var(--line-strong); line-height: 1.45; overflow-wrap: anywhere; white-space: pre-wrap; }
 .compose-draft-status { display: flex; align-items: center; gap: 6px; padding: 0 17px 9px; color: var(--muted); font-size: 10px; }
 .compose-format-note { display: flex; align-items: center; gap: 6px; padding: 0 17px 10px; color: var(--accent); font-size: 11px; }
 .compose-attachments { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 17px 10px; }
@@ -551,6 +555,22 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .css-row { display: grid; align-items: start; }
 .css-row > span { width: 100%; }
 .css-row textarea { width: 100%; min-height: 56px; resize: vertical; padding: 8px; border: 1px solid var(--line); border-radius: 6px; outline: 0; color: var(--text); background: var(--bg); font-family: ui-monospace, monospace; font-size: 10px; }
+.settings-signature { display: grid; gap: 8px; padding: 12px 15px; border-bottom: 1px solid var(--line); }
+.settings-signature-heading, .settings-signature-heading > span, .settings-signature-foot { display: flex; align-items: center; }
+.settings-signature-heading { justify-content: space-between; gap: 10px; }
+.settings-signature-heading > span { min-width: 0; gap: 9px; color: var(--muted-strong); }
+.settings-signature-heading > span > span { min-width: 0; display: grid; gap: 2px; }
+.settings-signature-heading strong { color: var(--text); font-size: 11px; }
+.settings-signature-heading small { color: var(--muted); font-size: 9px; }
+.settings-signature select { min-width: 0; max-width: 136px; height: 28px; padding: 0 7px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted-strong); background: var(--bg); font-size: 10px; }
+.settings-signature textarea { width: 100%; min-height: 68px; resize: vertical; padding: 8px 9px; border: 1px solid var(--line); border-radius: 6px; outline: 0; color: var(--text); background: var(--bg); font-size: 10px; line-height: 1.45; }
+.settings-signature textarea:focus { border-color: var(--accent); }
+.settings-signature-foot { justify-content: space-between; gap: 10px; color: var(--muted); font-size: 9px; }
+.settings-signature-foot.is-saved > span { color: var(--success); }
+.settings-signature-foot.is-error > span { color: var(--danger); }
+.settings-signature-foot button { flex: 0 0 auto; height: 27px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 6px; color: var(--accent); background: var(--surface-strong); font-size: 10px; }
+.settings-signature-foot button:hover:not(:disabled) { color: var(--text); background: var(--surface-hover); }
+.settings-signature.is-empty { display: flex; align-items: center; color: var(--muted); font-size: 10px; }
 .settings-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 12px; }
 .settings-actions button { min-height: 33px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted-strong); background: var(--surface-strong); font-size: 10px; }
 .settings-actions button:hover { color: var(--text); border-color: var(--line-strong); }
@@ -562,85 +582,106 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .toast-error svg { color: var(--danger); }
 .toast-info svg { color: #8ba1ff; }
 
-.app-shell.is-compact-density { font-size: 12px; }
-.app-shell.is-compact-density .titlebar { height: 42px; gap: 6px; }
-.app-shell.is-compact-density .titlebar-brand { font-size: 15px; }
-.app-shell.is-compact-density .brand-mark { width: 22px; height: 22px; flex-basis: 22px; }
-.app-shell.is-compact-density .titlebar-menu { width: 28px; height: 28px; flex-basis: 28px; }
-.app-shell.is-compact-density .titlebar-search .search-wrap { height: 30px; }
-.app-shell.is-compact-density .titlebar-utilities .icon-button { width: 27px; height: 27px; }
-.app-shell.is-compact-density .sync-summary { height: 27px; padding-inline: 7px; }
-.app-shell.is-compact-density .window-controls .icon-button { width: 29px; height: 26px; }
-.app-shell.is-compact-density .workspace { height: calc(100% - 42px); }
-.app-shell.is-compact-density .sidebar { padding-block: 5px 2px; }
-.app-shell.is-compact-density .compose-button { min-height: 32px; margin-bottom: 4px; border-radius: 9px; }
-.app-shell.is-compact-density .nav-row { height: 28px; }
+.app-shell.is-compact-density { font-size: 11px; }
+.app-shell.is-compact-density .titlebar { height: 38px; gap: 5px; padding-inline: 7px; }
+.app-shell.is-compact-density .titlebar-brand { font-size: 14px; }
+.app-shell.is-compact-density .brand-mark { width: 20px; height: 20px; flex-basis: 20px; }
+.app-shell.is-compact-density .titlebar-menu { width: 26px; height: 26px; flex-basis: 26px; }
+.app-shell.is-compact-density .titlebar-search .search-wrap { height: 27px; padding-inline: 9px; }
+.app-shell.is-compact-density .titlebar-search .search-wrap input { font-size: 11px; }
+.app-shell.is-compact-density .titlebar-utilities .icon-button { width: 25px; height: 25px; }
+.app-shell.is-compact-density .sync-summary { height: 25px; padding-inline: 6px; font-size: 9px; }
+.app-shell.is-compact-density .window-controls .icon-button { width: 27px; height: 24px; }
+.app-shell.is-compact-density .workspace { height: calc(100% - 38px); }
+.app-shell.is-compact-density .sidebar { padding: 4px 6px 2px; }
+.app-shell.is-compact-density .compose-button { min-height: 29px; margin-bottom: 3px; border-radius: 8px; font-size: 11px; }
+.app-shell.is-compact-density .nav-row { height: 26px; font-size: 11px; }
 .app-shell.is-compact-density .server-folders { margin-top: 5px; padding-top: 5px; }
 .app-shell.is-compact-density .server-folders-heading { padding-bottom: 4px; }
 .app-shell.is-compact-density .server-folders-list { max-height: min(100px, 16vh); }
-.app-shell.is-compact-density .server-folder-row { height: 25px; }
+.app-shell.is-compact-density .server-folder-row { height: 23px; }
 .app-shell.is-compact-density .sidebar-section { margin-top: 5px; padding-top: 5px; }
 .app-shell.is-compact-density .section-label-row { padding-bottom: 4px; font-size: 10px; }
-.app-shell.is-compact-density .smart-row { height: 25px; }
-.app-shell.is-compact-density .smart-dot { width: 20px; height: 20px; }
-.app-shell.is-compact-density .account-row { min-height: 34px; padding-block: 2px; }
-.app-shell.is-compact-density .account-row .provider-mark { width: 22px; height: 22px; flex-basis: 22px; font-size: 11px; }
+.app-shell.is-compact-density .smart-row { height: 23px; }
+.app-shell.is-compact-density .smart-dot { width: 18px; height: 18px; }
+.app-shell.is-compact-density .account-row { min-height: 31px; padding-block: 1px; }
+.app-shell.is-compact-density .account-row .provider-mark { width: 20px; height: 20px; flex-basis: 20px; font-size: 10px; }
 .app-shell.is-compact-density .account-copy { gap: 1px; }
 .app-shell.is-compact-density .storage-bar { padding-block: 5px 3px; }
 .app-shell.is-compact-density .storage-track { margin-block: 6px; }
-.app-shell.is-compact-density .sidebar-footer { height: 27px; }
-.app-shell.is-compact-density .panel-toolbar { height: 36px; padding-block: 2px; }
+.app-shell.is-compact-density .sidebar-footer { height: 25px; }
+.app-shell.is-compact-density .panel-toolbar { height: 32px; padding: 1px 8px 1px 11px; }
 .app-shell.is-compact-density .mailbox-heading { gap: 0; }
-.app-shell.is-compact-density .mailbox-heading strong { font-size: 14px; }
-.app-shell.is-compact-density .inbox-tabs { height: 31px; }
-.app-shell.is-compact-density .inbox-tabs button { font-size: 10px; }
-.app-shell.is-compact-density .list-toolbar { height: 29px; }
-.app-shell.is-compact-density .toolbar-action { height: 25px; }
+.app-shell.is-compact-density .mailbox-heading strong { font-size: 13px; }
+.app-shell.is-compact-density .inbox-tabs { height: 28px; }
+.app-shell.is-compact-density .inbox-tabs button { font-size: 9px; }
+.app-shell.is-compact-density .list-toolbar { height: 26px; }
+.app-shell.is-compact-density .toolbar-action { height: 23px; font-size: 9px; }
 .app-shell.is-compact-density .mail-group-label { padding-inline: 16px; font-size: 9px; }
-.app-shell.is-compact-density .mail-row { min-height: 44px; padding-block: 2px; }
-.app-shell.is-compact-density .mail-row-copy p { line-height: 1.15; }
-.app-shell.is-compact-density .list-loading-strip { min-height: 26px; }
-.app-shell.is-compact-density .list-footer { height: 29px; }
-.app-shell.is-compact-density .reading-toolbar { height: 36px; }
-.app-shell.is-compact-density .reading-actions .icon-button { width: 26px; height: 26px; }
-.app-shell.is-compact-density .reading-scroll { padding: 11px clamp(12px, 1.5vw, 19px) 15px; }
-.app-shell.is-compact-density .reading-heading h1 { font-size: clamp(15px, 1.05vw, 17px); }
+.app-shell.is-compact-density .mail-row { min-height: 40px; padding-block: 1px; }
+.app-shell.is-compact-density .mail-row-top strong { font-size: 11px; }
+.app-shell.is-compact-density .mail-row-top time { font-size: 9px; }
+.app-shell.is-compact-density .mail-row-subject { font-size: 10px; }
+.app-shell.is-compact-density .mail-row-copy p { font-size: 8.5px; line-height: 1.1; }
+.app-shell.is-compact-density .star-button { width: 22px; height: 22px; flex-basis: 22px; }
+.app-shell.is-compact-density .list-loading-strip { min-height: 24px; }
+.app-shell.is-compact-density .list-footer { height: 26px; }
+.app-shell.is-compact-density .reading-toolbar { height: 32px; }
+.app-shell.is-compact-density .reading-actions .icon-button { width: 24px; height: 24px; }
+.app-shell.is-compact-density .reading-scroll { padding: 9px clamp(10px, 1.25vw, 16px) 12px; }
+.app-shell.is-compact-density .reading-heading h1 { font-size: clamp(14px, .95vw, 16px); }
 .app-shell.is-compact-density .message-tags { gap: 4px; margin-top: 6px; }
 .app-shell.is-compact-density .tag { min-height: 20px; padding-inline: 6px; font-size: 9px; }
 .app-shell.is-compact-density .conversation-stack { margin-top: 8px; }
-.app-shell.is-compact-density .conversation-message { min-height: 50px; padding-block: 6px; }
-.app-shell.is-compact-density .sender-row { margin-top: 9px; padding-bottom: 8px; }
-.app-shell.is-compact-density .sender-row .avatar-lg { width: 34px; height: 34px; flex-basis: 34px; font-size: 12px; }
-.app-shell.is-compact-density .sender-copy strong { font-size: 12px; }
+.app-shell.is-compact-density .conversation-message { min-height: 44px; padding-block: 5px; }
+.app-shell.is-compact-density .sender-row { margin-top: 7px; padding-bottom: 6px; }
+.app-shell.is-compact-density .sender-row .avatar-lg { width: 30px; height: 30px; flex-basis: 30px; font-size: 11px; }
+.app-shell.is-compact-density .sender-copy strong { font-size: 11px; }
 .app-shell.is-compact-density .recipient { margin-top: 3px; font-size: 10px; }
-.app-shell.is-compact-density .message-content { padding-block: 9px 8px; font-size: 12px; line-height: 1.48; }
-.app-shell.is-compact-density .message-content p { margin-bottom: 7px; }
+.app-shell.is-compact-density .message-content { padding-block: 7px 6px; font-size: 11.5px; line-height: 1.44; }
+.app-shell.is-compact-density .message-content p { margin-bottom: 6px; }
 .app-shell.is-compact-density .content-mode-row { margin-bottom: 11px; padding: 7px 9px; font-size: 10px; }
-.app-shell.is-compact-density .html-rendered { padding: 10px; font-size: 12px; line-height: 1.48; }
+.app-shell.is-compact-density .html-rendered { padding: 8px; font-size: 11.5px; line-height: 1.44; }
 .app-shell.is-compact-density .attachments { padding-block: 7px 9px; }
 .app-shell.is-compact-density .attachments-heading { margin-bottom: 8px; }
 .app-shell.is-compact-density .attachment-grid { gap: 7px; }
-.app-shell.is-compact-density .attachment-card { height: 42px; padding-block: 4px; }
+.app-shell.is-compact-density .attachment-card { height: 38px; padding-block: 3px; }
 .app-shell.is-compact-density .file-glyph { width: 26px; height: 31px; flex-basis: 26px; }
 .app-shell.is-compact-density .attachment-copy { gap: 2px; }
 .app-shell.is-compact-density .reply-composer { margin-top: 8px; }
-.app-shell.is-compact-density .reply-input { min-height: 60px; padding-block: 8px 6px; }
+.app-shell.is-compact-density .reply-input { min-height: 52px; padding-block: 6px 5px; }
 .app-shell.is-compact-density .reply-tools { margin-top: 8px; }
-.app-shell.is-compact-density .auth-panel { top: 42px; }
+.app-shell.is-compact-density .auth-panel { top: 38px; }
+.app-shell.is-compact-density .compose-modal { width: min(560px, calc(100vw - 40px)); }
+.app-shell.is-compact-density .compose-header { height: 40px; padding-left: 13px; }
+.app-shell.is-compact-density .compose-modal > label,
+.app-shell.is-compact-density .compose-recipient-row > label { height: 38px; padding-left: 13px; }
+.app-shell.is-compact-density .compose-recipient-row input,
+.app-shell.is-compact-density .compose-modal > label input { font-size: 11px; }
+.app-shell.is-compact-density .compose-body { min-height: 178px; padding: 12px 13px; font-size: 11.5px; line-height: 1.55; }
+.app-shell.is-compact-density .compose-signature-preview { padding: 0 13px 8px; }
+.app-shell.is-compact-density .compose-footer { padding: 6px 9px; }
+.app-shell.is-compact-density .compose-footer .gradient-button { min-height: 32px; }
+.app-shell.is-compact-density .settings-popover { top: 44px; right: 126px; width: 330px; max-height: calc(100vh - 54px); border-radius: 10px; }
+.app-shell.is-compact-density .settings-title { height: 40px; }
+.app-shell.is-compact-density .settings-row { gap: 10px; padding: 9px 12px; }
+.app-shell.is-compact-density .settings-signature { gap: 6px; padding: 9px 12px; }
+.app-shell.is-compact-density .settings-signature textarea { min-height: 58px; }
+.app-shell.is-compact-density .settings-actions { padding: 9px; }
 
 @media (max-width: 1400px) {
-  .workspace { grid-template-columns: 196px minmax(320px, 360px) minmax(0, 1fr); }
-  .workspace.is-sidebar-collapsed { grid-template-columns: 56px minmax(320px, 360px) minmax(0, 1fr); }
-  .titlebar-brand { width: 184px; flex-basis: 184px; }
+  .workspace { grid-template-columns: 188px minmax(304px, 332px) minmax(0, 1fr); }
+  .workspace.is-sidebar-collapsed { grid-template-columns: 52px minmax(304px, 332px) minmax(0, 1fr); }
+  .titlebar-brand { width: 174px; flex-basis: 174px; }
   .titlebar-search { width: min(620px, 44vw); }
   .reading-actions > span { display: none; }
   .reading-scroll { padding-inline: 20px; }
 }
 
 @media (max-width: 1100px) {
-  .workspace { grid-template-columns: 176px minmax(292px, 320px) minmax(0, 1fr); }
-  .workspace.is-sidebar-collapsed { grid-template-columns: 56px minmax(292px, 320px) minmax(0, 1fr); }
-  .titlebar-brand { width: 164px; flex-basis: 164px; }
+  .workspace { grid-template-columns: 168px minmax(282px, 300px) minmax(0, 1fr); }
+  .workspace.is-sidebar-collapsed { grid-template-columns: 52px minmax(282px, 300px) minmax(0, 1fr); }
+  .titlebar-brand { width: 154px; flex-basis: 154px; }
   .titlebar-search { width: min(500px, 40vw); }
   .sync-summary { width: 32px; padding: 0; justify-content: center; overflow: hidden; color: transparent; }
   .reading-scroll { padding-inline: 16px; }
@@ -654,14 +695,14 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 @media (max-width: 900px) {
   html, body, #root { min-width: 0; }
   body { min-width: 0; }
-  .titlebar { height: 52px; padding: 0 8px 0 10px; }
+  .titlebar, .app-shell.is-compact-density .titlebar { height: 44px; padding: 0 8px 0 10px; }
   .titlebar { gap: 5px; }
   .titlebar-brand { width: auto; min-width: 0; flex: 0 0 auto; gap: 5px; font-size: 17px; }
   .titlebar-brand > span:last-child { display: none; }
   .titlebar-menu { width: 32px; height: 32px; flex-basis: 32px; }
   .titlebar-brand .brand-mark { transform: scale(.84); transform-origin: left center; margin-right: -4px; }
   .titlebar-search { min-width: 80px; width: auto; flex: 1; }
-  .titlebar-search .search-wrap { height: 38px; padding-inline: 11px; }
+  .titlebar-search .search-wrap, .app-shell.is-compact-density .titlebar-search .search-wrap { height: 34px; padding-inline: 11px; }
   .titlebar-search .search-wrap kbd, .titlebar-search .search-status { display: none; }
   .titlebar-utilities { margin-left: 0; }
   .titlebar-utilities > :not(:nth-child(2)) { display: none; }
@@ -670,10 +711,10 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
   .window-controls .icon-button { width: 30px; height: 30px; }
   .window-controls .icon-button:not(.mobile-only-button):not(.close-button) { display: none; }
   .mobile-only-button { display: inline-flex !important; }
-  .workspace, .app-shell.is-compact-density .workspace { position: relative; height: calc(100% - 52px); min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); }
+  .workspace, .app-shell.is-compact-density .workspace { position: relative; height: calc(100% - 44px); min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); }
   .workspace.is-sidebar-collapsed { grid-template-columns: minmax(0, 1fr); }
-  .mobile-overlay { position: fixed; inset: 52px 0 0; z-index: 20; display: block; width: 100%; height: auto; padding: 0; border-radius: 0; background: rgba(2, 6, 17, .52); cursor: default; }
-  .sidebar { position: fixed; top: 52px; bottom: 0; left: 0; z-index: 21; width: min(290px, 86vw); transform: translateX(-102%); box-shadow: 18px 0 44px rgba(2, 7, 18, .34); transition: transform .2s ease; }
+  .mobile-overlay { position: fixed; inset: 44px 0 0; z-index: 20; display: block; width: 100%; height: auto; padding: 0; border-radius: 0; background: rgba(2, 6, 17, .52); cursor: default; }
+  .sidebar { position: fixed; top: 44px; bottom: 0; left: 0; z-index: 21; width: min(290px, 86vw); transform: translateX(-102%); box-shadow: 18px 0 44px rgba(2, 7, 18, .34); transition: transform .2s ease; }
   .workspace.is-sidebar-collapsed .sidebar { width: min(290px, 86vw); padding: 14px 10px 8px; }
   .workspace.is-sidebar-collapsed .compose-button { width: 136px; min-height: 42px; }
   .workspace.is-sidebar-collapsed .compose-button > span,
@@ -712,7 +753,7 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
   .reading-heading h1 { font-size: 18px; }
   .sender-row { gap: 8px; }
   .sender-row > time { display: none; }
-  .auth-panel, .app-shell.is-compact-density .auth-panel { position: fixed; top: 52px; right: 0; bottom: 0; z-index: 24; display: flex; width: min(340px, calc(100vw - 24px)); transform: translateX(102%); box-shadow: -18px 0 44px rgba(2, 7, 18, .34); transition: transform .2s ease; }
+  .auth-panel, .app-shell.is-compact-density .auth-panel { position: fixed; top: 44px; right: 0; bottom: 0; z-index: 24; display: flex; width: min(340px, calc(100vw - 24px)); transform: translateX(102%); box-shadow: -18px 0 44px rgba(2, 7, 18, .34); transition: transform .2s ease; }
   .auth-panel:not(.is-mobile-open) { display: none; }
   .auth-panel.is-mobile-open { transform: translateX(0); }
   .auth-panel-reopen { top: 66px; right: 8px; z-index: 23; padding: 8px 10px; }

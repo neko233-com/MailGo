@@ -2,12 +2,14 @@ import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import appIconUrl from '../resources/icons/mailgo-64.png'
+import { AccountSignatureSettings } from './components/AccountSignatureSettings'
 import { Icon, type IconName } from './components/Icon'
 import { buildComposeThreadHeaders, type ComposeMode } from './compose-thread'
 import { sanitizeCustomCss } from './customCss'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
 import { mapWithConcurrency } from './lib/asyncPool'
 import { invoke, readNativeState } from './lib/ipc'
+import { appendAccountSignature, normalizeAccountSignature } from './signature'
 import { buildMailThreads, type MailThread } from './threading'
 import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeConnectionDiagnostic, NativeConnectionDiagnosticChannel, NativeDeviceStartResponse, NativeDraft, NativeDraftAttachment, NativeLocalSearchResponse, NativeMailboxResponse, NativeMessageResponse, NativeOutboxStatus, NativeQueueStatus, NativeSearchResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
 
@@ -34,10 +36,12 @@ const ATTACHMENT_DOWNLOAD_CONCURRENCY = 3
 const MOBILE_LAYOUT_QUERY = '(max-width: 900px)'
 const COMPACT_DENSITY_QUERY = '(max-height: 820px), (max-width: 1366px)'
 const AUTO_COLLAPSE_SIDEBAR_QUERY = '(max-width: 1366px) and (min-width: 901px)'
-const COMPACT_MAIL_GROUP_HEIGHT = 20
-const COMPACT_MAIL_ROW_HEIGHT = 44
+const COMPACT_MAIL_GROUP_HEIGHT = 18
+const COMPACT_MAIL_ROW_HEIGHT = 40
 const COMFORTABLE_MAIL_GROUP_HEIGHT = 26
 const COMFORTABLE_MAIL_ROW_HEIGHT = 54
+const MOBILE_MAIL_GROUP_HEIGHT = 24
+const MOBILE_MAIL_ROW_HEIGHT = 58
 const HTML_PRESENTATIONAL_SIZING_ATTRIBUTES = new Set([
   'border', 'cellpadding', 'cellspacing', 'face', 'height', 'nowrap', 'size', 'width',
 ])
@@ -1373,8 +1377,8 @@ function App() {
     count: virtualMailItems.length,
     getScrollElement: () => mailListRef.current,
     estimateSize: (index) => virtualMailItems[index]?.type === 'group'
-      ? (isCompactDensity ? COMPACT_MAIL_GROUP_HEIGHT : COMFORTABLE_MAIL_GROUP_HEIGHT)
-      : (isCompactDensity ? COMPACT_MAIL_ROW_HEIGHT : COMFORTABLE_MAIL_ROW_HEIGHT),
+      ? (isMobileLayout ? MOBILE_MAIL_GROUP_HEIGHT : isCompactDensity ? COMPACT_MAIL_GROUP_HEIGHT : COMFORTABLE_MAIL_GROUP_HEIGHT)
+      : (isMobileLayout ? MOBILE_MAIL_ROW_HEIGHT : isCompactDensity ? COMPACT_MAIL_ROW_HEIGHT : COMFORTABLE_MAIL_ROW_HEIGHT),
     getItemKey: getVirtualMailKey,
     overscan: 8,
     useFlushSync: false,
@@ -1382,7 +1386,7 @@ function App() {
 
   useEffect(() => {
     mailListVirtualizer.measure()
-  }, [isCompactDensity, mailListVirtualizer])
+  }, [isCompactDensity, isMobileLayout, mailListVirtualizer])
 
   const selectedVisibleMails = useMemo(
     () => visibleMails.filter((mail) => selectedMailIds.includes(mail.id)),
@@ -2195,6 +2199,7 @@ function App() {
       status: 'syncing',
       lastSync: '后台同步中…',
       authentication: customAuthentication,
+      signature: existingAccount?.signature ?? '',
       ...(provider === 'other' ? {
         imapHost: customImapHost.trim(),
         imapPort: Number(customImapPort),
@@ -2233,6 +2238,7 @@ function App() {
         email: accountEmail.trim(),
         authorizationCode,
         authentication: customAuthentication,
+        signature: existingAccount?.signature ?? '',
         ...(oauthSessionId ? { oauthSessionId } : {}),
         ...(oauthSessionId && oauthState ? { oauthState } : {}),
         ...(provider === 'other' ? {
@@ -2333,7 +2339,7 @@ function App() {
 
   const exportAccounts = () => {
     const payload = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       exportedAt: new Date().toISOString(),
       product: 'MailGo',
       warning: '出于安全原因，授权码不会导出。导入后请为每个账户重新授权。',
@@ -2349,6 +2355,7 @@ function App() {
         smtpPort: account.smtpPort,
         smtpSecurity: account.smtpSecurity,
         authentication: account.authentication,
+        signature: account.signature,
         status: 'requires-reauth' as const,
         secretRef: `mailgo://${account.id}`,
       })),
@@ -2374,7 +2381,7 @@ function App() {
     setImporting(true)
     try {
       const parsed = JSON.parse(await file.text()) as { accounts?: unknown[]; schemaVersion?: number }
-      if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.accounts)) throw new Error('不支持的配置格式')
+      if (![1, 2].includes(parsed.schemaVersion ?? -1) || !Array.isArray(parsed.accounts)) throw new Error('不支持的配置格式')
       const imported = parsed.accounts.flatMap((candidate) => {
         if (!candidate || typeof candidate !== 'object') return []
         const account = candidate as Partial<MailAccount>
@@ -2382,6 +2389,12 @@ function App() {
         const id = account.id.trim()
         const email = account.email.trim()
         if (!id || id.length > 128 || !email.includes('@') || email.length > 320) return []
+        let signature = ''
+        try {
+          signature = normalizeAccountSignature(typeof account.signature === 'string' ? account.signature : '')
+        } catch {
+          return []
+        }
         return [{
           id,
           provider: account.provider,
@@ -2398,6 +2411,7 @@ function App() {
           smtpPort: typeof account.smtpPort === 'number' ? account.smtpPort : undefined,
           smtpSecurity: typeof account.smtpSecurity === 'string' ? account.smtpSecurity.trim().slice(0, 32) : undefined,
           authentication: typeof account.authentication === 'string' ? account.authentication.trim().slice(0, 32) : undefined,
+          signature,
         }]
       }).slice(0, 64)
       if (imported.length === 0) throw new Error('配置文件中没有可导入的有效账户')
@@ -2428,6 +2442,17 @@ function App() {
       setImporting(false)
     }
   }
+
+  const saveAccountSignature = useCallback(async (accountId: string, value: string) => {
+    const signature = normalizeAccountSignature(value)
+    const saved = isNativeRuntime
+      ? await invoke<{ signature: string }>('accounts.set_signature', { accountId, signature })
+      : { signature }
+    setAccounts((current) => current.map((account) => account.id === accountId
+      ? { ...account, signature: saved.signature }
+      : account))
+    return saved.signature
+  }, [isNativeRuntime])
 
   const handleCloseWindow = () => {
     if (minimizeToTray) {
@@ -2715,11 +2740,35 @@ function App() {
       </div>
 
       <AnimatePresence>
-        {isSettingsOpen && <motion.div className="settings-popover" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}><div className="settings-title"><span><Icon name="settings" size={17} />偏好设置</span><TooltipButton label="关闭设置" onClick={() => setSettingsOpen(false)}><Icon name="close" size={17} /></TooltipButton></div><div className="settings-row"><span><Icon name={theme === 'dark' ? 'moon' : 'theme'} size={17} /><span>外观主题<small>{theme === 'dark' ? '深色 · 午夜蓝' : '浅色 · 雪白'}</small></span></span><button type="button" className="theme-switch" onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}><span className={theme === 'light' ? 'is-light' : ''}>{theme === 'dark' ? '深' : '浅'}</span></button></div><div className="settings-row"><span><Icon name="menu" size={17} /><span>界面密度<small>{displayDensity === 'compact' ? '紧凑 · 高信息密度' : viewportRequiresCompactDensity ? '窗口较小，已自动紧凑' : '舒适 · 更大间距'}</small></span></span><button type="button" aria-label="紧凑桌面布局" className={`toggle-switch ${displayDensity === 'compact' ? 'is-on' : ''}`} onClick={() => setDisplayDensity((value) => value === 'compact' ? 'comfortable' : 'compact')}><span /></button></div><label className="settings-row css-row"><span><Icon name="brush" size={17} /><span>用户 CSS<small>{sanitizedCustomCss.removedUnsafeSyntax ? '已过滤外部资源与危险语法' : '可覆盖 MailGo 视觉变量；不加载外部资源'}</small></span></span><textarea value={customCss} onChange={(event) => setCustomCss(event.target.value)} placeholder="例如：:root { --accent: #ff6b8a; }" /></label><div className="settings-row"><span><Icon name="cloud" size={17} /><span>关闭时后台运行<small>最小化到系统托盘并继续同步</small></span></span><button type="button" className={`toggle-switch ${minimizeToTray ? 'is-on' : ''}`} onClick={() => { const next = !minimizeToTray; setMinimizeToTray(next); void invoke('app.set_minimize_to_tray', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-row"><span><Icon name="image" size={17} /><span>加载远程图片<small>{remoteImagesEnabled ? '已允许 HTTPS 图片，可能包含追踪像素' : '默认屏蔽，保护隐私；CID 内嵌图片不受影响'}</small></span></span><button type="button" aria-label="加载远程图片" className={`toggle-switch ${remoteImagesEnabled ? 'is-on' : ''}`} onClick={() => { const next = !remoteImagesEnabled; setRemoteImagesEnabled(next); void invoke('app.set_remote_images', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-row"><span><Icon name="bell" size={17} /><span>后台新邮件提醒<small>窗口隐藏时发送 Windows 托盘通知</small></span></span><button type="button" aria-label="后台新邮件提醒" className={`toggle-switch ${notificationsEnabled ? 'is-on' : ''}`} onClick={() => { const next = !notificationsEnabled; setNotificationsEnabled(next); void invoke('app.set_notifications', { enabled: next }).catch(() => undefined) }}><span /></button></div><div className="settings-actions"><button type="button" onClick={exportAccounts}><Icon name="download" size={16} />导出脱敏配置</button><button type="button" onClick={() => importInputRef.current?.click()} disabled={isImporting}><Icon name="folder" size={16} />{isImporting ? '导入中…' : '导入脱敏配置'}</button></div><div className="settings-security-note"><Icon name="shieldCheck" size={15} /><span>导出文件不包含授权码或令牌；导入后需重新授权。</span></div><input ref={importInputRef} type="file" accept="application/json,.json" hidden onChange={importAccounts} /></motion.div>}
+        {isSettingsOpen && <motion.div className="settings-popover" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}>
+          <div className="settings-title"><span><Icon name="settings" size={17} />偏好设置</span><TooltipButton label="关闭设置" onClick={() => setSettingsOpen(false)}><Icon name="close" size={17} /></TooltipButton></div>
+          <div className="settings-row"><span><Icon name={theme === 'dark' ? 'moon' : 'theme'} size={17} /><span>外观主题<small>{theme === 'dark' ? '深色 · 午夜蓝' : '浅色 · 雪白'}</small></span></span><button type="button" className="theme-switch" onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}><span className={theme === 'light' ? 'is-light' : ''}>{theme === 'dark' ? '深' : '浅'}</span></button></div>
+          <div className="settings-row"><span><Icon name="menu" size={17} /><span>界面密度<small>{displayDensity === 'compact' ? '紧凑 · 高信息密度' : viewportRequiresCompactDensity ? '窗口较小，已自动紧凑' : '舒适 · 更大间距'}</small></span></span><button type="button" aria-label="紧凑桌面布局" className={`toggle-switch ${displayDensity === 'compact' ? 'is-on' : ''}`} onClick={() => setDisplayDensity((value) => value === 'compact' ? 'comfortable' : 'compact')}><span /></button></div>
+          <label className="settings-row css-row"><span><Icon name="brush" size={17} /><span>用户 CSS<small>{sanitizedCustomCss.removedUnsafeSyntax ? '已过滤外部资源与危险语法' : '可覆盖 MailGo 视觉变量；不加载外部资源'}</small></span></span><textarea value={customCss} onChange={(event) => setCustomCss(event.target.value)} placeholder="例如：:root { --accent: #ff6b8a; }" /></label>
+          <AccountSignatureSettings accounts={accounts} initialAccountId={selectedAccountId} onSave={saveAccountSignature} />
+          <div className="settings-row"><span><Icon name="cloud" size={17} /><span>关闭时后台运行<small>最小化到系统托盘并继续同步</small></span></span><button type="button" className={`toggle-switch ${minimizeToTray ? 'is-on' : ''}`} onClick={() => { const next = !minimizeToTray; setMinimizeToTray(next); void invoke('app.set_minimize_to_tray', { enabled: next }).catch(() => undefined) }}><span /></button></div>
+          <div className="settings-row"><span><Icon name="image" size={17} /><span>加载远程图片<small>{remoteImagesEnabled ? '已允许 HTTPS 图片，可能包含追踪像素' : '默认屏蔽，保护隐私；CID 内嵌图片不受影响'}</small></span></span><button type="button" aria-label="加载远程图片" className={`toggle-switch ${remoteImagesEnabled ? 'is-on' : ''}`} onClick={() => { const next = !remoteImagesEnabled; setRemoteImagesEnabled(next); void invoke('app.set_remote_images', { enabled: next }).catch(() => undefined) }}><span /></button></div>
+          <div className="settings-row"><span><Icon name="bell" size={17} /><span>后台新邮件提醒<small>窗口隐藏时发送 Windows 托盘通知</small></span></span><button type="button" aria-label="后台新邮件提醒" className={`toggle-switch ${notificationsEnabled ? 'is-on' : ''}`} onClick={() => { const next = !notificationsEnabled; setNotificationsEnabled(next); void invoke('app.set_notifications', { enabled: next }).catch(() => undefined) }}><span /></button></div>
+          <div className="settings-actions"><button type="button" onClick={exportAccounts}><Icon name="download" size={16} />导出脱敏配置</button><button type="button" onClick={() => importInputRef.current?.click()} disabled={isImporting}><Icon name="folder" size={16} />{isImporting ? '导入中…' : '导入脱敏配置'}</button></div>
+          <div className="settings-security-note"><Icon name="shieldCheck" size={15} /><span>导出文件不包含授权码或令牌；导入后需重新授权。</span></div>
+          <input ref={importInputRef} type="file" accept="application/json,.json" hidden onChange={importAccounts} />
+        </motion.div>}
       </AnimatePresence>
 
       <AnimatePresence>{isHelpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}</AnimatePresence>
-      <AnimatePresence>{isComposeOpen && <ComposeModal mode={composeMode} source={composeSource} accountId={composeSource?.accountId ?? selectedAccountId ?? accounts[0]?.id} senderEmail={accounts.find((account) => account.id === (composeSource?.accountId ?? selectedAccountId))?.email ?? accounts[0]?.email} draftId={composeDraftId} onDraftChanged={handleDraftChanged} onDraftRemoved={handleDraftRemoved} onClose={() => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts() }} onSent={(queued) => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts(); void refreshOutbox(); pushToast(queued ? '网络暂不可用，邮件已加入发件箱，联网后自动重试' : '邮件已发送', 'success') }} onError={(message) => pushToast(message, 'error')} />}</AnimatePresence>
+      <AnimatePresence>{isComposeOpen && <ComposeModal
+        mode={composeMode}
+        source={composeSource}
+        accountId={composeSource?.accountId ?? selectedAccountId ?? accounts[0]?.id}
+        senderEmail={accounts.find((account) => account.id === (composeSource?.accountId ?? selectedAccountId))?.email ?? accounts[0]?.email}
+        signature={accounts.find((account) => account.id === (composeSource?.accountId ?? selectedAccountId ?? accounts[0]?.id))?.signature ?? ''}
+        draftId={composeDraftId}
+        onDraftChanged={handleDraftChanged}
+        onDraftRemoved={handleDraftRemoved}
+        onClose={() => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts() }}
+        onSent={(queued) => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts(); void refreshOutbox(); pushToast(queued ? '网络暂不可用，邮件已加入发件箱，联网后自动重试' : '邮件已发送', 'success') }}
+        onError={(message) => pushToast(message, 'error')}
+      />}</AnimatePresence>
       <AnimatePresence>{isAccountModalOpen && <AccountModal editingAccountId={editingAccountId} provider={provider} setProvider={changeProvider} providerDefinition={selectedProvider} accountEmail={accountEmail} setAccountEmail={setAccountEmail} authorizationCode={authorizationCode} setAuthorizationCode={setAuthorizationCode} showAuthorizationCode={showAuthorizationCode} setShowAuthorizationCode={setShowAuthorizationCode} customImapHost={customImapHost} setCustomImapHost={setCustomImapHost} customImapPort={customImapPort} setCustomImapPort={setCustomImapPort} customImapSecurity={customImapSecurity} setCustomImapSecurity={setCustomImapSecurity} customSmtpHost={customSmtpHost} setCustomSmtpHost={setCustomSmtpHost} customSmtpPort={customSmtpPort} setCustomSmtpPort={setCustomSmtpPort} customSmtpSecurity={customSmtpSecurity} setCustomSmtpSecurity={setCustomSmtpSecurity} customAuthentication={customAuthentication} setCustomAuthentication={setCustomAuthentication} deviceFlow={deviceFlow} diagnostic={editingAccountId ? connectionDiagnostics[editingAccountId] : undefined} isBusy={isAddingAccount} onClose={closeAccountModal} onOpenProvider={() => { void handleOpenProvider() }} onCopy={handleCopy} onAdd={handleAddAccount} onRemove={handleRemoveAccount} onDiagnose={() => { void handleDiagnoseAccount() }} />}</AnimatePresence>
       <div className="toast-stack" aria-live="polite">{toasts.map((toast) => <motion.div key={toast.id} className={`toast toast-${toast.tone}`} initial={{ opacity: 0, y: 12, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 12 }}><Icon name={toast.tone === 'success' ? 'checkCircle' : toast.tone === 'error' ? 'info' : 'bell'} size={17} /><span>{toast.message}</span></motion.div>)}</div>
     </div>
@@ -2790,7 +2839,7 @@ function AccountModal({ editingAccountId, provider, setProvider, providerDefinit
   return <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="account-modal" initial={{ opacity: 0, y: 14, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 8, scale: 0.98 }} role="dialog" aria-modal="true" aria-labelledby="account-modal-title"><div className="modal-header"><div><Icon name="user" size={21} /><h2 id="account-modal-title">{editingAccountId ? '重新授权账户' : '添加账户'}</h2></div><TooltipButton label="关闭" onClick={onClose} disabled={isBusy}><Icon name="close" size={19} /></TooltipButton></div><div className="account-modal-body"><div className="provider-chooser">{providerDefinitions.map((item) => <button key={item.id} type="button" className={`provider-option ${provider === item.id ? 'is-selected' : ''}`} onClick={() => setProvider(item.id)} disabled={isBusy}><ProviderMark provider={item.id} size="md" /><span><strong>{item.label}</strong><small>{item.description}</small></span>{provider === item.id && <Icon name="checkCircle" size={19} />}</button>)}</div><div className="account-form"><label>邮箱地址<input type="email" value={accountEmail} onChange={(event) => setAccountEmail(event.target.value)} placeholder={provider === 'qq' ? 'yourname@qq.com' : 'name@example.com'} autoFocus disabled={isBusy} /></label>{(provider === 'google' || provider === 'outlook') && <label>认证方式<select value={customAuthentication} onChange={(event) => setCustomAuthentication(event.target.value)} disabled={isBusy}><option value="oauth2">OAuth2 安全授权</option>{provider === 'google' && <option value="app-password">应用专用密码</option>}</select></label>}<label><span className="label-with-action">{credentialLabel}<button type="button" onClick={onOpenProvider} disabled={isBusy}>{isOAuth ? '打开授权页面' : '如何获取授权码？'} <Icon name="link" size={13} /></button></span><span className="secret-input"><input type={showAuthorizationCode ? 'text' : 'password'} value={authorizationCode} onChange={(event) => setAuthorizationCode(event.target.value)} placeholder={isOAuth ? 'OAuth 授权完成后无需粘贴' : '粘贴邮箱授权码'} disabled={isBusy} /><button type="button" onClick={() => setShowAuthorizationCode(!showAuthorizationCode)} aria-label={showAuthorizationCode ? '隐藏授权码' : '显示授权码'} disabled={isBusy}><Icon name={showAuthorizationCode ? 'eyeSlash' : 'eye'} size={17} /></button><button type="button" onClick={onCopy} aria-label="复制授权码" disabled={isBusy}><Icon name="copy" size={17} /></button></span></label>{deviceFlow && <div className="device-flow-box"><div className="device-flow-heading"><span><Icon name="shieldCheck" size={16} />Outlook 设备授权</span><strong>{deviceFlow.status === 'complete' ? '已完成' : deviceFlow.status === 'error' ? '需要重试' : '等待验证'}</strong></div><code>{deviceFlow.userCode}</code><p>{deviceFlow.status === 'complete' ? '设备验证已完成，可以开始同步。' : (deviceFlow.message || '请打开验证页完成 Microsoft 账户授权。')}</p><small>{deviceFlow.verificationUri}</small>{deviceFlow.status !== 'complete' && <button type="button" onClick={onOpenProvider} disabled={isBusy}>{deviceFlow.status === 'error' ? '重新开始授权' : '重新打开验证页'} <Icon name="link" size={13} /></button>}</div>}{provider === 'other' && <div className="custom-transport-fields"><div className="transport-heading"><Icon name="settings" size={15} />自定义服务器</div><div className="transport-row"><label>IMAP 主机<input value={customImapHost} onChange={(event) => setCustomImapHost(event.target.value)} placeholder="imap.example.com" disabled={isBusy} /></label><label>端口<input type="number" min="1" max="65535" value={customImapPort} onChange={(event) => setCustomImapPort(event.target.value)} disabled={isBusy} /></label><label>安全<input value={customImapSecurity} onChange={(event) => setCustomImapSecurity(event.target.value)} placeholder="tls / starttls" disabled={isBusy} /></label></div><div className="transport-row"><label>SMTP 主机<input value={customSmtpHost} onChange={(event) => setCustomSmtpHost(event.target.value)} placeholder="smtp.example.com" disabled={isBusy} /></label><label>端口<input type="number" min="1" max="65535" value={customSmtpPort} onChange={(event) => setCustomSmtpPort(event.target.value)} disabled={isBusy} /></label><label>安全<input value={customSmtpSecurity} onChange={(event) => setCustomSmtpSecurity(event.target.value)} placeholder="tls / starttls" disabled={isBusy} /></label></div><label>认证方式<select value={customAuthentication} onChange={(event) => setCustomAuthentication(event.target.value)} disabled={isBusy}><option value="password">密码 / 授权码</option><option value="app-password">应用专用密码</option><option value="oauth2">OAuth2 Bearer Token</option></select></label></div>}{editingAccountId && <ConnectionDiagnosticCard diagnostic={diagnostic} disabled={isBusy} onDiagnose={onDiagnose} />}<div className="guide-box"><div className="guide-heading"><span><Icon name="key" size={17} />{guideTitle}</span><em>{providerDefinition.label}</em></div>{guide.map((step, index) => <div className="guide-step" key={step}><span className="step-number">{index + 1}</span><span><strong>{step}</strong><small>{isOAuth ? (index === 0 ? 'MailGo 会在本机发起安全授权流程' : index === 1 ? '只授予邮件同步所需的账户权限' : '令牌仅保存到本机系统安全存储') : (index === 0 ? `登录 ${providerDefinition.label}，打开设置页面` : index === 1 ? '找到第三方客户端或账户安全选项' : '复制生成的授权凭据，返回此处粘贴')}</small></span>{index === 0 && <button type="button" onClick={onOpenProvider} disabled={isBusy}>{isOAuth ? '开始授权' : '前往设置'} <Icon name="link" size={13} /></button>}</div>)}</div></div></div><div className="modal-footer"><span><Icon name="shieldCheck" size={17} />凭据仅存本机 · 邮件后台同步</span><div>{editingAccountId && <button className="danger-button" type="button" onClick={onRemove} disabled={isBusy}><Icon name="trash" size={16} />移除账户</button>}<button className="secondary-button" type="button" onClick={onClose} disabled={isBusy}>取消</button><button className="gradient-button" type="button" onClick={onAdd} disabled={isBusy}><Icon name="rotate" size={17} />{isBusy ? '正在保存…' : editingAccountId ? '保存并进入' : '添加并进入'}</button></div></div></motion.div></motion.div>
 }
 
-function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraftId, onClose, onSent, onError, onDraftChanged, onDraftRemoved }: { mode: ComposeMode; source?: MailMessage; accountId?: string; senderEmail?: string; draftId?: string; onClose: () => void; onSent: (queued: boolean) => void; onError: (message: string) => void; onDraftChanged?: (draft: NativeDraft) => void; onDraftRemoved?: (draftId: string) => void }) {
+function ComposeModal({ mode, source, accountId, senderEmail, signature = '', draftId: openDraftId, onClose, onSent, onError, onDraftChanged, onDraftRemoved }: { mode: ComposeMode; source?: MailMessage; accountId?: string; senderEmail?: string; signature?: string; draftId?: string; onClose: () => void; onSent: (queued: boolean) => void; onError: (message: string) => void; onDraftChanged?: (draft: NativeDraft) => void; onDraftRemoved?: (draftId: string) => void }) {
   const [to, setTo] = useState('')
   const [cc, setCc] = useState('')
   const [bcc, setBcc] = useState('')
@@ -2818,6 +2867,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
   const isNativeRuntime = Boolean(window.ipc?.postMessage)
   const maxAttachmentBytes = 25 * 1024 * 1024
   const maxTotalAttachmentBytes = 50 * 1024 * 1024
+  const accountSignature = normalizeAccountSignature(signature)
 
   useEffect(() => {
     attachmentsRef.current = attachments
@@ -3419,16 +3469,17 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
         const persistedIds = allItems.flatMap((item) => item.persistedId ? [item.persistedId] : [])
         const currentDraftId = draftIdRef.current
         const effectiveHtml = htmlMode || currentInlineImages.length > 0
+        const outgoingBody = appendAccountSignature(body, accountSignature)
         const result = await invoke<{ queued?: boolean }>('mail.send', {
           accountId,
           to: to.trim(),
           ...(cc.trim() ? { cc: cc.trim() } : {}),
           ...(bcc.trim() ? { bcc: bcc.trim() } : {}),
           subject: subject.trim() || '(无主题)',
-          textBody: body,
+          textBody: outgoingBody,
           ...(inReplyTo ? { inReplyTo } : {}),
           ...(references.length ? { references } : {}),
-          ...(effectiveHtml && (body.trim() || currentInlineImages.length) ? { htmlBody: composeHtmlBody(body, currentInlineImages) } : {}),
+          ...(effectiveHtml && (outgoingBody.trim() || currentInlineImages.length) ? { htmlBody: composeHtmlBody(outgoingBody, currentInlineImages) } : {}),
           ...(uploadIds.length ? { attachmentIds: uploadIds } : {}),
           ...(persistedIds.length ? { draftId: currentDraftId, draftAttachmentIds: persistedIds } : {}),
         })
@@ -3460,6 +3511,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, draftId: openDraft
       {showCopyFields && <><label>抄送<input value={cc} onChange={(event) => setCc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label><label>密送<input value={bcc} onChange={(event) => setBcc(event.target.value)} placeholder="可选，多个地址用逗号分隔" /></label></>}
       <label>主题<input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="主题" /></label>
       <textarea className="compose-body" value={body} onChange={(event) => setBody(event.target.value)} placeholder={htmlEnabled ? '输入内容，将以 HTML + 纯文本双格式发送…' : '写下你的邮件…'} />
+      {accountSignature && <div className="compose-signature-preview"><span>账户签名 · 发送时自动加入</span><p>{accountSignature}</p></div>}
       {draftStatus && <div className="compose-draft-status" aria-live="polite"><Icon name="cloud" size={14} />{draftStatus}</div>}
       {htmlEnabled && <div className="compose-format-note"><Icon name="grid" size={14} />将发送安全的 HTML + 纯文本版本{inlineImages.length > 0 ? '，内嵌图片会显示在正文末尾' : ''}</div>}
       {inlineImages.length > 0 && <div className="compose-inline-images" aria-label="待发送内嵌图片">{inlineImages.map((image) => <div className={`compose-inline-image is-${image.status}`} key={image.localId}>{image.previewUrl ? <img src={image.previewUrl} alt={image.fileName} /> : <span className="compose-inline-placeholder"><Icon name="image" size={22} /></span>}<span>{image.fileName}<small>{image.status === 'saving' ? '加密保存中…' : image.status === 'failed' ? '保存失败' : image.status === 'removing' ? '移除中…' : '已保存'}</small></span><button type="button" disabled={image.status === 'saving' || image.status === 'removing'} onClick={() => { trackAttachmentJob(removeComposeAttachment(image, true)) }} aria-label={'移除内嵌图片 ' + image.fileName}>×</button></div>)}</div>}

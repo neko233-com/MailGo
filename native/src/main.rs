@@ -39,7 +39,7 @@ mod tray;
 
 const APP_SERVICE: &str = "MailGo";
 const CREDENTIAL_ENVELOPE_PREFIX: &str = "mailgo-credential-v1:";
-const STATE_SCHEMA_VERSION: u32 = 1;
+const STATE_SCHEMA_VERSION: u32 = 2;
 const ATTACHMENT_CHUNK_BYTES: usize = 192 * 1024;
 const LOG_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
@@ -101,6 +101,7 @@ const MAX_AUTH_SESSIONS: usize = 16;
 const MAX_FOLDERS_PER_ACCOUNT: usize = 64;
 const MAX_ACCOUNT_ID_LENGTH: usize = 128;
 const MAX_ACCOUNT_LABEL_LENGTH: usize = 128;
+const MAX_ACCOUNT_SIGNATURE_BYTES: usize = 8 * 1024;
 const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 const MAX_RECIPIENT_BYTES: usize = 320;
 const MAX_SUBJECT_BYTES: usize = 998;
@@ -129,6 +130,8 @@ struct PersistedAccount {
     smtp_port: Option<u16>,
     smtp_security: Option<String>,
     authentication: Option<String>,
+    #[serde(default)]
+    signature: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,17 +261,42 @@ fn sanitize_persisted_folder_names(
         .collect()
 }
 
+fn normalize_account_signature(value: &str) -> Result<String> {
+    if value.len() > MAX_ACCOUNT_SIGNATURE_BYTES {
+        return Err(anyhow!("account signature is too large"));
+    }
+    if value
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\r' | '\n' | '\t'))
+    {
+        return Err(anyhow!(
+            "account signature contains unsupported control characters"
+        ));
+    }
+    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalized.trim().to_string();
+    if normalized.len() > MAX_ACCOUNT_SIGNATURE_BYTES {
+        return Err(anyhow!("account signature is too large"));
+    }
+    Ok(normalized)
+}
+
 fn sanitize_persisted_accounts(accounts: Vec<PersistedAccount>) -> Vec<PersistedAccount> {
     let mut seen_ids = HashSet::new();
     accounts
         .into_iter()
-        .filter(|account| {
+        .filter_map(|mut account| {
             let normalized_id = account.id.to_ascii_lowercase();
-            valid_account_id(&account.id)
+            let valid = valid_account_id(&account.id)
                 && account.label.len() <= MAX_ACCOUNT_LABEL_LENGTH
                 && providers::validate_email(&account.email).is_ok()
-                && profile_for_account(account).is_ok()
-                && seen_ids.insert(normalized_id)
+                && profile_for_account(&account).is_ok()
+                && seen_ids.insert(normalized_id);
+            if !valid {
+                return None;
+            }
+            account.signature = normalize_account_signature(&account.signature).unwrap_or_default();
+            Some(account)
         })
         .take(MAX_IMPORTED_ACCOUNTS)
         .collect()
@@ -1585,8 +1613,15 @@ fn handle_ipc(
                 );
                 let provider_kind = providers::ProviderKind::parse(&provider)?;
                 providers::validate_email(&email)?;
+                let supplied_signature = optional_bounded_string_field(
+                    &message.payload,
+                    "signature",
+                    MAX_ACCOUNT_SIGNATURE_BYTES,
+                )?
+                .map(|signature| normalize_account_signature(&signature))
+                .transpose()?;
                 let offline_mode = offline_mode_enabled(shared)?;
-                let new_account = PersistedAccount {
+                let mut new_account = PersistedAccount {
                     id: id.clone(),
                     provider: provider_kind.as_str().to_string(),
                     label,
@@ -1610,6 +1645,7 @@ fn handle_ipc(
                     smtp_port: optional_u16_field(&message.payload, "smtpPort"),
                     smtp_security: optional_string_field(&message.payload, "smtpSecurity"),
                     authentication: optional_string_field(&message.payload, "authentication"),
+                    signature: supplied_signature.clone().unwrap_or_default(),
                 };
                 let profile = profile_for_account(&new_account)?;
                 let account_is_existing = {
@@ -1626,6 +1662,9 @@ fn handle_ipc(
                             return Err(anyhow!(
                                 "account identity is fixed; remove the account and add it again to change mailbox"
                             ));
+                        }
+                        if supplied_signature.is_none() {
+                            new_account.signature.clone_from(&existing.signature);
                         }
                     }
                     if has_new_mailbox_identity_conflict(
@@ -1769,6 +1808,14 @@ fn handle_ipc(
                     {
                         continue;
                     }
+                    let raw_signature = match raw.get("signature") {
+                        None | Some(Value::Null) => "",
+                        Some(Value::String(signature)) => signature.as_str(),
+                        Some(_) => continue,
+                    };
+                    let Ok(signature) = normalize_account_signature(raw_signature) else {
+                        continue;
+                    };
                     let imported_account = PersistedAccount {
                         id: id.to_string(),
                         provider: provider_kind.as_str().to_string(),
@@ -1806,6 +1853,7 @@ fn handle_ipc(
                             .get("authentication")
                             .and_then(Value::as_str)
                             .map(ToOwned::to_owned),
+                        signature,
                     };
                     if profile_for_account(&imported_account).is_ok() {
                         imported_accounts.push(imported_account);
@@ -1926,6 +1974,34 @@ fn handle_ipc(
                 clear_credential_snapshots(&mut previous_credentials);
                 Ok(json!({ "removed": id }))
             }
+            "accounts.set_signature" => {
+                let id =
+                    bounded_string_field(&message.payload, "accountId", MAX_ACCOUNT_ID_LENGTH)?;
+                if !valid_account_id(&id) {
+                    return Err(anyhow!("invalid account id"));
+                }
+                let signature = normalize_account_signature(&bounded_string_field(
+                    &message.payload,
+                    "signature",
+                    MAX_ACCOUNT_SIGNATURE_BYTES,
+                )?)?;
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                let account_index = app
+                    .state
+                    .accounts
+                    .iter()
+                    .position(|account| account.id == id)
+                    .ok_or_else(|| anyhow!("unknown account"))?;
+                let previous_signature = app.state.accounts[account_index].signature.clone();
+                app.state.accounts[account_index]
+                    .signature
+                    .clone_from(&signature);
+                if let Err(error) = app.save() {
+                    app.state.accounts[account_index].signature = previous_signature;
+                    return Err(error);
+                }
+                Ok(json!({ "accountId": id, "signature": signature }))
+            }
             "accounts.diagnose" => {
                 ensure_network_allowed(shared)?;
                 let account_id = string_field(&message.payload, "accountId")?;
@@ -1997,6 +2073,7 @@ fn handle_ipc(
                         "imapHost": account.imap_host, "imapPort": account.imap_port, "imapSecurity": account.imap_security,
                         "smtpHost": account.smtp_host, "smtpPort": account.smtp_port, "smtpSecurity": account.smtp_security,
                         "authentication": account.authentication,
+                        "signature": account.signature,
                         "status": "requires-reauth", "secretRef": format!("mailgo://{}", account.id),
                     })).collect::<Vec<_>>(),
                 }))
@@ -3333,6 +3410,26 @@ mod tests {
     }
 
     #[test]
+    fn account_signatures_are_bounded_normalized_and_backward_compatible() {
+        assert_eq!(
+            normalize_account_signature("  MailGo\r\nDesktop  ").unwrap(),
+            "MailGo\nDesktop"
+        );
+        assert!(normalize_account_signature("unsafe\0signature").is_err());
+        assert!(normalize_account_signature(&"签".repeat(MAX_ACCOUNT_SIGNATURE_BYTES)).is_err());
+
+        let state = decode_persisted_state(
+            r##"{
+                "schemaVersion": 1,
+                "accounts": [{"id":"legacy","provider":"qq","label":"QQ","email":"legacy@example.invalid","unread":0,"accent":"#111","status":"offline","lastSync":"never"}]
+            }"##,
+        )
+        .unwrap();
+        assert_eq!(state.schema_version, STATE_SCHEMA_VERSION);
+        assert_eq!(state.accounts[0].signature, "");
+    }
+
+    #[test]
     fn state_decoder_sanitizes_discovered_folder_names() {
         let state = decode_persisted_state(
             r##"{
@@ -3390,6 +3487,7 @@ mod tests {
             smtp_port: None,
             smtp_security: None,
             authentication: Some("app-password".into()),
+            signature: String::new(),
         };
         let mut changed = existing.clone();
         changed.email = "other@example.invalid".into();
@@ -3447,6 +3545,7 @@ mod tests {
             smtp_port: Some(465),
             smtp_security: Some("tls".into()),
             authentication: Some("password".into()),
+            signature: String::new(),
         };
         let mut proposed = existing.clone();
         proposed.id = "custom-2".into();
@@ -3475,6 +3574,7 @@ mod tests {
             smtp_port: Some(465),
             smtp_security: Some("tls".into()),
             authentication: Some("password".into()),
+            signature: String::new(),
         };
         let stored = encode_stored_credential(&account, "development-secret")
             .expect("encode bound credential");
@@ -3486,6 +3586,10 @@ mod tests {
         let mut renamed = account.clone();
         renamed.label = "Renamed".into();
         assert!(decode_stored_credential(&renamed, stored.as_str()).is_ok());
+
+        let mut resigned = account.clone();
+        resigned.signature = "A new local signature".into();
+        assert!(decode_stored_credential(&resigned, stored.as_str()).is_ok());
 
         let mut redirected = account.clone();
         redirected.imap_host = Some("attacker.example.invalid".into());
@@ -3517,6 +3621,7 @@ mod tests {
             smtp_port: None,
             smtp_security: None,
             authentication: None,
+            signature: String::new(),
         };
         assert!(has_case_variant_account_id(&[account], "account-1"));
     }
@@ -3539,6 +3644,7 @@ mod tests {
             smtp_port: None,
             smtp_security: None,
             authentication: None,
+            signature: String::new(),
         };
         let shared = Arc::new(Mutex::new(MailGoState {
             state_path: PathBuf::new(),
@@ -3588,6 +3694,7 @@ mod tests {
                 smtp_port: None,
                 smtp_security: None,
                 authentication: None,
+                signature: String::new(),
             })
             .collect::<Vec<_>>();
         assert!(!import_fits_account_capacity(

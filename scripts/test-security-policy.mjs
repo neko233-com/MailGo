@@ -30,6 +30,11 @@ assert(nativeMain.includes('CREDENTIAL_ENVELOPE_PREFIX'), 'stored credentials mu
 assert(nativeMain.includes('credential_binding(account)'), 'stored credentials must be bound to account connection metadata')
 assert(nativeMain.includes('account connection settings changed; reauthorization required'), 'binding mismatch must fail closed')
 assert(nativeMain.includes('legacy custom account credentials require reauthorization before connecting'), 'unbound custom credentials must never connect before reauthorization')
+assert(nativeMain.includes('MAX_ACCOUNT_SIGNATURE_BYTES'), 'account signatures need a native UTF-8 byte budget')
+assert(nativeMain.includes('"accounts.set_signature" =>'), 'account signature writes must cross the validated native IPC boundary')
+assert(app.includes('appendAccountSignature(body, accountSignature)'), 'renderer must append the selected account signature only at send time')
+assert(app.includes('textBody: outgoingBody'), 'plain-text sends must use the signature-appended body')
+assert(app.includes('composeHtmlBody(outgoingBody, currentInlineImages)'), 'HTML sends must escape and render the same signature-appended body')
 
 assert(oauth.includes('CALLBACK_REQUEST_DEADLINE'), 'OAuth callbacks need an absolute request deadline')
 assert(oauth.includes('checked_duration_since(Instant::now())'), 'OAuth read timeout must shrink with the remaining deadline')

@@ -61,6 +61,7 @@ export interface MailAccount {
   smtpPort?: number
   smtpSecurity?: string
   authentication?: string
+  signature: string
 }
 
 export interface ProviderDefinition {
@@ -81,6 +82,7 @@ export interface ExportedAccount {
   email: string
   status: 'requires-reauth'
   secretRef: string
+  signature?: string
 }
 
 export interface NativeState {

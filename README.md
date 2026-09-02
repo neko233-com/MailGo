@@ -5,7 +5,7 @@ MailGo is a Windows-first local-first email workspace for multiple Google, QQ, O
 The current foundation includes:
 
 - React + Vite desktop UI with three-pane unified inbox.
-- Gmail/Foxmail-style desktop density is compact by default and user-switchable, with a 960×640 minimum three-pane layout, bounded HTML-message typography, and a smaller 1280×800 native opening window for high-DPI laptops.
+- Gmail/Foxmail-style desktop density is compact by default and user-switchable. The compact profile uses a 38px title bar, 40px virtualized message rows, a 52px collapsed navigation rail, bounded HTML-message typography, and an 1180×720 native opening window that remains resizable down to 920×600.
 - Resizable Windows windows stay usable below the desktop four-pane breakpoint: mail list and reading view become a single-column flow, with drawer navigation, authorization help, and a title-bar compose entry.
 - `motion` transitions with `prefers-reduced-motion` support.
 - Tree-shakeable `reicon-react` icon components.
@@ -46,6 +46,7 @@ The current foundation includes:
 - Native mode also has an encrypted, bounded offline 发件箱: transient SMTP/network failures are queued without credentials, retried with bounded backoff, paused after repeated permanent failures, and resumed after reauthorization.
 - Native SMTP sending supports plain text and HTML alternatives through provider-specific TLS/STARTTLS defaults.
 - Compose supports bounded To/CC/BCC recipient lists, safe HTML alternatives, and chunked multi-file attachments without putting attachment bytes in a single IPC request.
+- Per-account plain-text signatures are bounded to 8 KiB, stored as non-secret local account metadata, included in redacted configuration migration, and appended only when sending so drafts never duplicate the signature. Reply and forward signatures are inserted before the quoted message and the HTML alternative escapes the same final text.
 - Reply, reply-all, and forward preserve the active account, prefill recipients from MIME To/CC headers, add safe subject prefixes, and quote the original message without restoring an unrelated draft.
 - The desktop keyboard flow includes `C` for compose, `R` for replying to the selected message, `Ctrl/Cmd+K` for search, and `Esc` for closing transient UI.
 - Native mode automatically saves and restores per-account drafts in a DPAPI-protected local store. Draft attachments and inline images are encrypted as independent bounded files, restored without blocking the text editor, reused directly by native send/outbox paths, and removed after send or explicit discard.
