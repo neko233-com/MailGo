@@ -4163,9 +4163,11 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow!("state lock poisoned"))?
         .state
         .minimize_to_tray;
-    cache_db::spawn_search_indexer(cache_dir());
-    cache_db::spawn_encryption_migrator(cache_dir());
-    sync::spawn_scheduler(shared_state.clone(), cache_dir());
+    let cache_root = cache_dir();
+    cache_db::enable_connection_pool(&cache_root)?;
+    cache_db::spawn_search_indexer(cache_root.clone());
+    cache_db::spawn_encryption_migrator(cache_root.clone());
+    sync::spawn_scheduler(shared_state.clone(), cache_root);
     tray::start(minimize_to_tray);
     tracing::info!("MailGo desktop window ready; background synchronization scheduled");
     Box::new(renderer).run()?;

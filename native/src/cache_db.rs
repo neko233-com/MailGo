@@ -45,18 +45,28 @@ const LIST_INDEX_BATCH_SIZE: usize = 48;
 const ENCRYPTION_MIGRATION_BATCH_SIZE: usize = 32;
 const ENCRYPTION_MIGRATION_BATCH_BYTES: usize = 16 * 1024 * 1024;
 const CURRENT_DATABASE_ENCRYPTION_VERSION: i64 = 1;
+const MAX_IDLE_CONNECTIONS_PER_DATABASE: usize = 4;
 
 static INITIALIZED_DATABASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 static DATABASE_ACCESS: OnceLock<RwLock<()>> = OnceLock::new();
 static BACKUP_ACCESS: OnceLock<Mutex<()>> = OnceLock::new();
 static SEARCH_KEYS: OnceLock<Mutex<HashMap<PathBuf, [u8; SEARCH_KEY_BYTES]>>> = OnceLock::new();
+static CONNECTION_POOL: OnceLock<Mutex<ConnectionPool>> = OnceLock::new();
 static SEARCH_INDEX_RUNNING: AtomicBool = AtomicBool::new(false);
 static SEARCH_INDEX_REQUESTED: AtomicBool = AtomicBool::new(false);
 static LIST_INDEX_RUNNING: AtomicBool = AtomicBool::new(false);
 static LIST_INDEX_REQUESTED: AtomicBool = AtomicBool::new(false);
 static ENCRYPTION_MIGRATION_RUNNING: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static CONNECTION_OPEN_COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
 type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Default)]
+struct ConnectionPool {
+    registered: HashSet<PathBuf>,
+    idle: HashMap<PathBuf, Vec<Connection>>,
+}
 
 struct SearchIndexerRun;
 
@@ -438,6 +448,70 @@ fn recipient_query_terms(key: &[u8; SEARCH_KEY_BYTES], words: &[String]) -> Resu
         .collect()
 }
 
+fn connection_pool() -> &'static Mutex<ConnectionPool> {
+    CONNECTION_POOL.get_or_init(|| Mutex::new(ConnectionPool::default()))
+}
+
+/// Opt one long-lived application database into bounded connection reuse. Test and recovery
+/// databases remain ephemeral unless they explicitly register, so temporary files are never held
+/// open accidentally. Connections are moved between worker threads only while idle; a checked-out
+/// `SQLITE_OPEN_NO_MUTEX` connection is owned by exactly one operation at a time.
+pub fn enable_connection_pool(cache_root: &Path) -> Result<()> {
+    let path = database_path(cache_root);
+    connection_pool()
+        .lock()
+        .map_err(|_| anyhow!("indexed mail cache connection pool lock poisoned"))?
+        .registered
+        .insert(path);
+    Ok(())
+}
+
+fn take_idle_connection(cache_root: &Path) -> Result<Option<Connection>> {
+    let path = database_path(cache_root);
+    let mut pool = connection_pool()
+        .lock()
+        .map_err(|_| anyhow!("indexed mail cache connection pool lock poisoned"))?;
+    if !pool.registered.contains(&path) {
+        return Ok(None);
+    }
+    Ok(pool.idle.get_mut(&path).and_then(Vec::pop))
+}
+
+fn return_idle_connection(cache_root: &Path, connection: Connection) {
+    if !connection.is_autocommit() {
+        tracing::warn!("discarding indexed mail cache connection with an open transaction");
+        return;
+    }
+    let path = database_path(cache_root);
+    let Ok(mut pool) = connection_pool().lock() else {
+        tracing::warn!("discarding indexed mail cache connection after pool lock poisoning");
+        return;
+    };
+    if !pool.registered.contains(&path) {
+        return;
+    }
+    let idle = pool.idle.entry(path).or_default();
+    if idle.len() < MAX_IDLE_CONNECTIONS_PER_DATABASE {
+        idle.push(connection);
+    }
+}
+
+fn clear_idle_connections(path: &Path) -> Result<()> {
+    let connections = connection_pool()
+        .lock()
+        .map_err(|_| anyhow!("indexed mail cache connection pool lock poisoned"))?
+        .idle
+        .remove(path);
+    // Close handles outside the pool lock. On Windows this must complete before recovery renames
+    // the primary SQLite, WAL, or shared-memory file.
+    drop(connections);
+    Ok(())
+}
+
+fn acquire_connection(cache_root: &Path) -> Result<Connection> {
+    take_idle_connection(cache_root)?.map_or_else(|| open(cache_root), Ok)
+}
+
 fn open(cache_root: &Path) -> Result<Connection> {
     fs::create_dir_all(cache_root)
         .with_context(|| format!("create mail cache directory {}", cache_root.display()))?;
@@ -450,6 +524,15 @@ fn open(cache_root: &Path) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("open indexed mail cache {}", path.display()))?;
+    #[cfg(test)]
+    {
+        *CONNECTION_OPEN_COUNTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|_| anyhow!("indexed mail cache open-count lock poisoned"))?
+            .entry(path.clone())
+            .or_default() += 1;
+    }
     connection.busy_timeout(BUSY_TIMEOUT)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "temp_store", "MEMORY")?;
@@ -511,23 +594,7 @@ fn with_recovery<T>(
         let _read_guard = access
             .read()
             .map_err(|_| anyhow!("indexed mail cache access lock poisoned"))?;
-        let mut connection = match open(cache_root) {
-            Ok(connection) => connection,
-            Err(error) => {
-                if !is_sqlite_corruption(&error) {
-                    return Err(error);
-                }
-                drop(_read_guard);
-                recover_database(cache_root)?;
-                let _retry_guard = access
-                    .read()
-                    .map_err(|_| anyhow!("indexed mail cache access lock poisoned"))?;
-                let mut connection = open(cache_root)?;
-                return operation(&mut connection)
-                    .context("retry indexed mail cache operation after recovery");
-            }
-        };
-        operation(&mut connection)
+        run_connection_operation(cache_root, &mut operation)
     };
     match first_attempt {
         Ok(value) => Ok(value),
@@ -536,11 +603,27 @@ fn with_recovery<T>(
             let _read_guard = access
                 .read()
                 .map_err(|_| anyhow!("indexed mail cache access lock poisoned"))?;
-            let mut connection = open(cache_root)?;
-            operation(&mut connection).context("retry indexed mail cache operation after recovery")
+            run_connection_operation(cache_root, &mut operation)
+                .context("retry indexed mail cache operation after recovery")
         }
         Err(error) => Err(error),
     }
+}
+
+fn run_connection_operation<T>(
+    cache_root: &Path,
+    operation: &mut impl FnMut(&mut Connection) -> Result<T>,
+) -> Result<T> {
+    let mut connection = acquire_connection(cache_root)?;
+    let result = operation(&mut connection);
+    let reusable = result
+        .as_ref()
+        .err()
+        .is_none_or(|error| !is_sqlite_corruption(error));
+    if reusable {
+        return_idle_connection(cache_root, connection);
+    }
+    result
 }
 
 fn validate_database_file(path: &Path) -> Result<bool> {
@@ -660,6 +743,7 @@ fn recover_database(cache_root: &Path) -> Result<()> {
     fs::create_dir_all(cache_root)
         .with_context(|| format!("create mail cache directory {}", cache_root.display()))?;
     let primary = database_path(cache_root);
+    clear_idle_connections(&primary)?;
 
     if primary.exists() {
         match validate_database_file(&primary) {
@@ -1075,13 +1159,14 @@ fn read_metadata(
     account_key: &[u8],
     folder_key: &[u8],
 ) -> Result<Option<(MailboxMetadata, u64)>> {
-    let row = connection
-        .query_row(
-            "SELECT payload, revision FROM mailbox_meta
-             WHERE account_key = ?1 AND folder_key = ?2",
-            params![account_key, folder_key],
-            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
-        )
+    let mut statement = connection.prepare_cached(
+        "SELECT payload, revision FROM mailbox_meta
+         WHERE account_key = ?1 AND folder_key = ?2",
+    )?;
+    let row = statement
+        .query_row(params![account_key, folder_key], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+        })
         .optional()?;
     let Some((payload, revision)) = row else {
         return Ok(None);
@@ -1095,20 +1180,19 @@ fn read_metadata_for_page(
     account_key: &[u8],
     folder_key: &[u8],
 ) -> Result<Option<(MailboxMetadata, u64, usize, bool)>> {
-    let row = connection
-        .query_row(
-            "SELECT payload, revision, message_count, list_count FROM mailbox_meta
-             WHERE account_key = ?1 AND folder_key = ?2",
-            params![account_key, folder_key],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            },
-        )
+    let mut statement = connection.prepare_cached(
+        "SELECT payload, revision, message_count, list_count FROM mailbox_meta
+         WHERE account_key = ?1 AND folder_key = ?2",
+    )?;
+    let row = statement
+        .query_row(params![account_key, folder_key], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
         .optional()?;
     let Some((payload, revision, message_count, list_count)) = row else {
         return Ok(None);
@@ -2378,7 +2462,7 @@ pub fn load_mailbox_summaries(
         validate_identity(&metadata, account_id, folder)?;
         let bounded_limit = limit.clamp(1, MAX_SYNC_SUMMARIES);
         let encrypted_rows = if summaries_complete {
-            let mut statement = connection.prepare(
+            let mut statement = connection.prepare_cached(
                 "SELECT uid, payload FROM message_list
                  WHERE account_key = ?1 AND folder_key = ?2
                  ORDER BY uid DESC LIMIT ?3",
@@ -2393,7 +2477,7 @@ pub fn load_mailbox_summaries(
             }
             values
         } else {
-            let mut statement = connection.prepare(
+            let mut statement = connection.prepare_cached(
                 "SELECT messages.uid, COALESCE(message_list.payload, messages.payload)
                  FROM messages LEFT JOIN message_list
                    ON message_list.account_key = messages.account_key
@@ -2475,7 +2559,7 @@ pub fn load_mailbox_page(
         let page_size = limit.clamp(1, MAX_PAGE_SIZE);
         let encrypted_rows = match (summaries_complete, before_uid) {
             (true, Some(before_uid)) => {
-                let mut statement = connection.prepare(
+                let mut statement = connection.prepare_cached(
                     "SELECT uid, payload FROM message_list
                      WHERE account_key = ?1 AND folder_key = ?2 AND uid < ?3
                      ORDER BY uid DESC LIMIT ?4",
@@ -2496,7 +2580,7 @@ pub fn load_mailbox_page(
                 values
             }
             (true, None) => {
-                let mut statement = connection.prepare(
+                let mut statement = connection.prepare_cached(
                     "SELECT uid, payload FROM message_list
                      WHERE account_key = ?1 AND folder_key = ?2
                      ORDER BY uid DESC LIMIT ?3",
@@ -2512,7 +2596,7 @@ pub fn load_mailbox_page(
                 values
             }
             (false, Some(before_uid)) => {
-                let mut statement = connection.prepare(
+                let mut statement = connection.prepare_cached(
                     "SELECT messages.uid, COALESCE(message_list.payload, messages.payload)
                      FROM messages LEFT JOIN message_list
                        ON message_list.account_key = messages.account_key
@@ -2538,7 +2622,7 @@ pub fn load_mailbox_page(
                 values
             }
             (false, None) => {
-                let mut statement = connection.prepare(
+                let mut statement = connection.prepare_cached(
                     "SELECT messages.uid, COALESCE(message_list.payload, messages.payload)
                      FROM messages LEFT JOIN message_list
                        ON message_list.account_key = messages.account_key
@@ -2597,13 +2681,14 @@ pub fn load_message(
     with_recovery(cache_root, |connection| {
         let account_key = identity_key(account_id);
         let folder_key = folder_identity_key(account_id, folder);
-        let payload = connection
-            .query_row(
-                "SELECT payload FROM messages
-                 WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3",
-                params![account_key, folder_key, i64::from(uid)],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
+        let mut statement = connection.prepare_cached(
+            "SELECT payload FROM messages
+             WHERE account_key = ?1 AND folder_key = ?2 AND uid = ?3",
+        )?;
+        let payload = statement
+            .query_row(params![account_key, folder_key, i64::from(uid)], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
             .optional()?;
         payload
             .map(|payload| decrypt_message(&payload, account_id, folder, uid))
@@ -3538,6 +3623,73 @@ mod tests {
             attachments: Vec::new(),
             raw_path: None,
         }
+    }
+
+    fn connection_open_count(root: &Path) -> usize {
+        CONNECTION_OPEN_COUNTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .get(&database_path(root))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn disable_test_connection_pool(root: &Path) {
+        let path = database_path(root);
+        let connections = {
+            let mut pool = connection_pool().lock().unwrap();
+            pool.registered.remove(&path);
+            pool.idle.remove(&path)
+        };
+        drop(connections);
+        CONNECTION_OPEN_COUNTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .remove(&path);
+    }
+
+    #[test]
+    fn registered_database_reuses_one_connection_across_short_lived_worker_threads() {
+        let root = temporary_root("connection-pool");
+        enable_connection_pool(&root).unwrap();
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = (1..=48).rev().map(fixture_message).collect();
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        let initial_opens = connection_open_count(&root);
+        assert_eq!(initial_opens, 1);
+
+        for _ in 0..12 {
+            let worker_root = root.clone();
+            std::thread::spawn(move || {
+                assert!(mailbox_revision(&worker_root, "fixture-account", "INBOX")
+                    .unwrap()
+                    .is_some());
+                assert_eq!(
+                    load_mailbox_page(&worker_root, "fixture-account", "INBOX", None, 12)
+                        .unwrap()
+                        .unwrap()
+                        .mailbox
+                        .messages
+                        .len(),
+                    12
+                );
+                assert_eq!(
+                    load_message(&worker_root, "fixture-account", "INBOX", 48)
+                        .unwrap()
+                        .unwrap()
+                        .uid,
+                    48
+                );
+            })
+            .join()
+            .unwrap();
+        }
+
+        assert_eq!(connection_open_count(&root), initial_opens);
+        disable_test_connection_pool(&root);
+        let _ = fs::remove_dir_all(root);
     }
 
     fn insert_corrupt_rows(root: &Path, folder: &str, first_uid: u32, last_uid: u32) {
@@ -4988,6 +5140,31 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("mail-index-v1.sqlite3.corrupt-")
         }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registered_database_drains_idle_connections_when_recovery_starts() {
+        let root = temporary_root("pooled-recovery-drain");
+        enable_connection_pool(&root).unwrap();
+        let mut mailbox = CachedMailbox::empty("fixture-account", "INBOX");
+        mailbox.messages = vec![fixture_message(9), fixture_message(8)];
+        save_mailbox(&root, "fixture-account", &mailbox).unwrap();
+        let initial_opens = connection_open_count(&root);
+        assert_eq!(initial_opens, 1);
+
+        recover_database(&root).unwrap();
+
+        assert_eq!(
+            load_message(&root, "fixture-account", "INBOX", 8)
+                .unwrap()
+                .unwrap()
+                .uid,
+            8
+        );
+        assert_eq!(connection_open_count(&root), initial_opens + 1);
+
+        disable_test_connection_pool(&root);
         let _ = fs::remove_dir_all(root);
     }
 
