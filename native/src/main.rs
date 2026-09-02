@@ -89,7 +89,6 @@ fn init_logging() -> Result<tracing_appender::non_blocking::WorkerGuard> {
     Ok(guard)
 }
 const MAX_ATTACHMENT_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
-const MAX_LEGACY_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_ATTACHMENT_DOWNLOADS: usize = 2;
 const ATTACHMENT_DOWNLOAD_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_OUTGOING_ATTACHMENT_BYTES: usize = drafts::MAX_ATTACHMENT_BYTES;
@@ -2581,34 +2580,6 @@ fn handle_ipc(
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                 let cancelled = app.attachment_downloads.remove(&download_id).is_some();
                 Ok(json!({ "downloadId": download_id, "cancelled": cancelled }))
-            }
-            "mail.attachment" => {
-                // Keep the original one-shot command for older clients. New clients use the
-                // chunked start/chunk/cancel protocol to cap IPC payload size and support cancel.
-                let account_id = string_field(&message.payload, "accountId")?;
-                account_for(shared, &account_id)?;
-                let uid = u32_field(&message.payload, "uid")?;
-                let folder = optional_string_field(&message.payload, "folder")
-                    .unwrap_or_else(|| "INBOX".to_string());
-                let index = message
-                    .payload
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .and_then(|value| usize::try_from(value).ok())
-                    .ok_or_else(|| anyhow!("missing or invalid field: index"))?;
-                let attachment =
-                    sync::load_attachment_data(&cache_dir(), &account_id, &folder, uid, index)?;
-                if attachment.bytes.len() > MAX_LEGACY_ATTACHMENT_BYTES {
-                    return Err(anyhow!(
-                        "legacy attachment transfer is limited to {} MiB; use the chunked client",
-                        MAX_LEGACY_ATTACHMENT_BYTES / (1024 * 1024)
-                    ));
-                }
-                Ok(json!({
-                    "fileName": attachment.file_name,
-                    "contentType": attachment.content_type,
-                    "dataBase64": STANDARD.encode(attachment.bytes),
-                }))
             }
             "mail.move" | "mail.archive" | "mail.delete" | "mail.spam" | "mail.inbox" => {
                 let account_id = string_field(&message.payload, "accountId")?;

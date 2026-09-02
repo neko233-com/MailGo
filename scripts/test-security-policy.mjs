@@ -19,6 +19,7 @@ assert(!app.includes('accounts.export_encrypted'), 'renderer must not expose cre
 assert(!app.includes('accounts.import_encrypted'), 'renderer must not expose credential-bearing import')
 assert(!nativeMain.includes('accounts.export_encrypted'), 'native IPC must not expose credential-bearing export')
 assert(!nativeMain.includes('accounts.import_encrypted'), 'native IPC must not expose credential-bearing import')
+assert(!nativeMain.includes('            "mail.attachment" =>'), 'attachments must not expose the legacy one-shot IPC path')
 assert(!existsSync(resolve(root, 'native/src/transfer.rs')), 'credential transfer implementation must stay removed')
 assert(!cargo.includes('argon2 ='), 'credential-transfer-only KDF dependency must stay removed')
 
