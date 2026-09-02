@@ -7,6 +7,7 @@ const outbox = read('native/src/outbox.rs')
 const sync = read('native/src/sync.rs')
 const send = read('native/src/send.rs')
 const app = read('src/App.tsx')
+const compose = read('src/components/ComposeModal.tsx')
 const styles = read('src/styles.css')
 
 assert.match(main, /const DEFAULT_UNDO_SEND_SECONDS: u64 = 10/)
@@ -29,9 +30,9 @@ assert.doesNotMatch(sync, /mailgo-outbox-[^"\n]*\{/) // one scheduler, never one
 
 assert.match(app, /撤销发送/)
 assert.match(app, /mail\.outbox\.undo/)
-assert.match(app, /!sendResult\.queued/)
+assert.match(compose, /!sendResult\.queued/)
 assert.match(app, /openCompose\(action\.draftId\)/)
-assert.match(app, /currentDraftId \? \{ draftId: currentDraftId \}/)
+assert.match(compose, /currentDraftId \? \{ draftId: currentDraftId \}/)
 assert.match(styles, /animation: toast-progress var\(--toast-duration\) linear forwards/)
 
 console.log('Undo-send scheduling, cancellation, draft recovery, and UI timing checks passed.')

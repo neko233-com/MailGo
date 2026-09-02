@@ -5,6 +5,7 @@ import { resolve } from 'node:path'
 const root = resolve(import.meta.dirname, '..')
 const read = (path) => readFileSync(resolve(root, path), 'utf8')
 const app = read('src/App.tsx')
+const compose = read('src/components/ComposeModal.tsx')
 const data = read('src/data.ts')
 const types = read('src/types.ts')
 const outbox = read('native/src/outbox.rs')
@@ -39,7 +40,7 @@ assert.match(app, /folder === 'outbox'\) \{[\s\S]*?refreshOutbox\(\)[\s\S]*?retu
 assert.match(app, /selectedFolder !== 'starred' && selectedFolder !== 'snoozed' && selectedFolder !== 'outbox'/)
 assert.match(app, /selectedFolder === 'starred' \|\| selectedFolder === 'snoozed' \|\| selectedFolder === 'outbox'/)
 assert.match(app, /queuedDraftKeys/)
-assert.match(app, /!sendResult\.queued/)
+assert.match(compose, /!sendResult\.queued/)
 assert.match(app, /<OutboxDetail/)
 assert.match(app, /<ConfirmDialog/)
 const discardHandler = app.match(/const discardQueuedMessage = async \(\) => \{[\s\S]*?\n  \}/)?.[0] ?? ''

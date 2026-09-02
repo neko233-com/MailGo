@@ -6,6 +6,7 @@ import { resolve } from 'node:path'
 const root = resolve(import.meta.dirname, '..')
 const read = (path) => readFileSync(resolve(root, path), 'utf8')
 const app = read('src/App.tsx')
+const compose = read('src/components/ComposeModal.tsx')
 const styles = read('src/styles.css')
 const html = read('dist/index.html')
 const assetsRoot = resolve(root, 'dist/assets')
@@ -20,12 +21,14 @@ for (const component of [
   'ExternalLinkDialog',
   'MailRuleManager',
   'OutboxDetail',
-  'RecipientInput',
-  'RichTextEditor',
-  'ScheduleSendControl',
+  'ComposeModal',
 ]) {
   assert.match(app, new RegExp(`lazy\\(async \\(\\) => \\({ default: \\(await import\\('\\.\\/components\\/${component}'\\)\\)\\.${component} }\\)\\)`))
   assert.ok(assets.some((asset) => asset.startsWith(`${component}-`) && asset.endsWith('.js')), `missing deferred ${component} chunk`)
+}
+
+for (const component of ['RecipientInput', 'RichTextEditor', 'ScheduleSendControl']) {
+  assert.match(compose, new RegExp(`import \\{ ${component} \\} from '\\.\\/${component}'`))
 }
 
 assert.match(app, /<Suspense fallback=\{<DeferredModalLoading label="正在打开写信窗口…" \/>\}>/)
@@ -37,8 +40,8 @@ assert.match(styles, /\.deferred-pane-loading/)
 const entryMatch = html.match(/<script type="module"[^>]+src="\.\/assets\/(index-[^"]+\.js)"/)
 assert.ok(entryMatch, 'production HTML must reference the hashed entry bundle')
 const entry = readFileSync(resolve(assetsRoot, entryMatch[1]))
-assert.ok(entry.length <= 390_000, `entry bundle is too large: ${entry.length} bytes`)
-assert.ok(gzipSync(entry).length <= 125_000, `gzipped entry bundle is too large: ${gzipSync(entry).length} bytes`)
+assert.ok(entry.length <= 360_000, `entry bundle is too large: ${entry.length} bytes`)
+assert.ok(gzipSync(entry).length <= 115_000, `gzipped entry bundle is too large: ${gzipSync(entry).length} bytes`)
 assert.equal(entry.includes(Buffer.from('Q3 launch plan')), false, 'browser demo messages must not enter the native startup bundle')
 
 console.log(`Startup entry is ${entry.length} bytes (${gzipSync(entry).length} gzip) with localized deferred UI chunks.`)

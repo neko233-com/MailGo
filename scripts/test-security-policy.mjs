@@ -8,6 +8,7 @@ const assert = (condition, message) => {
 }
 
 const app = read('src/App.tsx')
+const compose = read('src/components/ComposeModal.tsx')
 const externalLinkDialog = read('src/components/ExternalLinkDialog.tsx')
 const linkSafety = read('src/linkSafety.ts')
 const recipientInput = read('src/components/RecipientInput.tsx')
@@ -36,10 +37,10 @@ assert(nativeMain.includes('account connection settings changed; reauthorization
 assert(nativeMain.includes('legacy custom account credentials require reauthorization before connecting'), 'unbound custom credentials must never connect before reauthorization')
 assert(nativeMain.includes('MAX_ACCOUNT_SIGNATURE_BYTES'), 'account signatures need a native UTF-8 byte budget')
 assert(nativeMain.includes('"accounts.set_signature" =>'), 'account signature writes must cross the validated native IPC boundary')
-assert(app.includes('appendAccountSignature(body, accountSignature)'), 'renderer must append the selected account signature only at send time')
-assert(app.includes('textBody: outgoingBody'), 'plain-text sends must use the signature-appended body')
-assert(app.includes('appendSignatureToComposeHtml(textBlock, signature)'), 'HTML signatures must be inserted through the sanitized rich-body boundary')
-assert(app.includes('composeHtmlBody(body, currentInlineImages, htmlMode ? richBody : undefined, accountSignature)'), 'HTML sends must sanitize rich content and add the selected signature once')
+assert(compose.includes('appendAccountSignature(body, accountSignature)'), 'renderer must append the selected account signature only at send time')
+assert(compose.includes('textBody: outgoingBody'), 'plain-text sends must use the signature-appended body')
+assert(compose.includes('appendSignatureToComposeHtml(textBlock, signature)'), 'HTML signatures must be inserted through the sanitized rich-body boundary')
+assert(compose.includes('composeHtmlBody(body, currentInlineImages, htmlMode ? richBody : undefined, accountSignature)'), 'HTML sends must sanitize rich content and add the selected signature once')
 assert(app.includes('setPendingExternalLink(inspectExternalLink(href, anchor.textContent ?? undefined))'), 'mail HTML links must stop at the inspection boundary')
 assert(!app.includes('void openExternalUrl(href)'), 'mail HTML links must not launch an external handler immediately')
 assert(externalLinkDialog.includes('await onOpen(inspection.url)'), 'external navigation must require explicit dialog confirmation')
