@@ -1,20 +1,12 @@
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, startTransition, Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import appIconUrl from '../resources/icons/mailgo-64.png'
-import { AccountSignatureSettings } from './components/AccountSignatureSettings'
-import { ConfirmDialog } from './components/ConfirmDialog'
-import { ExternalLinkDialog } from './components/ExternalLinkDialog'
 import { Icon, type IconName } from './components/Icon'
-import { MailRuleManager } from './components/MailRuleManager'
-import { OutboxDetail } from './components/OutboxDetail'
-import { RecipientInput } from './components/RecipientInput'
-import { RichTextEditor } from './components/RichTextEditor'
-import { ScheduleSendControl } from './components/ScheduleSendControl'
 import { SnoozeControl } from './components/SnoozeControl'
 import { buildComposeThreadHeaders, type ComposeMode } from './compose-thread'
 import { sanitizeCustomCss } from './customCss'
-import { folderLabels, providerDefinitions, sampleAccounts, sampleMails, sampleOutboxItems } from './data'
+import { folderLabels, providerDefinitions } from './data'
 import { mapWithConcurrency } from './lib/asyncPool'
 import { invoke, readNativeState } from './lib/ipc'
 import { inspectExternalLink, type ExternalLinkInspection } from './linkSafety'
@@ -27,6 +19,15 @@ import { formatSnoozeTime } from './snooze'
 import { buildMailThreads, type MailThread } from './threading'
 import { sanitizeHtml } from './htmlSafety'
 import type { FolderId, MailAccount, MailAttachment, MailMessage, MailRuleKind, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeConnectionDiagnostic, NativeConnectionDiagnosticChannel, NativeDeviceStartResponse, NativeDraft, NativeDraftAttachment, NativeLocalSearchResponse, NativeMailboxResponse, NativeMailRule, NativeMailRuleSnapshot, NativeMessageResponse, NativeOutboxActionResponse, NativeOutboxItem, NativeOutboxRecallResponse, NativeOutboxSnapshot, NativeQueueStatus, NativeSearchResponse, NativeSendResponse, NativeSnoozeSnapshot, NativeSyncItem, NativeSyncResponse, NativeUndoSendResponse, Provider, SmartCategory, ThemeMode } from './types'
+
+const AccountSignatureSettings = lazy(async () => ({ default: (await import('./components/AccountSignatureSettings')).AccountSignatureSettings }))
+const ConfirmDialog = lazy(async () => ({ default: (await import('./components/ConfirmDialog')).ConfirmDialog }))
+const ExternalLinkDialog = lazy(async () => ({ default: (await import('./components/ExternalLinkDialog')).ExternalLinkDialog }))
+const MailRuleManager = lazy(async () => ({ default: (await import('./components/MailRuleManager')).MailRuleManager }))
+const OutboxDetail = lazy(async () => ({ default: (await import('./components/OutboxDetail')).OutboxDetail }))
+const RecipientInput = lazy(async () => ({ default: (await import('./components/RecipientInput')).RecipientInput }))
+const RichTextEditor = lazy(async () => ({ default: (await import('./components/RichTextEditor')).RichTextEditor }))
+const ScheduleSendControl = lazy(async () => ({ default: (await import('./components/ScheduleSendControl')).ScheduleSendControl }))
 
 type ToastTone = 'info' | 'success' | 'error'
 type UndoSendSeconds = 0 | 5 | 10 | 20 | 30
@@ -691,12 +692,24 @@ function ToastView({ toast, onAction }: { toast: Toast; onAction: (toast: Toast)
   )
 }
 
+function DeferredModalLoading({ label }: { label: string }) {
+  return <div className="modal-backdrop deferred-modal-backdrop" role="status" aria-live="polite"><div className="deferred-modal-loading"><span className="loading-spinner" aria-hidden="true" /><strong>{label}</strong><small>邮箱主界面仍可继续使用</small></div></div>
+}
+
+function DeferredPaneLoading({ label }: { label: string }) {
+  return <div className="deferred-pane-loading" role="status" aria-live="polite"><span className="loading-spinner" aria-hidden="true" /><span>{label}</span></div>
+}
+
+function DeferredSettingsLoading() {
+  return <div className="settings-row deferred-settings-loading" role="status"><span><span className="loading-spinner loading-spinner-small" aria-hidden="true" /><span>正在载入签名设置<small>其他偏好仍可立即调整</small></span></span></div>
+}
+
 function App() {
   const isNativeRuntime = Boolean(window.ipc?.postMessage)
   const prefersReducedMotion = useReducedMotion()
   const [theme, setTheme] = useState<ThemeMode>(loadTheme)
-  const [accounts, setAccounts] = useState<MailAccount[]>(() => isNativeRuntime ? [] : sampleAccounts)
-  const [mails, setMails] = useState<MailMessage[]>(() => isNativeRuntime ? [] : sampleMails.map((mail) => ({ ...mail, body: [...mail.body], attachments: mail.attachments?.map((attachment) => ({ ...attachment })) })))
+  const [accounts, setAccounts] = useState<MailAccount[]>([])
+  const [mails, setMails] = useState<MailMessage[]>([])
   const [localSearchMails, setLocalSearchMails] = useState<MailMessage[]>([])
   const [localSearchState, setLocalSearchState] = useState<'idle' | 'searching' | 'indexing' | 'ready' | 'error'>('idle')
   const [localSearchTruncated, setLocalSearchTruncated] = useState(false)
@@ -759,7 +772,7 @@ function App() {
   const [outboxPaused, setOutboxPaused] = useState(0)
   const [outboxScheduled, setOutboxScheduled] = useState(0)
   const [outboxUndoable, setOutboxUndoable] = useState(0)
-  const [nativeOutboxItems, setNativeOutboxItems] = useState<NativeOutboxItem[]>(() => isNativeRuntime ? [] : sampleOutboxItems)
+  const [nativeOutboxItems, setNativeOutboxItems] = useState<NativeOutboxItem[]>([])
   const [snoozedMails, setSnoozedMails] = useState<MailMessage[]>([])
   const [snoozeActionId, setSnoozeActionId] = useState<string | null>(null)
   const [outboxAction, setOutboxAction] = useState<OutboxAction | null>(null)
@@ -821,6 +834,18 @@ function App() {
   const mailListRef = useRef<HTMLDivElement>(null)
   const [nativeStateReady, setNativeStateReady] = useState(!isNativeRuntime)
   const [nativeStateError, setNativeStateError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (isNativeRuntime) return
+    let cancelled = false
+    void import('./demoData').then(({ sampleAccounts, sampleMails, sampleOutboxItems }) => {
+      if (cancelled) return
+      setAccounts(sampleAccounts)
+      setMails(sampleMails.map((mail) => ({ ...mail, body: [...mail.body], attachments: mail.attachments?.map((attachment) => ({ ...attachment })) })))
+      setNativeOutboxItems(sampleOutboxItems)
+    }).catch(() => undefined)
+    return () => { cancelled = true }
+  }, [isNativeRuntime])
 
   const openExternalUrl = async (url: string) => {
     if (isNativeRuntime) {
@@ -3349,7 +3374,7 @@ function App() {
         </main>
 
         <section className="reading-panel" aria-label="邮件阅读区">
-          {selectedOutboxItem ? <OutboxDetail
+          {selectedOutboxItem ? <Suspense fallback={<DeferredPaneLoading label="正在载入发件箱详情…" />}><OutboxDetail
             item={selectedOutboxItem}
             account={selectedMailAccount}
             busyAction={outboxAction?.id === selectedOutboxItem.id ? outboxAction.kind : undefined}
@@ -3357,7 +3382,7 @@ function App() {
             onEdit={() => { void editQueuedMessage(selectedOutboxItem) }}
             onRetry={() => { void retryQueuedMessage(selectedOutboxItem) }}
             onDiscard={() => setPendingOutboxDiscard(selectedOutboxItem)}
-          /> : selectedMail.id === 'empty-mail' ? <div className="reading-empty-state">
+          /></Suspense> : selectedMail.id === 'empty-mail' ? <div className="reading-empty-state">
             <TooltipButton label="返回邮件列表" className="mobile-only-button reading-empty-back" onClick={() => setMobilePane('list')}><span className="mobile-back-label">列表</span></TooltipButton>
             <span className="reading-empty-icon"><Icon name={selectedFolder === 'outbox' ? 'send' : selectedFolder === 'snoozed' ? 'clock' : 'inbox'} size={25} /></span>
             <strong>{selectedFolder === 'outbox' ? '发件箱为空' : selectedFolder === 'snoozed' ? '稍后处理为空' : accounts.length === 0 ? '添加邮箱后开始阅读' : '选择一封邮件开始阅读'}</strong>
@@ -3420,7 +3445,7 @@ function App() {
           <div className="settings-row"><span><Icon name="menu" size={17} /><span>界面密度<small>{displayDensity === 'compact' ? '紧凑 · 高信息密度' : viewportRequiresCompactDensity ? '窗口较小，已自动紧凑' : '舒适 · 更大间距'}</small></span></span><button type="button" aria-label="紧凑桌面布局" className={`toggle-switch ${displayDensity === 'compact' ? 'is-on' : ''}`} onClick={() => setDisplayDensity((value) => value === 'compact' ? 'comfortable' : 'compact')}><span /></button></div>
           <label className="settings-row settings-select-row"><span><Icon name="clock" size={17} /><span>撤销发送<small>{undoSendSeconds === 0 ? '关闭后立即连接邮件服务器发送' : `发送后保留 ${undoSendSeconds} 秒撤销窗口`}</small></span></span><select aria-label="撤销发送等待时间" value={undoSendSeconds} onChange={(event) => handleUndoSendSecondsChange(asUndoSendSeconds(Number(event.target.value)))}><option value={0}>关闭</option><option value={5}>5 秒</option><option value={10}>10 秒</option><option value={20}>20 秒</option><option value={30}>30 秒</option></select></label>
           <label className="settings-row css-row"><span><Icon name="brush" size={17} /><span>用户 CSS<small>{sanitizedCustomCss.removedUnsafeSyntax ? '已过滤外部资源与危险语法' : '可覆盖 MailGo 视觉变量；不加载外部资源'}</small></span></span><textarea value={customCss} onChange={(event) => setCustomCss(event.target.value)} placeholder="例如：:root { --accent: #ff6b8a; }" /></label>
-          <AccountSignatureSettings accounts={accounts} initialAccountId={selectedAccountId} onSave={saveAccountSignature} />
+          <Suspense fallback={<DeferredSettingsLoading />}><AccountSignatureSettings accounts={accounts} initialAccountId={selectedAccountId} onSave={saveAccountSignature} /></Suspense>
           <div className="settings-row"><span><Icon name="shieldCheck" size={17} /><span>屏蔽规则<small>{mailRules.length ? `${mailRules.length} 条 · 加密保存在本机` : '按发件人或域名过滤，不上传云端'}</small></span></span><button type="button" className="settings-text-button" onClick={() => { setSettingsOpen(false); setMailRuleError(''); setMailRulesOpen(true) }}>管理</button></div>
           <div className="settings-row"><span><Icon name="cloud" size={17} /><span>关闭时后台运行<small>最小化到系统托盘并继续同步</small></span></span><button type="button" className={`toggle-switch ${minimizeToTray ? 'is-on' : ''}`} onClick={() => { const next = !minimizeToTray; setMinimizeToTray(next); void invoke('app.set_minimize_to_tray', { enabled: next }).catch(() => undefined) }}><span /></button></div>
           <div className="settings-row"><span><Icon name="image" size={17} /><span>加载远程图片<small>{remoteImagesEnabled ? '已允许 HTTPS 图片，可能包含追踪像素' : '默认屏蔽，保护隐私；CID 内嵌图片不受影响'}</small></span></span><button type="button" aria-label="加载远程图片" className={`toggle-switch ${remoteImagesEnabled ? 'is-on' : ''}`} onClick={() => { const next = !remoteImagesEnabled; setRemoteImagesEnabled(next); void invoke('app.set_remote_images', { enabled: next }).catch(() => undefined) }}><span /></button></div>
@@ -3432,17 +3457,17 @@ function App() {
       </AnimatePresence>
 
       <AnimatePresence>{isHelpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}</AnimatePresence>
-      <AnimatePresence>{isMailRulesOpen && <MailRuleManager accounts={accounts} rules={mailRules} initialAccountId={selectedAccountId} busyKey={mailRuleBusyKey} externalError={mailRuleError} onAdd={addMailRule} onRemove={removeMailRule} onClose={() => { if (!mailRuleBusyKey) setMailRulesOpen(false) }} />}</AnimatePresence>
-      <AnimatePresence>{pendingExternalLink && <ExternalLinkDialog inspection={pendingExternalLink} onClose={() => setPendingExternalLink(null)} onOpen={openExternalUrl} onError={(message) => pushToast(message, 'error')} />}</AnimatePresence>
-      <AnimatePresence>{pendingOutboxDiscard && <ConfirmDialog
+      <AnimatePresence>{isMailRulesOpen && <Suspense fallback={<DeferredModalLoading label="正在载入屏蔽规则…" />}><MailRuleManager accounts={accounts} rules={mailRules} initialAccountId={selectedAccountId} busyKey={mailRuleBusyKey} externalError={mailRuleError} onAdd={addMailRule} onRemove={removeMailRule} onClose={() => { if (!mailRuleBusyKey) setMailRulesOpen(false) }} /></Suspense>}</AnimatePresence>
+      <AnimatePresence>{pendingExternalLink && <Suspense fallback={<DeferredModalLoading label="正在检查外部链接…" />}><ExternalLinkDialog inspection={pendingExternalLink} onClose={() => setPendingExternalLink(null)} onOpen={openExternalUrl} onError={(message) => pushToast(message, 'error')} /></Suspense>}</AnimatePresence>
+      <AnimatePresence>{pendingOutboxDiscard && <Suspense fallback={<DeferredModalLoading label="正在准备确认信息…" />}><ConfirmDialog
         title="删除这封待发送邮件？"
         detail={`“${pendingOutboxDiscard.subject || '(无主题)'}”及其本地草稿会一起删除，此操作无法撤销。`}
         confirmLabel="删除待发送"
         busy={outboxAction?.id === pendingOutboxDiscard.id && outboxAction.kind === 'discard'}
         onCancel={() => setPendingOutboxDiscard(null)}
         onConfirm={() => { void discardQueuedMessage() }}
-      />}</AnimatePresence>
-      <AnimatePresence>{isComposeOpen && <ComposeModal
+      /></Suspense>}</AnimatePresence>
+      <AnimatePresence>{isComposeOpen && <Suspense fallback={<DeferredModalLoading label="正在打开写信窗口…" />}><ComposeModal
         mode={composeMode}
         source={composeSource}
         accountId={composeSource?.accountId ?? selectedAccountId ?? accounts[0]?.id}
@@ -3454,7 +3479,7 @@ function App() {
         onClose={() => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts() }}
         onSent={handleComposeSent}
         onError={(message) => pushToast(message, 'error')}
-      />}</AnimatePresence>
+      /></Suspense>}</AnimatePresence>
       <AnimatePresence>{isAccountModalOpen && <AccountModal editingAccountId={editingAccountId} provider={provider} setProvider={changeProvider} providerDefinition={selectedProvider} accountEmail={accountEmail} setAccountEmail={setAccountEmail} authorizationCode={authorizationCode} setAuthorizationCode={setAuthorizationCode} showAuthorizationCode={showAuthorizationCode} setShowAuthorizationCode={setShowAuthorizationCode} customImapHost={customImapHost} setCustomImapHost={setCustomImapHost} customImapPort={customImapPort} setCustomImapPort={setCustomImapPort} customImapSecurity={customImapSecurity} setCustomImapSecurity={setCustomImapSecurity} customSmtpHost={customSmtpHost} setCustomSmtpHost={setCustomSmtpHost} customSmtpPort={customSmtpPort} setCustomSmtpPort={setCustomSmtpPort} customSmtpSecurity={customSmtpSecurity} setCustomSmtpSecurity={setCustomSmtpSecurity} customAuthentication={customAuthentication} setCustomAuthentication={setCustomAuthentication} deviceFlow={deviceFlow} diagnostic={editingAccountId ? connectionDiagnostics[editingAccountId] : undefined} isBusy={isAddingAccount} onClose={closeAccountModal} onOpenProvider={() => { void handleOpenProvider() }} onCopy={handleCopy} onAdd={handleAddAccount} onRemove={handleRemoveAccount} onDiagnose={() => { void handleDiagnoseAccount() }} />}</AnimatePresence>
       <div className="toast-stack" aria-live="polite">{toasts.map((toast) => <ToastView key={toast.id} toast={toast} onAction={(item) => { void handleUndoSend(item) }} />)}</div>
     </div>
