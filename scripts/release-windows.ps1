@@ -91,6 +91,9 @@ try {
     & npm run test:conditional-refresh
     if ($LASTEXITCODE -ne 0) { throw "conditional mailbox refresh checks failed with exit code $LASTEXITCODE" }
 
+    & npm run test:message-hydration
+    if ($LASTEXITCODE -ne 0) { throw "message hydration checks failed with exit code $LASTEXITCODE" }
+
     & npm run test:rich-compose
     if ($LASTEXITCODE -ne 0) { throw "rich compose checks failed with exit code $LASTEXITCODE" }
 

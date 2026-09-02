@@ -2672,8 +2672,9 @@ fn error_chain_text(error: &anyhow::Error) -> String {
         .to_ascii_lowercase()
 }
 
-/// Download and parse one full message only when the reader asks for it. The raw message can be
-/// retained by a caller in an account cache, but the returned representation is sanitized.
+/// Download and parse one full message when the reader or its bounded adjacent read-ahead asks for
+/// it. The raw message can be retained by a caller in an account cache, but the returned
+/// representation is sanitized.
 pub fn fetch_message(
     account_id: &str,
     profile: ProviderProfile,

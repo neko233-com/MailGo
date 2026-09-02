@@ -16,6 +16,7 @@ import { folderLabels, providerDefinitions, sampleAccounts, sampleMails, sampleO
 import { mapWithConcurrency } from './lib/asyncPool'
 import { invoke, readNativeState } from './lib/ipc'
 import { inspectExternalLink, type ExternalLinkInspection } from './linkSafety'
+import { mailNeedsBodyHydration, selectBodyHydrationCandidates } from './messageHydration'
 import { appendSignatureToComposeHtml, plainTextToComposeHtml, sanitizeComposeHtml } from './richText'
 import { appendAccountSignature, normalizeAccountSignature } from './signature'
 import { formatScheduledAt } from './scheduleSend'
@@ -255,6 +256,10 @@ function nativeMoveTargets(account: MailAccount, folders: string[] | undefined, 
 
 function nativeMailboxKey(accountId: string, folder: string) {
   return `${accountId}::${folder}`
+}
+
+function nativeFolderCountKey(accountId: string, folder: string) {
+  return `${accountId}\u0000${folder.toLocaleLowerCase()}`
 }
 
 function sameStringArrayRecord(left: Record<string, string[]>, right: Record<string, string[]>) {
@@ -1450,16 +1455,17 @@ function App() {
   }, [])
 
   const selectedProvider = providerFor(provider)
+  const accountsById = useMemo(() => new Map(accounts.map((account) => [account.id, account])), [accounts])
   const queuedDraftKeys = useMemo(() => new Set(nativeOutboxItems.flatMap((item) => item.draftId ? [`${item.accountId}\u0000${item.draftId}`] : [])), [nativeOutboxItems])
   const visibleNativeDrafts = useMemo(() => nativeDrafts.filter((draft) => !queuedDraftKeys.has(`${draft.accountId}\u0000${draft.id}`)), [nativeDrafts, queuedDraftKeys])
   const localDraftMails = useMemo(() => visibleNativeDrafts.flatMap((draft) => {
-    const account = accounts.find((item) => item.id === draft.accountId)
+    const account = accountsById.get(draft.accountId)
     return account ? [draftToUi(draft, account)] : []
-  }), [accounts, visibleNativeDrafts])
+  }), [accountsById, visibleNativeDrafts])
   const outboxMails = useMemo(() => nativeOutboxItems.flatMap((item) => {
-    const account = accounts.find((candidate) => candidate.id === item.accountId)
+    const account = accountsById.get(item.accountId)
     return account ? [outboxToUi(item, account)] : []
-  }), [accounts, nativeOutboxItems])
+  }), [accountsById, nativeOutboxItems])
   const allMails = useMemo(() => {
     const merged = new Map<string, MailMessage>()
     for (const mail of localSearchMails) merged.set(mail.id, mail)
@@ -1473,12 +1479,21 @@ function App() {
     () => new Set([...localSearchMails, ...serverSearchMails].map((mail) => mail.id)),
     [localSearchMails, serverSearchMails],
   )
+  const unreadNativeFolderCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const mail of allMails) {
+      if (!mail.unread || !mail.nativeFolder) continue
+      const key = nativeFolderCountKey(mail.accountId, mail.nativeFolder)
+      counts.set(key, (counts.get(key) ?? 0) + 1)
+    }
+    return counts
+  }, [allMails])
   const displayedFolderLabels = useMemo(() => {
     if (!isNativeRuntime) return folderLabels.map((folder) => folder.id === 'outbox' ? { ...folder, unread: nativeOutboxItems.length } : folder)
     const matchesFixedFolder = (mail: MailMessage, folder: FolderId) => {
       if (folder === 'starred') return mail.starred
       if (folder === 'outbox') return mail.folder === 'outbox'
-      const account = accounts.find((item) => item.id === mail.accountId)
+      const account = accountsById.get(mail.accountId)
       return mail.nativeFolder && account
         ? isSameNativeFolder(mail.nativeFolder, nativeFolderName(account, folder))
         : mail.folder === folder
@@ -1491,7 +1506,7 @@ function App() {
           ? visibleNativeDrafts.length
         : allMails.filter((mail) => matchesFixedFolder(mail, folder.id) && mail.unread).length,
     }))
-  }, [accounts, allMails, isNativeRuntime, nativeOutboxItems.length, visibleNativeDrafts.length])
+  }, [accountsById, allMails, isNativeRuntime, nativeOutboxItems.length, visibleNativeDrafts.length])
   const visibleMails = useMemo(() => {
     const lowerQuery = deferredQuery.trim().toLowerCase()
     return allMails.filter((mail) => {
@@ -1503,7 +1518,7 @@ function App() {
           : selectedFolder === 'outbox'
             ? mail.folder === 'outbox'
           : (() => {
-              const account = accounts.find((item) => item.id === mail.accountId)
+              const account = accountsById.get(mail.accountId)
               return nativeFolder && account
                 ? isSameNativeFolder(nativeFolder, nativeFolderName(account, selectedFolder))
                 : mail.folder === selectedFolder
@@ -1519,7 +1534,7 @@ function App() {
         || `${mail.senderName} ${mail.subject} ${mail.preview}`.toLowerCase().includes(lowerQuery)
       return folderMatch && accountMatch && categoryMatch && adMatch && unreadMatch && queryMatch
     })
-  }, [accounts, allMails, deferredQuery, filterUnread, hideAds, nativeSearchResultIds, selectedAccountId, selectedCategory, selectedFolder, selectedNativeFolder])
+  }, [accountsById, allMails, deferredQuery, filterUnread, hideAds, nativeSearchResultIds, selectedAccountId, selectedCategory, selectedFolder, selectedNativeFolder])
 
   const visibleThreads = useMemo(() => buildMailThreads(visibleMails), [visibleMails])
 
@@ -1544,7 +1559,7 @@ function App() {
     setHtmlMode(Boolean(selectedMail.hasHtml))
   }, [selectedMail.hasHtml, selectedMail.id])
   const selectedThread = visibleThreads.find((thread) => thread.messages.some((mail) => mail.id === selectedMail.id)) ?? visibleThreads[0]
-  const selectedMailAccount = accounts.find((account) => account.id === selectedMail.accountId)
+  const selectedMailAccount = accountsById.get(selectedMail.accountId)
   const selectedOutboxItem = selectedMail.outboxId
     ? nativeOutboxItems.find((item) => item.id === selectedMail.outboxId && item.accountId === selectedMail.accountId)
     : undefined
@@ -1614,6 +1629,11 @@ function App() {
     return request
   }, [])
 
+  const bodyHydrationCandidates = useMemo(
+    () => selectBodyHydrationCandidates(visibleMails, selectedMail.id),
+    [selectedMail.id, visibleMails],
+  )
+
   const selectMail = async (mail: MailMessage) => {
     setSelectedMailId(mail.id)
     setMobilePane('reading')
@@ -1642,10 +1662,11 @@ function App() {
             pushToast('邮件仍未标记为已读，请重新授权或稍后重试', 'error')
           })
       }
+      if (!mailNeedsBodyHydration(mail)) return
       setLoadingMessageId(mail.id)
       try {
         const result = await requestNativeMessage(mail)
-        const account = accounts.find((item) => item.id === mail.accountId)
+        const account = accountsById.get(mail.accountId)
         if (account && result.message) {
           const converted = nativeMessageToUi(result.message, account)
           mapMailSources((item) => item.id === mail.id ? converted : item)
@@ -1659,21 +1680,52 @@ function App() {
   }
 
   useEffect(() => {
-    if (!isNativeRuntime || selectedMail.nativeUid == null || selectedMail.id === 'empty-mail') return
-    if (!(selectedMail.body.length === 1 && selectedMail.body[0] === '正在加载邮件正文…')) return
-    const timer = window.setTimeout(() => {
-      void requestNativeMessage(selectedMail).then((result) => {
-        const account = accounts.find((item) => item.id === selectedMail.accountId)
-        if (!account || !result.message) return
+    if (!isNativeRuntime || offlineMode || bodyHydrationCandidates.length === 0) return
+    const candidate = bodyHydrationCandidates[0]
+    const isForeground = candidate.id === selectedMail.id
+    const idleScheduler = window as unknown as {
+      requestIdleCallback?: (callback: IdleRequestCallback, options?: IdleRequestOptions) => number
+      cancelIdleCallback?: (handle: number) => void
+    }
+    let disposed = false
+    let timer: number | undefined
+    let idleRequest: number | undefined
+
+    const hydrate = async () => {
+      if (disposed) return
+      if (isForeground) setLoadingMessageId(candidate.id)
+      try {
+        const result = await requestNativeMessage(candidate)
+        if (disposed || !result.message) return
+        const account = accountsById.get(candidate.accountId)
+        if (!account) return
         const converted = nativeMessageToUi(result.message, account)
         startTransition(() => {
-          setMails((current) => current.map((mail) => mail.id === selectedMail.id ? converted : mail))
-          setServerSearchMails((current) => current.map((mail) => mail.id === selectedMail.id ? converted : mail))
+          setMails((current) => current.map((mail) => mail.id === candidate.id ? converted : mail))
+          setServerSearchMails((current) => current.map((mail) => mail.id === candidate.id ? converted : mail))
         })
-      }).catch(() => undefined)
-    }, 700)
-    return () => window.clearTimeout(timer)
-  }, [accounts, isNativeRuntime, offlineMode, requestNativeMessage, selectedMail.accountId, selectedMail.body, selectedMail.id, selectedMail.nativeUid])
+      } catch {
+        // Read-ahead is opportunistic. An explicit selection keeps its own visible retry path.
+      } finally {
+        if (!disposed && isForeground) {
+          setLoadingMessageId((current) => current === candidate.id ? null : current)
+        }
+      }
+    }
+
+    if (isForeground) {
+      timer = window.setTimeout(() => { void hydrate() }, 40)
+    } else if (idleScheduler.requestIdleCallback) {
+      idleRequest = idleScheduler.requestIdleCallback(() => { void hydrate() }, { timeout: 800 })
+    } else {
+      timer = window.setTimeout(() => { void hydrate() }, 320)
+    }
+    return () => {
+      disposed = true
+      if (timer != null) window.clearTimeout(timer)
+      if (idleRequest != null) idleScheduler.cancelIdleCallback?.(idleRequest)
+    }
+  }, [accountsById, bodyHydrationCandidates, isNativeRuntime, offlineMode, requestNativeMessage, selectedMail.id])
 
   const toggleStar = (mail: MailMessage) => {
     const nextStarred = !mail.starred
@@ -1816,7 +1868,7 @@ function App() {
 
   const moveMail = async (mail: MailMessage, operation: 'archive' | 'delete' | 'spam' | 'inbox') => {
     if (mail.id === 'empty-mail') return false
-    const account = accounts.find((item) => item.id === mail.accountId)
+    const account = accountsById.get(mail.accountId)
     if (operation === 'archive' && mail.folder === 'archive') return false
     if (operation === 'spam' && mail.folder === 'spam') return false
     if (operation === 'inbox' && mail.folder === 'inbox') return false
@@ -1856,7 +1908,7 @@ function App() {
 
   const moveMailToFolder = async (mail: MailMessage, targetFolder: string) => {
     if (mail.id === 'empty-mail' || !isNativeRuntime || mail.nativeUid == null) return false
-    const account = accounts.find((item) => item.id === mail.accountId)
+    const account = accountsById.get(mail.accountId)
     if (!account || !targetFolder.trim()) return false
     const result = await invoke<{ queued?: boolean }>('mail.move', {
       accountId: mail.accountId,
@@ -2029,7 +2081,7 @@ function App() {
     const first = allMails.find((mail) => {
       if (folder === 'starred') return mail.starred
       if (folder === 'outbox') return mail.folder === 'outbox'
-      const account = accounts.find((item) => item.id === mail.accountId)
+      const account = accountsById.get(mail.accountId)
       return mail.nativeFolder && account
         ? isSameNativeFolder(mail.nativeFolder, nativeFolderName(account, folder))
         : mail.folder === folder
@@ -2547,7 +2599,7 @@ function App() {
       pushToast('请先完成 Outlook 设备验证，完成后再开始同步', 'info')
       return
     }
-    const existingAccount = editingAccountId ? accounts.find((account) => account.id === editingAccountId) : undefined
+    const existingAccount = editingAccountId ? accountsById.get(editingAccountId) : undefined
     const changedMailboxIdentity = existingAccount && (
       existingAccount.provider !== provider
       || existingAccount.email.toLowerCase() !== accountEmail.trim().toLowerCase()
@@ -2684,7 +2736,7 @@ function App() {
 
   const handleRemoveAccount = async () => {
     if (!editingAccountId) return
-    const account = accounts.find((item) => item.id === editingAccountId)
+    const account = editingAccountId ? accountsById.get(editingAccountId) : undefined
     if (!account || !window.confirm(`确定移除 ${account.label}（${account.email}）吗？本机凭据与缓存也会删除。`)) return
     try {
       if (isNativeRuntime) await invoke('accounts.remove', { id: account.id })
@@ -2855,6 +2907,7 @@ function App() {
     : selectedCategory
       ? (smartCategories.find((category) => category.id === selectedCategory)?.label ?? '智能分类')
       : (displayedFolderLabels.find((folder) => folder.id === selectedFolder)?.label ?? '收件箱')
+  const composeAccount = accountsById.get(composeSource?.accountId ?? selectedAccountId ?? accounts[0]?.id ?? '')
   const hasAccountNeedingAuth = accounts.some((account) => account.status === 'needs-auth')
   const hasOfflineAccount = accounts.some((account) => account.status === 'offline')
   const syncStatusLabel = nativeStateError
@@ -2957,7 +3010,7 @@ function App() {
               <div className="server-folders-list">
                 {nativeFolderGroups.flatMap(({ account, folders }) => folders.map((folder) => {
                   const selected = Boolean(selectedNativeFolder && selectedNativeFolder.accountId === account.id && isSameNativeFolder(selectedNativeFolder.name, folder))
-                  const unread = allMails.filter((mail) => mail.accountId === account.id && mail.nativeFolder && isSameNativeFolder(mail.nativeFolder, folder) && mail.unread).length
+                  const unread = unreadNativeFolderCounts.get(nativeFolderCountKey(account.id, folder)) ?? 0
                   const folderLabel = nativeFolderLabel(folder, nativeFolderLabels[account.id]?.[folder])
                   return <button key={`${account.id}::${folder}`} type="button" aria-label={`${account.label} · ${folderLabel}${unread > 0 ? `，${unread} 封未读` : ''}`} className={`nav-row server-folder-row ${selected ? 'is-selected' : ''}`} onClick={() => selectNativeFolder(account, folder)} title={`${account.label} · ${folderLabel}`}>
                     <span className="nav-icon"><Icon name="folder" size={17} weight={selected ? 'Filled' : 'Outline'} /></span>
@@ -3108,7 +3161,7 @@ function App() {
             </div>
           </div>
           <div className="reading-scroll">
-            <div className="reading-heading"><div><h1>{selectedMail.subject}</h1><div className="message-tags"><span className="tag tag-account"><ProviderMark provider={accounts.find((account) => account.id === selectedMail.accountId)?.provider ?? 'google'} size="sm" /> {accounts.find((account) => account.id === selectedMail.accountId)?.label ?? 'Google'}</span>{selectedThread && selectedThread.messages.length > 1 && <span className="tag"><Icon name="message" size={13} />{selectedThread.messages.length} 封会话</span>}{selectedMail.hasHtml && <span className="tag">HTML 邮件</span>}</div></div><TooltipButton label={selectedMail.starred ? '取消星标' : '添加星标'} className={`reading-star ${selectedMail.starred ? 'is-starred' : ''}`} onClick={() => toggleStar(selectedMail)}><Icon name="star" size={24} weight={selectedMail.starred ? 'Filled' : 'Outline'} /></TooltipButton></div>
+            <div className="reading-heading"><div><h1>{selectedMail.subject}</h1><div className="message-tags"><span className="tag tag-account"><ProviderMark provider={selectedMailAccount?.provider ?? 'google'} size="sm" /> {selectedMailAccount?.label ?? 'Google'}</span>{selectedThread && selectedThread.messages.length > 1 && <span className="tag"><Icon name="message" size={13} />{selectedThread.messages.length} 封会话</span>}{selectedMail.hasHtml && <span className="tag">HTML 邮件</span>}</div></div><TooltipButton label={selectedMail.starred ? '取消星标' : '添加星标'} className={`reading-star ${selectedMail.starred ? 'is-starred' : ''}`} onClick={() => toggleStar(selectedMail)}><Icon name="star" size={24} weight={selectedMail.starred ? 'Filled' : 'Outline'} /></TooltipButton></div>
             <ConversationStack thread={selectedThread} selectedId={selectedMail.id} loadingId={loadingMessageId} onSelect={(mail) => { void selectMail(mail) }} />
             <div className="sender-row"><Avatar message={selectedMail} size="lg" /><div className="sender-copy"><div><strong>{selectedMail.senderName}</strong> <span>&lt;{selectedMail.from}&gt;</span></div><div className="recipient">收件人： {selectedMailAccount?.label ?? '当前账户'} &lt;{selectedMailAccount?.email ?? '—'}&gt;</div></div><time>{selectedMail.timestamp}<br /><span>今天</span></time><TooltipButton label="发件人更多信息"><Icon name="more" size={19} /></TooltipButton></div>
             {loadingMessageId === selectedMail.id && <div className="reading-loading-strip" role="status"><span className="loading-spinner" aria-hidden="true" /><span><strong>正在补全邮件正文</strong>列表和已缓存摘要仍可继续浏览</span></div>}
@@ -3166,8 +3219,8 @@ function App() {
         mode={composeMode}
         source={composeSource}
         accountId={composeSource?.accountId ?? selectedAccountId ?? accounts[0]?.id}
-        senderEmail={accounts.find((account) => account.id === (composeSource?.accountId ?? selectedAccountId))?.email ?? accounts[0]?.email}
-        signature={accounts.find((account) => account.id === (composeSource?.accountId ?? selectedAccountId ?? accounts[0]?.id))?.signature ?? ''}
+        senderEmail={composeAccount?.email}
+        signature={composeAccount?.signature ?? ''}
         draftId={composeDraftId}
         onDraftChanged={handleDraftChanged}
         onDraftRemoved={handleDraftRemoved}
