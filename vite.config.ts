@@ -7,6 +7,9 @@ export default defineConfig({
   server: {
     host: 'localhost',
     port: 1420,
+    watch: {
+      ignored: ['**/artifacts/**'],
+    },
   },
   build: {
     target: 'es2022',
