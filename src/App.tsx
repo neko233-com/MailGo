@@ -5,6 +5,7 @@ import appIconUrl from '../resources/icons/mailgo-64.png'
 import type { ConnectionDiagnosticViewState, DeviceFlowState } from './components/AccountModal'
 import { Icon, type IconName } from './components/Icon'
 import { ProviderMark } from './components/ProviderMark'
+import type { DisplayDensity, UndoSendSeconds } from './components/SettingsPopover'
 import { SnoozeControl } from './components/SnoozeControl'
 import { TooltipButton } from './components/TooltipButton'
 import type { ComposeMode } from './compose-thread'
@@ -22,7 +23,6 @@ import { buildMailThreads, type MailThread } from './threading'
 import { sanitizeHtml } from './htmlSafety'
 import type { FolderId, MailAccount, MailAttachment, MailMessage, MailRuleKind, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeConnectionDiagnostic, NativeDeviceStartResponse, NativeDraft, NativeLocalSearchResponse, NativeMailboxResponse, NativeMailRule, NativeMailRuleSnapshot, NativeMessageResponse, NativeOutboxActionResponse, NativeOutboxItem, NativeOutboxRecallResponse, NativeOutboxSnapshot, NativeQueueStatus, NativeSearchResponse, NativeSendResponse, NativeSnoozeSnapshot, NativeSyncItem, NativeSyncResponse, NativeUndoSendResponse, Provider, SmartCategory, ThemeMode } from './types'
 
-const AccountSignatureSettings = lazy(async () => ({ default: (await import('./components/AccountSignatureSettings')).AccountSignatureSettings }))
 const ConfirmDialog = lazy(async () => ({ default: (await import('./components/ConfirmDialog')).ConfirmDialog }))
 const ExternalLinkDialog = lazy(async () => ({ default: (await import('./components/ExternalLinkDialog')).ExternalLinkDialog }))
 const MailRuleManager = lazy(async () => ({ default: (await import('./components/MailRuleManager')).MailRuleManager }))
@@ -30,15 +30,14 @@ const OutboxDetail = lazy(async () => ({ default: (await import('./components/Ou
 const ComposeModal = lazy(async () => ({ default: (await import('./components/ComposeModal')).ComposeModal }))
 const AccountModal = lazy(async () => ({ default: (await import('./components/AccountModal')).AccountModal }))
 const HelpModal = lazy(async () => ({ default: (await import('./components/HelpModal')).HelpModal }))
+const SettingsPopover = lazy(async () => ({ default: (await import('./components/SettingsPopover')).SettingsPopover }))
 
 type ToastTone = 'info' | 'success' | 'error'
-type UndoSendSeconds = 0 | 5 | 10 | 20 | 30
 type ToastAction = { kind: 'undo-send'; accountId: string; outboxId: string; draftId?: string }
 type Toast = { id: number; message: string; tone: ToastTone; durationMs: number; action?: ToastAction }
 type ToastOptions = { action?: ToastAction; durationMs?: number; onExpire?: () => void }
 type ActionMenu = 'bulk' | 'message'
 type MobilePane = 'list' | 'reading'
-type DisplayDensity = 'compact' | 'comfortable'
 type MailContentScale = 70 | 80 | 90 | 100
 type MailMoveTarget = { folder: string; label: string; icon: IconName }
 type OutboxAction = { id: string; kind: 'edit' | 'retry' | 'discard' }
@@ -584,8 +583,8 @@ function DeferredPaneLoading({ label }: { label: string }) {
   return <div className="deferred-pane-loading" role="status" aria-live="polite"><span className="loading-spinner" aria-hidden="true" /><span>{label}</span></div>
 }
 
-function DeferredSettingsLoading() {
-  return <div className="settings-row deferred-settings-loading" role="status"><span><span className="loading-spinner loading-spinner-small" aria-hidden="true" /><span>正在载入签名设置<small>其他偏好仍可立即调整</small></span></span></div>
+function DeferredSettingsPopoverLoading() {
+  return <div className="settings-popover deferred-settings-popover-loading" role="status" aria-live="polite"><span className="loading-spinner loading-spinner-small" aria-hidden="true" /><span>正在载入偏好设置…</span></div>
 }
 
 function App() {
@@ -3323,21 +3322,34 @@ function App() {
       </div>
 
       <AnimatePresence>
-        {isSettingsOpen && <motion.div className="settings-popover" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}>
-          <div className="settings-title"><span><Icon name="settings" size={17} />偏好设置</span><TooltipButton label="关闭设置" onClick={() => setSettingsOpen(false)}><Icon name="close" size={17} /></TooltipButton></div>
-          <div className="settings-row"><span><Icon name={theme === 'dark' ? 'moon' : 'theme'} size={17} /><span>外观主题<small>{theme === 'dark' ? '深色 · 午夜蓝' : '浅色 · 雪白'}</small></span></span><button type="button" className="theme-switch" onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}><span className={theme === 'light' ? 'is-light' : ''}>{theme === 'dark' ? '深' : '浅'}</span></button></div>
-          <div className="settings-row"><span><Icon name="menu" size={17} /><span>界面密度<small>{displayDensity === 'compact' ? '紧凑 · 高信息密度' : viewportRequiresCompactDensity ? '窗口较小，已自动紧凑' : '舒适 · 更大间距'}</small></span></span><button type="button" aria-label="紧凑桌面布局" className={`toggle-switch ${displayDensity === 'compact' ? 'is-on' : ''}`} onClick={() => setDisplayDensity((value) => value === 'compact' ? 'comfortable' : 'compact')}><span /></button></div>
-          <label className="settings-row settings-select-row"><span><Icon name="clock" size={17} /><span>撤销发送<small>{undoSendSeconds === 0 ? '关闭后立即连接邮件服务器发送' : `发送后保留 ${undoSendSeconds} 秒撤销窗口`}</small></span></span><select aria-label="撤销发送等待时间" value={undoSendSeconds} onChange={(event) => handleUndoSendSecondsChange(asUndoSendSeconds(Number(event.target.value)))}><option value={0}>关闭</option><option value={5}>5 秒</option><option value={10}>10 秒</option><option value={20}>20 秒</option><option value={30}>30 秒</option></select></label>
-          <label className="settings-row css-row"><span><Icon name="brush" size={17} /><span>用户 CSS<small>{sanitizedCustomCss.removedUnsafeSyntax ? '已过滤外部资源与危险语法' : '可覆盖 MailGo 视觉变量；不加载外部资源'}</small></span></span><textarea value={customCss} onChange={(event) => setCustomCss(event.target.value)} placeholder="例如：:root { --accent: #ff6b8a; }" /></label>
-          <Suspense fallback={<DeferredSettingsLoading />}><AccountSignatureSettings accounts={accounts} initialAccountId={selectedAccountId} onSave={saveAccountSignature} /></Suspense>
-          <div className="settings-row"><span><Icon name="shieldCheck" size={17} /><span>屏蔽规则<small>{mailRules.length ? `${mailRules.length} 条 · 加密保存在本机` : '按发件人或域名过滤，不上传云端'}</small></span></span><button type="button" className="settings-text-button" onClick={() => { setSettingsOpen(false); setMailRuleError(''); setMailRulesOpen(true) }}>管理</button></div>
-          <div className="settings-row"><span><Icon name="cloud" size={17} /><span>关闭时后台运行<small>最小化到系统托盘并继续同步</small></span></span><button type="button" className={`toggle-switch ${minimizeToTray ? 'is-on' : ''}`} onClick={() => { const next = !minimizeToTray; setMinimizeToTray(next); void invoke('app.set_minimize_to_tray', { enabled: next }).catch(() => undefined) }}><span /></button></div>
-          <div className="settings-row"><span><Icon name="image" size={17} /><span>加载远程图片<small>{remoteImagesEnabled ? '已允许 HTTPS 图片，可能包含追踪像素' : '默认屏蔽，保护隐私；CID 内嵌图片不受影响'}</small></span></span><button type="button" aria-label="加载远程图片" className={`toggle-switch ${remoteImagesEnabled ? 'is-on' : ''}`} onClick={() => { const next = !remoteImagesEnabled; setRemoteImagesEnabled(next); void invoke('app.set_remote_images', { enabled: next }).catch(() => undefined) }}><span /></button></div>
-          <div className="settings-row"><span><Icon name="bell" size={17} /><span>后台新邮件提醒<small>窗口隐藏时发送 Windows 托盘通知</small></span></span><button type="button" aria-label="后台新邮件提醒" className={`toggle-switch ${notificationsEnabled ? 'is-on' : ''}`} onClick={() => { const next = !notificationsEnabled; setNotificationsEnabled(next); void invoke('app.set_notifications', { enabled: next }).catch(() => undefined) }}><span /></button></div>
-          <div className="settings-actions"><button type="button" onClick={exportAccounts}><Icon name="download" size={16} />导出脱敏配置</button><button type="button" onClick={() => importInputRef.current?.click()} disabled={isImporting}><Icon name="folder" size={16} />{isImporting ? '导入中…' : '导入脱敏配置'}</button></div>
-          <div className="settings-security-note"><Icon name="shieldCheck" size={15} /><span>导出文件不包含授权码或令牌；导入后需重新授权。</span></div>
-          <input ref={importInputRef} type="file" accept="application/json,.json" hidden onChange={importAccounts} />
-        </motion.div>}
+        {isSettingsOpen && <Suspense fallback={<DeferredSettingsPopoverLoading />}><SettingsPopover
+          theme={theme}
+          displayDensity={displayDensity}
+          viewportRequiresCompactDensity={viewportRequiresCompactDensity}
+          undoSendSeconds={undoSendSeconds}
+          customCss={customCss}
+          removedUnsafeCustomCss={sanitizedCustomCss.removedUnsafeSyntax}
+          accounts={accounts}
+          selectedAccountId={selectedAccountId}
+          mailRuleCount={mailRules.length}
+          minimizeToTray={minimizeToTray}
+          remoteImagesEnabled={remoteImagesEnabled}
+          notificationsEnabled={notificationsEnabled}
+          isImporting={isImporting}
+          importInputRef={importInputRef}
+          onClose={() => setSettingsOpen(false)}
+          onToggleTheme={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}
+          onToggleDensity={() => setDisplayDensity((value) => value === 'compact' ? 'comfortable' : 'compact')}
+          onUndoSendSecondsChange={handleUndoSendSecondsChange}
+          onCustomCssChange={setCustomCss}
+          onSaveSignature={saveAccountSignature}
+          onOpenMailRules={() => { setSettingsOpen(false); setMailRuleError(''); setMailRulesOpen(true) }}
+          onToggleMinimizeToTray={() => { const next = !minimizeToTray; setMinimizeToTray(next); void invoke('app.set_minimize_to_tray', { enabled: next }).catch(() => undefined) }}
+          onToggleRemoteImages={() => { const next = !remoteImagesEnabled; setRemoteImagesEnabled(next); void invoke('app.set_remote_images', { enabled: next }).catch(() => undefined) }}
+          onToggleNotifications={() => { const next = !notificationsEnabled; setNotificationsEnabled(next); void invoke('app.set_notifications', { enabled: next }).catch(() => undefined) }}
+          onExportAccounts={exportAccounts}
+          onImportAccounts={importAccounts}
+        /></Suspense>}
       </AnimatePresence>
 
       <AnimatePresence>{isHelpOpen && <Suspense fallback={<DeferredModalLoading label="正在载入帮助中心…" />}><HelpModal onClose={() => setHelpOpen(false)} /></Suspense>}</AnimatePresence>
