@@ -15,7 +15,7 @@ import { mapWithConcurrency } from './lib/asyncPool'
 import { invoke, readNativeState } from './lib/ipc'
 import { inspectExternalLink, type ExternalLinkInspection } from './linkSafety'
 import { applyMailRules, domainFromSender } from './mailRules'
-import { countUnreadFixedFolders, isSameNativeFolder, nativeFolderName } from './mailboxCounts'
+import { buildMailboxCountIndex, isSameNativeFolder, nativeFolderCountKey, nativeFolderName } from './mailboxCounts'
 import { mailNeedsBodyHydration, selectBodyHydrationCandidates } from './messageHydration'
 import { normalizeAccountSignature } from './signature'
 import { formatScheduledAt } from './scheduleSend'
@@ -190,10 +190,6 @@ function nativeMoveTargets(account: MailAccount, folders: string[] | undefined, 
 
 function nativeMailboxKey(accountId: string, folder: string) {
   return `${accountId}::${folder}`
-}
-
-function nativeFolderCountKey(accountId: string, folder: string) {
-  return `${accountId}\u0000${folder.toLocaleLowerCase()}`
 }
 
 function sameStringArrayRecord(left: Record<string, string[]>, right: Record<string, string[]>) {
@@ -1522,15 +1518,7 @@ function App() {
     () => new Set([...localSearchMails, ...serverSearchMails].map((mail) => mail.id)),
     [localSearchMails, serverSearchMails],
   )
-  const unreadNativeFolderCounts = useMemo(() => {
-    const counts = new Map<string, number>()
-    for (const mail of allMails) {
-      if (!mail.unread || mail.blocked || !mail.nativeFolder || mail.snoozedUntil != null) continue
-      const key = nativeFolderCountKey(mail.accountId, mail.nativeFolder)
-      counts.set(key, (counts.get(key) ?? 0) + 1)
-    }
-    return counts
-  }, [allMails])
+  const mailboxCountIndex = useMemo(() => buildMailboxCountIndex(allMails, accounts), [accounts, allMails])
   const displayedFolderLabels = useMemo(() => {
     if (!isNativeRuntime) return folderLabels.map((folder) => folder.id === 'outbox'
       ? { ...folder, unread: nativeOutboxItems.length }
@@ -1539,7 +1527,6 @@ function App() {
         : folder.id === 'inbox'
           ? { ...folder, unread: Math.max(0, folder.unread - snoozedMails.filter((mail) => mail.unread).length) }
           : folder)
-    const unreadCounts = countUnreadFixedFolders(allMails, accounts)
     return folderLabels.map((folder) => ({
       ...folder,
       unread: folder.id === 'outbox'
@@ -1548,18 +1535,12 @@ function App() {
           ? snoozedMails.length
         : folder.id === 'drafts'
           ? visibleNativeDrafts.length
-        : unreadCounts.get(folder.id) ?? 0,
+        : mailboxCountIndex.fixedUnread.get(folder.id) ?? 0,
     }))
-  }, [accounts, allMails, isNativeRuntime, nativeOutboxItems.length, snoozedMails, visibleNativeDrafts.length])
+  }, [isNativeRuntime, mailboxCountIndex, nativeOutboxItems.length, snoozedMails, visibleNativeDrafts.length])
   const displayedAccountUnreadCounts = useMemo(() => {
-    const hiddenUnread = new Map<string, number>()
-    for (const mail of allMails) {
-      if (mail.unread && (mail.blocked || mail.snoozedUntil != null)) {
-        hiddenUnread.set(mail.accountId, (hiddenUnread.get(mail.accountId) ?? 0) + 1)
-      }
-    }
-    return new Map(accounts.map((account) => [account.id, Math.max(0, account.unread - (hiddenUnread.get(account.id) ?? 0))]))
-  }, [accounts, allMails])
+    return new Map(accounts.map((account) => [account.id, Math.max(0, account.unread - (mailboxCountIndex.hiddenUnreadByAccount.get(account.id) ?? 0))]))
+  }, [accounts, mailboxCountIndex])
   const visibleMails = useMemo(() => {
     const lowerQuery = deferredQuery.trim().toLowerCase()
     return allMails.filter((mail) => {
@@ -3142,7 +3123,7 @@ function App() {
               <div className="server-folders-list">
                 {nativeFolderGroups.flatMap(({ account, folders }) => folders.map((folder) => {
                   const selected = Boolean(selectedNativeFolder && selectedNativeFolder.accountId === account.id && isSameNativeFolder(selectedNativeFolder.name, folder))
-                  const unread = unreadNativeFolderCounts.get(nativeFolderCountKey(account.id, folder)) ?? 0
+                  const unread = mailboxCountIndex.nativeUnread.get(nativeFolderCountKey(account.id, folder)) ?? 0
                   const folderLabel = nativeFolderLabel(folder, nativeFolderLabels[account.id]?.[folder])
                   return <button key={`${account.id}::${folder}`} type="button" aria-label={`${account.label} · ${folderLabel}${unread > 0 ? `，${unread} 封未读` : ''}`} className={`nav-row server-folder-row ${selected ? 'is-selected' : ''}`} onClick={() => selectNativeFolder(account, folder)} title={`${account.label} · ${folderLabel}`}>
                     <span className="nav-icon"><Icon name="folder" size={17} weight={selected ? 'Filled' : 'Outline'} /></span>

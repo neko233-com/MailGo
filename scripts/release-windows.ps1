@@ -103,6 +103,9 @@ try {
     & npm run test:message-hydration
     if ($LASTEXITCODE -ne 0) { throw "message hydration checks failed with exit code $LASTEXITCODE" }
 
+    & npm run test:mailbox-counts
+    if ($LASTEXITCODE -ne 0) { throw "mailbox count index checks failed with exit code $LASTEXITCODE" }
+
     & npm run test:startup-bundles
     if ($LASTEXITCODE -ne 0) { throw "startup bundle checks failed with exit code $LASTEXITCODE" }
 

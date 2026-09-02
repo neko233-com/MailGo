@@ -4,11 +4,12 @@ import ts from 'typescript'
 
 const source = await readFile(new URL('../src/mailboxCounts.ts', import.meta.url), 'utf8')
 const appSource = await readFile(new URL('../src/App.tsx', import.meta.url), 'utf8')
+const releaseSource = await readFile(new URL('./release-windows.ps1', import.meta.url), 'utf8')
 const transpiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(transpiled).toString('base64')}`
-const { countUnreadFixedFolders, nativeFolderName } = await import(moduleUrl)
+const { buildMailboxCountIndex, nativeFolderCountKey, nativeFolderName } = await import(moduleUrl)
 
 const account = (id, provider) => ({ id, provider, label: provider, email: `${id}@example.invalid`, unread: 0, accent: '#888', status: 'synced', lastSync: '', signature: '' })
 const accounts = [account('google', 'google'), account('qq', 'qq'), account('outlook', 'outlook')]
@@ -51,7 +52,8 @@ const onePassMessages = new Proxy(messages, {
     return Reflect.get(target, property, receiver)
   },
 })
-const counts = countUnreadFixedFolders(onePassMessages, accounts)
+const countIndex = buildMailboxCountIndex(onePassMessages, accounts)
+const counts = countIndex.fixedUnread
 
 assert.equal(iterations, 1, 'folder counters must inspect the message collection once')
 assert.equal(counts.get('inbox'), 1)
@@ -61,13 +63,18 @@ assert.equal(counts.get('spam'), 1)
 assert.equal(counts.get('trash'), 1)
 assert.equal(counts.get('starred'), 1)
 assert.equal(counts.has('drafts'), false)
+assert.equal(countIndex.nativeUnread.get(nativeFolderCountKey('qq', 'INBOX')), 1)
+assert.equal(countIndex.nativeUnread.has(nativeFolderCountKey('qq', 'Receipts')), true)
+assert.equal(countIndex.hiddenUnreadByAccount.get('qq'), 2)
 assert.equal(nativeFolderName(accounts[0], 'sent'), '[Gmail]/Sent Mail')
 assert.equal(nativeFolderName(accounts[1], 'sent'), 'Sent Messages')
 assert.equal(nativeFolderName(accounts[2], 'trash'), 'Deleted Items')
-assert.match(appSource, /const unreadCounts = countUnreadFixedFolders\(allMails, accounts\)/)
+assert.match(appSource, /const mailboxCountIndex = useMemo\(\(\) => buildMailboxCountIndex\(allMails, accounts\)/)
+assert.doesNotMatch(appSource, /const unreadNativeFolderCounts = useMemo/)
 assert.match(appSource, /const visibleMailsById = useMemo\(\(\) => new Map/)
 assert.match(appSource, /const visibleThreadsByMessageId = useMemo/)
 assert.match(appSource, /const selectedMailIdSet = useMemo\(\(\) => new Set\(selectedMailIds\)/)
 assert.doesNotMatch(appSource, /selectedMailIds\.includes\(mail\.id\)/)
+assert.match(releaseSource, /npm run test:mailbox-counts/)
 
 console.log('single-pass fixed-folder counters and provider mappings passed')

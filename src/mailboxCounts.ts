@@ -18,8 +18,20 @@ export function isSameNativeFolder(left: string, right: string) {
   return left.toLocaleLowerCase() === right.toLocaleLowerCase()
 }
 
-export function countUnreadFixedFolders(mails: readonly MailMessage[], accounts: readonly MailAccount[]) {
-  const counts = new Map<FolderId, number>()
+export interface MailboxCountIndex {
+  fixedUnread: Map<FolderId, number>
+  nativeUnread: Map<string, number>
+  hiddenUnreadByAccount: Map<string, number>
+}
+
+export function nativeFolderCountKey(accountId: string, folder: string) {
+  return `${accountId.length}:${accountId}${folder.toLocaleLowerCase()}`
+}
+
+export function buildMailboxCountIndex(mails: readonly MailMessage[], accounts: readonly MailAccount[]): MailboxCountIndex {
+  const fixedUnread = new Map<FolderId, number>()
+  const nativeUnread = new Map<string, number>()
+  const hiddenUnreadByAccount = new Map<string, number>()
   const nativeFoldersByAccount = new Map<string, Map<string, FolderId>>()
   for (const account of accounts) {
     const nativeFolders = new Map<string, FolderId>()
@@ -30,14 +42,22 @@ export function countUnreadFixedFolders(mails: readonly MailMessage[], accounts:
   }
 
   for (const mail of mails) {
-    if (!mail.unread || mail.blocked || mail.snoozedUntil != null) continue
-    if (mail.starred) counts.set('starred', (counts.get('starred') ?? 0) + 1)
+    if (!mail.unread) continue
+    if (mail.blocked || mail.snoozedUntil != null) {
+      hiddenUnreadByAccount.set(mail.accountId, (hiddenUnreadByAccount.get(mail.accountId) ?? 0) + 1)
+      continue
+    }
+    if (mail.nativeFolder) {
+      const key = nativeFolderCountKey(mail.accountId, mail.nativeFolder)
+      nativeUnread.set(key, (nativeUnread.get(key) ?? 0) + 1)
+    }
+    if (mail.starred) fixedUnread.set('starred', (fixedUnread.get('starred') ?? 0) + 1)
 
     const folder = mail.nativeFolder
       ? nativeFoldersByAccount.get(mail.accountId)?.get(mail.nativeFolder.toLocaleLowerCase())
       : mail.folder
     if (!folder || !FIXED_UNREAD_FOLDER_SET.has(folder)) continue
-    counts.set(folder, (counts.get(folder) ?? 0) + 1)
+    fixedUnread.set(folder, (fixedUnread.get(folder) ?? 0) + 1)
   }
-  return counts
+  return { fixedUnread, nativeUnread, hiddenUnreadByAccount }
 }

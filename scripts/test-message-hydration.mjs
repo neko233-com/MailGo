@@ -81,7 +81,7 @@ assert.match(app, /selectBodyHydrationCandidates\(visibleMails, selectedMail\.id
 assert.match(app, /requestIdleCallback/)
 assert.match(app, /mailNeedsBodyHydration\(mail\)/)
 assert.match(app, /const accountsById = useMemo\(\(\) => new Map/)
-assert.match(app, /const unreadNativeFolderCounts = useMemo/)
+assert.match(app, /const mailboxCountIndex = useMemo\(\(\) => buildMailboxCountIndex/)
 assert.match(release, /npm run test:message-hydration/)
 
 console.log('Bounded body hydration and hot-path account index checks passed.')
