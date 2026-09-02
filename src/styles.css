@@ -466,24 +466,24 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .deferred-modal-loading strong { font-size: 12px; }
 .deferred-modal-loading small { color: var(--muted); font-size: 9px; }
 .deferred-pane-loading { min-height: 0; height: 100%; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--muted); font-size: 10px; }
-.account-modal { width: min(720px, calc(100vw - 36px)); max-height: calc(100vh - 20px); display: flex; flex-direction: column; overflow: hidden; border: 1px solid rgba(139, 160, 210, .34); border-radius: 12px; background: linear-gradient(145deg, #121e35, #0d172a); box-shadow: 0 34px 120px rgba(0, 0, 0, .52); }
+.account-modal { width: min(660px, calc(100vw - 28px)); max-height: calc(100vh - 20px); display: flex; flex-direction: column; overflow: hidden; border: 1px solid rgba(139, 160, 210, .34); border-radius: 10px; background: linear-gradient(145deg, #121e35, #0d172a); box-shadow: 0 28px 92px rgba(0, 0, 0, .48); }
 :root[data-theme='light'] .account-modal { background: #fff; border-color: var(--line-strong); }
-.modal-header { height: 52px; display: flex; align-items: center; justify-content: space-between; padding: 0 13px 0 16px; border-bottom: 1px solid var(--line); }
+.modal-header { height: 46px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px 0 14px; border-bottom: 1px solid var(--line); }
 .modal-header > div { display: flex; align-items: center; gap: 10px; }
 .modal-header > div > svg { color: #a4adff; }
-.modal-header h2 { margin: 0; font-family: var(--font-display); font-size: 17px; letter-spacing: -.03em; }
-.account-modal-body { min-height: 0; display: grid; grid-template-columns: 184px minmax(0, 1fr); gap: 18px; padding: 16px 17px 18px; overflow: auto; overscroll-behavior: contain; }
-.provider-chooser { display: grid; align-content: start; gap: 5px; }
-.provider-option { min-height: 50px; display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid transparent; border-radius: 7px; color: var(--muted-strong); background: transparent; text-align: left; }
+.modal-header h2 { margin: 0; font-family: var(--font-display); font-size: 15px; letter-spacing: -.03em; }
+.account-modal-body { min-height: 0; display: grid; grid-template-columns: 166px minmax(0, 1fr); gap: 12px; padding: 12px 13px 13px; overflow: auto; overscroll-behavior: contain; }
+.provider-chooser { display: grid; align-content: start; gap: 4px; }
+.provider-option { min-height: 42px; display: flex; align-items: center; gap: 7px; padding: 4px 7px; border: 1px solid transparent; border-radius: 6px; color: var(--muted-strong); background: transparent; text-align: left; }
 .provider-option:hover { background: var(--surface-hover); }
 .provider-option.is-selected { border-color: #6281f8; background: linear-gradient(100deg, rgba(55, 83, 190, .38), rgba(46, 65, 124, .18)); box-shadow: 0 0 0 1px rgba(100, 131, 255, .16); }
-.provider-option > span:nth-child(2) { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 4px; }
-.provider-option strong { color: var(--text); font-size: 13px; }
-.provider-option small { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.provider-option > span:nth-child(2) { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.provider-option strong { color: var(--text); font-size: 11px; }
+.provider-option small { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .provider-option > svg { color: #78a1ff; }
-.account-form { min-width: 0; display: grid; align-content: start; gap: 12px; }
-.account-form label { display: grid; gap: 6px; color: var(--text); font-size: 11px; font-weight: 600; }
-.account-form input, .compose-modal input { width: 100%; height: 38px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 7px; outline: 0; color: var(--text); background: rgba(21, 33, 56, .82); }
+.account-form { min-width: 0; display: grid; align-content: start; gap: 9px; }
+.account-form label { display: grid; gap: 4px; color: var(--text); font-size: 10px; font-weight: 600; }
+.account-form input, .compose-modal input { width: 100%; height: 34px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 6px; outline: 0; color: var(--text); background: rgba(21, 33, 56, .82); }
 :root[data-theme='light'] .account-form input, :root[data-theme='light'] .compose-modal input { background: #f8faff; }
 .account-form input::placeholder, .compose-modal input::placeholder { color: #7787a3; }
 .account-form input:focus, .compose-modal input:focus { border-color: #758aff; box-shadow: 0 0 0 3px rgba(91, 111, 246, .13); }
@@ -536,27 +536,27 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .connection-diagnostic > p { margin: 0; display: flex; align-items: center; gap: 5px; color: var(--warning); font-size: 9px; }
 .guide-box { overflow: hidden; border: 1px solid rgba(120, 147, 206, .32); border-radius: 8px; background: rgba(27, 42, 70, .66); }
 :root[data-theme='light'] .guide-box { background: #f5f7fe; }
-.guide-heading { height: 38px; display: flex; align-items: center; justify-content: space-between; padding: 0 11px; border-bottom: 1px solid var(--line); color: var(--text); font-size: 11px; }
+.guide-heading { height: 32px; display: flex; align-items: center; justify-content: space-between; padding: 0 9px; border-bottom: 1px solid var(--line); color: var(--text); font-size: 10px; }
 .guide-heading span { display: inline-flex; align-items: center; gap: 7px; }
 .guide-heading span svg { color: #a483ff; }
-.guide-heading em { color: var(--muted); font-size: 10px; font-style: normal; }
-.guide-step { position: relative; min-height: 52px; display: flex; align-items: center; gap: 8px; padding: 7px 10px; }
+.guide-heading em { color: var(--muted); font-size: 9px; font-style: normal; }
+.guide-step { position: relative; min-height: 43px; display: flex; align-items: center; gap: 7px; padding: 5px 8px; }
 .guide-step + .guide-step { border-top: 1px solid var(--line); }
-.guide-step:not(:last-child):after { content: ''; position: absolute; top: 35px; bottom: -9px; left: 22px; z-index: 0; width: 1px; background: rgba(132, 151, 203, .35); }
-.step-number { position: relative; z-index: 1; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 24px; border-radius: 50%; color: white; background: linear-gradient(145deg, #8274f8, #5b62dd); font-family: var(--font-display); font-size: 11px; font-weight: 600; }
-.guide-step > span:nth-child(2) { min-width: 0; display: flex; flex: 1; flex-direction: column; gap: 4px; }
-.guide-step strong { color: var(--text); font-size: 12px; }
-.guide-step small { color: var(--muted); font-size: 10px; }
-.guide-step button { display: inline-flex; align-items: center; gap: 4px; padding: 6px 7px; border: 1px solid rgba(104, 135, 240, .36); border-radius: 5px; color: #88a5ff; background: rgba(87, 112, 217, .12); font-size: 10px; white-space: nowrap; }
-.modal-footer { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 10px 16px; border-top: 1px solid var(--line); }
-.modal-footer > span { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10px; }
+.guide-step:not(:last-child):after { content: ''; position: absolute; top: 30px; bottom: -7px; left: 18px; z-index: 0; width: 1px; background: rgba(132, 151, 203, .35); }
+.step-number { position: relative; z-index: 1; width: 20px; height: 20px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 20px; border-radius: 50%; color: white; background: linear-gradient(145deg, #8274f8, #5b62dd); font-family: var(--font-display); font-size: 9px; font-weight: 600; }
+.guide-step > span:nth-child(2) { min-width: 0; display: flex; flex: 1; flex-direction: column; gap: 2px; }
+.guide-step strong { color: var(--text); font-size: 10.5px; }
+.guide-step small { color: var(--muted); font-size: 9px; }
+.guide-step button { display: inline-flex; align-items: center; gap: 4px; padding: 5px 6px; border: 1px solid rgba(104, 135, 240, .36); border-radius: 5px; color: #88a5ff; background: rgba(87, 112, 217, .12); font-size: 9px; white-space: nowrap; }
+.modal-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 13px; border-top: 1px solid var(--line); }
+.modal-footer > span { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 9px; }
 .modal-footer > span svg { color: #7b9ce8; }
 .modal-footer > div { display: flex; gap: 10px; }
-.secondary-button { height: 36px; padding: 0 18px; border: 1px solid var(--line-strong); border-radius: 7px; color: var(--muted-strong); background: transparent; }
+.secondary-button { height: 32px; padding: 0 14px; border: 1px solid var(--line-strong); border-radius: 6px; color: var(--muted-strong); background: transparent; }
 .secondary-button:hover { color: var(--text); background: var(--surface-hover); }
-.danger-button { height: 36px; display: inline-flex; align-items: center; gap: 6px; padding: 0 12px; border: 1px solid rgba(250, 113, 128, .34); border-radius: 7px; color: var(--danger); background: rgba(250, 113, 128, .08); }
+.danger-button { height: 32px; display: inline-flex; align-items: center; gap: 6px; padding: 0 11px; border: 1px solid rgba(250, 113, 128, .34); border-radius: 6px; color: var(--danger); background: rgba(250, 113, 128, .08); }
 .danger-button:hover { border-color: rgba(250, 113, 128, .58); background: rgba(250, 113, 128, .16); }
-.modal-footer .gradient-button { min-width: 116px; height: 36px; }
+.modal-footer .gradient-button { min-width: 108px; height: 32px; min-height: 32px; }
 .help-modal { width: min(560px, calc(100vw - 60px)); overflow: hidden; border: 1px solid rgba(139, 160, 210, .34); border-radius: 13px; background: linear-gradient(145deg, #121e35, #0d172a); box-shadow: 0 34px 120px rgba(0, 0, 0, .52); }
 :root[data-theme='light'] .help-modal { background: #fff; border-color: var(--line-strong); }
 .help-modal-body { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; max-height: min(56vh, 440px); overflow: auto; padding: 18px 20px; }
