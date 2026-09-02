@@ -21,6 +21,7 @@
     "test:signatures": "node scripts/test-signatures.mjs",
     "test:link-safety": "node scripts/test-link-safety.mjs",
     "test:recipients": "node scripts/test-recipients.mjs",
+    "test:undo-send": "node scripts/test-undo-send.mjs",
     "package:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1",
     "package:msix": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-msix.ps1",
     "release:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1"

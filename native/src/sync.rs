@@ -55,6 +55,8 @@ const MAX_STARTTLS_LINE_BYTES: usize = 64 * 1024;
 const MAX_STARTTLS_RESPONSE_BYTES: usize = 256 * 1024;
 const INITIAL_SYNC_DELAY: Duration = Duration::from_secs(3);
 const BACKGROUND_SYNC_INTERVAL: Duration = Duration::from_secs(300);
+const OUTBOX_SCHEDULER_IDLE: Duration = Duration::from_secs(300);
+const OUTBOX_SCHEDULER_BUSY_RETRY: Duration = Duration::from_secs(2);
 pub(crate) const ACCOUNT_SYNC_CONCURRENCY: usize = 3;
 const IDLE_STATE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const IDLE_PAUSED_RECHECK: Duration = Duration::from_secs(5);
@@ -1102,6 +1104,7 @@ fn spawn_idle_supervisor(shared: Arc<Mutex<crate::MailGoState>>, cache_root: Pat
 /// Keep the local cache fresh while the window is hidden. The scheduler intentionally runs on a
 /// dedicated thread so IMAP handshakes never block rdesktop's WebView event loop.
 pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathBuf) {
+    spawn_outbox_scheduler(Arc::clone(&shared), cache_root.clone());
     spawn_idle_supervisor(Arc::clone(&shared), cache_root.clone());
     thread::Builder::new()
         .name("mailgo-sync-scheduler".into())
@@ -1131,6 +1134,122 @@ pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathB
             }
         })
         .expect("start MailGo sync scheduler");
+}
+
+fn spawn_outbox_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathBuf) {
+    let result = thread::Builder::new()
+        .name("mailgo-outbox-scheduler".into())
+        .spawn(move || loop {
+            let observed = crate::outbox::scheduler_generation();
+            let offline_mode = match shared.lock() {
+                Ok(app) => app.state.offline_mode,
+                Err(_) => {
+                    tracing::warn!("outbox scheduler state lock poisoned");
+                    crate::outbox::wait_for_scheduler_change(observed, OUTBOX_SCHEDULER_BUSY_RETRY);
+                    continue;
+                }
+            };
+            if offline_mode {
+                crate::outbox::wait_for_scheduler_change(observed, OUTBOX_SCHEDULER_IDLE);
+                continue;
+            }
+
+            let next_delay = match crate::outbox::next_due_delay(&cache_root) {
+                Ok(delay) => delay,
+                Err(error) => {
+                    tracing::warn!("could not inspect encrypted outbox schedule: {error}");
+                    crate::outbox::wait_for_scheduler_change(observed, OUTBOX_SCHEDULER_BUSY_RETRY);
+                    continue;
+                }
+            };
+            match next_delay {
+                None => {
+                    crate::outbox::wait_for_scheduler_change(observed, OUTBOX_SCHEDULER_IDLE);
+                    continue;
+                }
+                Some(delay) if !delay.is_zero() => {
+                    crate::outbox::wait_for_scheduler_change(
+                        observed,
+                        delay.min(OUTBOX_SCHEDULER_IDLE),
+                    );
+                    continue;
+                }
+                Some(_) => {}
+            }
+
+            let account_ids = match crate::outbox::due_account_ids(&cache_root) {
+                Ok(account_ids) => account_ids,
+                Err(error) => {
+                    tracing::warn!("could not read due outbox accounts: {error}");
+                    crate::outbox::wait_for_scheduler_change(observed, OUTBOX_SCHEDULER_BUSY_RETRY);
+                    continue;
+                }
+            };
+            for account_id in account_ids {
+                let account = match crate::account_for(&shared, &account_id) {
+                    Ok(account) => account,
+                    Err(_) => {
+                        if let Err(error) = crate::outbox::remove_account(&cache_root, &account_id) {
+                            tracing::warn!(account_id = %account_id, "could not remove orphaned outbox entries: {error}");
+                        }
+                        continue;
+                    }
+                };
+                let _sync_lease = match crate::try_begin_account_sync(&shared, &account_id) {
+                    Ok(lease) => lease,
+                    Err(_) => continue,
+                };
+                let profile = match crate::profile_for_account(&account) {
+                    Ok(profile) => profile,
+                    Err(_) => {
+                        if let Err(error) = crate::outbox::pause_account(
+                            &cache_root,
+                            &account_id,
+                            "账户设置无效，请重新配置后再发送",
+                        ) {
+                            tracing::warn!(account_id = %account_id, "could not pause invalid-account outbox: {error}");
+                        }
+                        continue;
+                    }
+                };
+                let credential = match crate::load_credential(&account) {
+                    Ok(credential) => credential,
+                    Err(error) => {
+                        let needs_auth = needs_reauthorization(&error);
+                        crate::record_account_sync_failure(&shared, &account_id, needs_auth);
+                        if needs_auth {
+                            if let Err(pause_error) = crate::outbox::pause_account(
+                                &cache_root,
+                                &account_id,
+                                "账户需要重新授权后才能发送",
+                            ) {
+                                tracing::warn!(account_id = %account_id, "could not pause unauthorized outbox: {pause_error}");
+                            }
+                        }
+                        continue;
+                    }
+                };
+                match crate::outbox::flush_due(
+                    &cache_root,
+                    &account_id,
+                    profile,
+                    &account.email,
+                    &credential,
+                ) {
+                    Ok(summary) if summary.authentication_failed => {
+                        crate::record_account_sync_failure(&shared, &account_id, true);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(account_id = %account_id, "scheduled outbox flush failed: {error}");
+                    }
+                }
+            }
+            crate::outbox::wait_for_scheduler_change(observed, OUTBOX_SCHEDULER_BUSY_RETRY);
+        });
+    if let Err(error) = result {
+        tracing::warn!("could not start outbox scheduler: {error}");
+    }
 }
 
 struct XOAuth2 {

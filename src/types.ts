@@ -95,6 +95,25 @@ export interface NativeState {
   notificationsEnabled: boolean
   remoteImagesEnabled: boolean
   hideAds: boolean
+  undoSendSeconds?: number
+}
+
+export interface NativeSendResponse {
+  sent: boolean
+  queued: boolean
+  accountId: string
+  outboxId?: string
+  draftId?: string
+  offline?: boolean
+  undoable?: boolean
+  undoSeconds?: number
+  undoExpiresAt?: number
+}
+
+export interface NativeUndoSendResponse {
+  accountId: string
+  outboxId: string
+  status: 'cancelled' | 'missing' | 'too-late'
 }
 
 export interface NativeSyncItem {
@@ -166,6 +185,7 @@ export interface NativeOutboxStatus {
   total: number
   pending: number
   paused: number
+  scheduled?: number
 }
 
 export interface NativeCacheStats {

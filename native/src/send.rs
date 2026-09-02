@@ -213,6 +213,17 @@ pub fn send_message(
     Ok(())
 }
 
+/// Validate and fully construct a message without opening a network connection. Delayed delivery
+/// uses this before accepting the message so malformed recipients or MIME attachments fail while
+/// the compose window is still open.
+pub fn validate_message(
+    message: &OutgoingMessage<'_>,
+    attachments: &[OutgoingAttachment],
+) -> Result<()> {
+    let _ = build_message(message, attachments)?;
+    Ok(())
+}
+
 fn smtp_transport(
     profile: &ProviderProfile,
     email: &str,
@@ -482,6 +493,29 @@ mod tests {
             .formatted()
             .windows(5)
             .any(|window| window == b"hello"));
+    }
+
+    #[test]
+    fn delayed_send_validation_builds_mime_without_a_credential_or_network() {
+        let message = OutgoingMessage {
+            from: "person@example.com",
+            credential: "",
+            to: "recipient@example.com",
+            cc: None,
+            bcc: None,
+            subject: "Scheduled",
+            text_body: "body",
+            html_body: None,
+            in_reply_to: None,
+            references: &[],
+        };
+        assert!(validate_message(&message, &[]).is_ok());
+
+        let invalid = OutgoingMessage {
+            to: "not-an-email",
+            ..message
+        };
+        assert!(validate_message(&invalid, &[]).is_err());
     }
 
     #[test]

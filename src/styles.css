@@ -587,6 +587,7 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .settings-row > span { min-width: 0; display: flex; align-items: center; gap: 9px; }
 .settings-row > span > span { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .settings-row small { color: var(--muted); font-size: 10px; font-weight: 400; }
+.settings-select-row select { flex: 0 0 auto; height: 29px; min-width: 72px; padding: 0 24px 0 8px; border: 1px solid var(--line-strong); border-radius: 6px; color: var(--text); background: var(--surface-strong); font: inherit; font-size: 10px; }
 .theme-switch, .toggle-switch { width: 39px; height: 23px; padding: 2px; border-radius: 99px; background: var(--surface-strong); }
 .theme-switch span { width: 19px; height: 19px; display: flex; align-items: center; justify-content: center; border-radius: 50%; color: white; background: #626bf0; font-size: 9px; transform: translateX(14px); transition: transform .18s ease; }
 .theme-switch span.is-light { color: #47526c; background: #e3e9f8; transform: translateX(0); }
@@ -618,7 +619,12 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .settings-security-note { display: flex; align-items: flex-start; gap: 7px; margin: 0 12px 12px; padding: 9px 10px; border: 1px solid color-mix(in srgb, var(--success), transparent 70%); border-radius: 7px; color: var(--muted-strong); background: color-mix(in srgb, var(--success), transparent 93%); font-size: 10px; line-height: 1.5; }
 .settings-security-note svg { flex: 0 0 auto; color: var(--success); }
 .toast-stack { position: fixed; right: 22px; bottom: 19px; z-index: 60; display: grid; gap: 8px; pointer-events: none; }
-.toast { min-width: 230px; max-width: 360px; display: flex; align-items: center; gap: 8px; padding: 11px 13px; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--muted-strong); background: var(--surface-strong); box-shadow: var(--shadow); font-size: 11px; }
+.toast { position: relative; min-width: 230px; max-width: 380px; display: flex; align-items: center; gap: 8px; overflow: hidden; padding: 11px 13px; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--muted-strong); background: var(--surface-strong); box-shadow: var(--shadow); font-size: 11px; pointer-events: auto; }
+.toast > span:not(.toast-progress) { flex: 1; }
+.toast > button { flex: 0 0 auto; height: 26px; padding: 0 9px; border: 1px solid color-mix(in srgb, var(--accent), transparent 48%); border-radius: 5px; color: var(--text); background: color-mix(in srgb, var(--accent), transparent 82%); font: inherit; font-weight: 650; }
+.toast > button:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent), transparent 68%); }
+.toast-progress { position: absolute; left: 0; bottom: 0; width: 100%; height: 2px; background: var(--accent); transform-origin: left; animation: toast-progress var(--toast-duration) linear forwards; }
+@keyframes toast-progress { to { transform: scaleX(0); } }
 .toast-success svg { color: var(--success); }
 .toast-error svg { color: var(--danger); }
 .toast-info svg { color: #8ba1ff; }

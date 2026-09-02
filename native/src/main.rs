@@ -39,7 +39,10 @@ mod tray;
 
 const APP_SERVICE: &str = "MailGo";
 const CREDENTIAL_ENVELOPE_PREFIX: &str = "mailgo-credential-v1:";
-const STATE_SCHEMA_VERSION: u32 = 2;
+const STATE_SCHEMA_VERSION: u32 = 3;
+const ACCOUNT_EXPORT_SCHEMA_VERSION: u32 = 2;
+const DEFAULT_UNDO_SEND_SECONDS: u64 = 10;
+const ALLOWED_UNDO_SEND_SECONDS: [u64; 5] = [0, 5, 10, 20, 30];
 const ATTACHMENT_CHUNK_BYTES: usize = 192 * 1024;
 const LOG_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
@@ -149,6 +152,8 @@ struct PersistedState {
     remote_images_enabled: bool,
     #[serde(default = "default_hide_ads", alias = "hideAds")]
     hide_ads: bool,
+    #[serde(default = "default_undo_send_seconds", alias = "undoSendSeconds")]
+    undo_send_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +179,8 @@ struct PersistedStateDisk {
     remote_images_enabled: bool,
     #[serde(default = "default_hide_ads", alias = "hideAds")]
     hide_ads: bool,
+    #[serde(default = "default_undo_send_seconds", alias = "undoSendSeconds")]
+    undo_send_seconds: u64,
 }
 
 fn default_theme() -> String {
@@ -194,6 +201,18 @@ fn default_notifications_enabled() -> bool {
 
 fn default_hide_ads() -> bool {
     false
+}
+
+fn default_undo_send_seconds() -> u64 {
+    DEFAULT_UNDO_SEND_SECONDS
+}
+
+fn normalize_undo_send_seconds(value: u64) -> u64 {
+    if ALLOWED_UNDO_SEND_SECONDS.contains(&value) {
+        value
+    } else {
+        DEFAULT_UNDO_SEND_SECONDS
+    }
 }
 
 fn decode_persisted_state(contents: &str) -> Result<PersistedState> {
@@ -220,6 +239,7 @@ fn decode_persisted_state(contents: &str) -> Result<PersistedState> {
         notifications_enabled: disk.notifications_enabled,
         remote_images_enabled: disk.remote_images_enabled,
         hide_ads: disk.hide_ads,
+        undo_send_seconds: normalize_undo_send_seconds(disk.undo_send_seconds),
     })
 }
 
@@ -314,6 +334,7 @@ impl Default for PersistedState {
             notifications_enabled: true,
             remote_images_enabled: false,
             hide_ads: false,
+            undo_send_seconds: DEFAULT_UNDO_SEND_SECONDS,
         }
     }
 }
@@ -441,6 +462,7 @@ impl MailGoState {
             "notificationsEnabled": self.state.notifications_enabled,
             "remoteImagesEnabled": self.state.remote_images_enabled,
             "hideAds": self.state.hide_ads,
+            "undoSendSeconds": self.state.undo_send_seconds,
         })
     }
 }
@@ -1481,7 +1503,23 @@ fn handle_ipc(
                 let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                 app.state.offline_mode = enabled;
                 app.save()?;
+                drop(app);
+                outbox::notify_scheduler();
                 Ok(json!({ "enabled": enabled }))
+            }
+            "app.set_undo_send_seconds" => {
+                let seconds = message
+                    .payload
+                    .get("seconds")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow!("undo send delay must be an integer"))?;
+                if !ALLOWED_UNDO_SEND_SECONDS.contains(&seconds) {
+                    return Err(anyhow!("unsupported undo send delay"));
+                }
+                let mut app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                app.state.undo_send_seconds = seconds;
+                app.save()?;
+                Ok(json!({ "seconds": seconds }))
             }
             "app.set_remote_images" => {
                 let enabled = message
@@ -2065,7 +2103,7 @@ fn handle_ipc(
             "accounts.export" => {
                 let app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                 Ok(json!({
-                    "schemaVersion": STATE_SCHEMA_VERSION,
+                    "schemaVersion": ACCOUNT_EXPORT_SCHEMA_VERSION,
                     "product": "MailGo",
                     "warning": "授权码不会从 Windows Credential Manager 导出。",
                     "accounts": app.state.accounts.iter().map(|account| json!({
@@ -2231,6 +2269,17 @@ fn handle_ipc(
                     &cache_dir(),
                     &account_id,
                 )?)?)
+            }
+            "mail.outbox.undo" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
+                let outbox_id = string_field(&message.payload, "outboxId")?;
+                let status = outbox::cancel_scheduled(&cache_dir(), &account_id, &outbox_id)?;
+                Ok(json!({
+                    "accountId": account_id,
+                    "outboxId": outbox_id,
+                    "status": status,
+                }))
             }
             "mail.outbox.retry_all" => {
                 let account_id = string_field(&message.payload, "accountId")?;
@@ -3188,17 +3237,31 @@ fn handle_ipc(
                         });
                     }
                 }
-                if offline_mode_enabled(shared)? {
-                    if let Ok(mut app) = shared.lock() {
-                        for upload_id in &attachment_ids {
-                            app.attachment_uploads.remove(upload_id);
-                        }
-                    }
-                    let queued = outbox::enqueue(
+                let (offline_mode, undo_send_seconds) = {
+                    let app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                    (app.state.offline_mode, app.state.undo_send_seconds)
+                };
+                if offline_mode || undo_send_seconds > 0 {
+                    let validation_message = send::OutgoingMessage {
+                        from: &account.email,
+                        credential: "",
+                        to: &to,
+                        cc: cc.as_deref(),
+                        bcc: bcc.as_deref(),
+                        subject: &subject,
+                        text_body: &text_body,
+                        html_body: html_body.as_deref(),
+                        in_reply_to: in_reply_to.as_deref(),
+                        references: &references,
+                    };
+                    send::validate_message(&validation_message, &attachments)?;
+                    let undoable = !offline_mode && undo_send_seconds > 0;
+                    let queued = outbox::enqueue_with_delay(
                         &cache_dir(),
                         outbox::QueuedMessage {
                             id: String::new(),
                             account_id: account_id.clone(),
+                            draft_id: draft_id.clone(),
                             to,
                             cc: cc.unwrap_or_default(),
                             bcc: bcc.unwrap_or_default(),
@@ -3221,12 +3284,23 @@ fn handle_ipc(
                             attempts: 0,
                             next_attempt_at: 0,
                             paused: false,
-                            last_error: Some("仅离线模式：联网后将自动发送".to_string()),
+                            last_error: None,
                         },
+                        if undoable { undo_send_seconds } else { 0 },
                     )?;
+                    if let Ok(mut app) = shared.lock() {
+                        for upload_id in &attachment_ids {
+                            app.attachment_uploads.remove(upload_id);
+                        }
+                    }
                     return Ok(json!({
                         "sent": false,
                         "queued": true,
+                        "offline": offline_mode,
+                        "undoable": undoable,
+                        "undoSeconds": if undoable { undo_send_seconds } else { 0 },
+                        "undoExpiresAt": if undoable { queued.next_attempt_at.saturating_mul(1_000) } else { 0 },
+                        "draftId": draft_id,
                         "outboxId": queued.id,
                         "accountId": account_id,
                     }));
@@ -3259,6 +3333,7 @@ fn handle_ipc(
                             outbox::QueuedMessage {
                                 id: String::new(),
                                 account_id: account_id.clone(),
+                                draft_id: draft_id.clone(),
                                 to,
                                 cc: cc.unwrap_or_default(),
                                 bcc: bcc.unwrap_or_default(),
@@ -3288,6 +3363,7 @@ fn handle_ipc(
                             "sent": false,
                             "queued": true,
                             "outboxId": queued.id,
+                            "draftId": draft_id,
                             "accountId": account_id,
                         }))
                     }
@@ -3405,6 +3481,7 @@ mod tests {
         assert!(!state.notifications_enabled);
         assert!(!state.remote_images_enabled);
         assert!(!state.hide_ads);
+        assert_eq!(state.undo_send_seconds, DEFAULT_UNDO_SEND_SECONDS);
     }
 
     #[test]
@@ -3427,6 +3504,7 @@ mod tests {
                 "notificationsEnabled": true,
                 "remoteImagesEnabled": true,
                 "hideAds": true,
+                "undoSendSeconds": 20,
                 "folderNames": {"missing": ["Ignored"]}
             }"#,
         )
@@ -3436,7 +3514,22 @@ mod tests {
         assert!(!state.offline_mode);
         assert!(state.remote_images_enabled);
         assert!(state.hide_ads);
+        assert_eq!(state.undo_send_seconds, 20);
         assert!(state.folder_names.is_empty());
+    }
+
+    #[test]
+    fn undo_send_delay_defaults_and_rejects_unsupported_persisted_values() {
+        assert_eq!(PersistedState::default().undo_send_seconds, 10);
+        assert_eq!(
+            decode_persisted_state(r#"{"accounts": [], "undoSendSeconds": 7}"#)
+                .unwrap()
+                .undo_send_seconds,
+            DEFAULT_UNDO_SEND_SECONDS
+        );
+        for seconds in ALLOWED_UNDO_SEND_SECONDS {
+            assert_eq!(normalize_undo_send_seconds(seconds), seconds);
+        }
     }
 
     #[test]

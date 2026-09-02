@@ -14,10 +14,13 @@ import { invoke, readNativeState } from './lib/ipc'
 import { inspectExternalLink, type ExternalLinkInspection } from './linkSafety'
 import { appendAccountSignature, normalizeAccountSignature } from './signature'
 import { buildMailThreads, type MailThread } from './threading'
-import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeConnectionDiagnostic, NativeConnectionDiagnosticChannel, NativeDeviceStartResponse, NativeDraft, NativeDraftAttachment, NativeLocalSearchResponse, NativeMailboxResponse, NativeMessageResponse, NativeOutboxStatus, NativeQueueStatus, NativeSearchResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
+import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeConnectionDiagnostic, NativeConnectionDiagnosticChannel, NativeDeviceStartResponse, NativeDraft, NativeDraftAttachment, NativeLocalSearchResponse, NativeMailboxResponse, NativeMessageResponse, NativeOutboxStatus, NativeQueueStatus, NativeSearchResponse, NativeSendResponse, NativeSyncItem, NativeSyncResponse, NativeUndoSendResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 type ToastTone = 'info' | 'success' | 'error'
-type Toast = { id: number; message: string; tone: ToastTone }
+type UndoSendSeconds = 0 | 5 | 10 | 20 | 30
+type ToastAction = { kind: 'undo-send'; accountId: string; outboxId: string; draftId?: string }
+type Toast = { id: number; message: string; tone: ToastTone; durationMs: number; action?: ToastAction }
+type ToastOptions = { action?: ToastAction; durationMs?: number; onExpire?: () => void }
 type DeviceFlowState = { sessionId: string; userCode: string; verificationUri: string; message?: string; retryAfter: number; status: 'pending' | 'complete' | 'error' }
 type ConnectionDiagnosticViewState =
   | { phase: 'checking' }
@@ -36,6 +39,7 @@ const EARLIER_MAILBOX_PAGE_SIZE = 50
 const ACCOUNT_IPC_CONCURRENCY = 4
 const BULK_ACTION_IPC_CONCURRENCY = 6
 const ATTACHMENT_DOWNLOAD_CONCURRENCY = 3
+const DEFAULT_UNDO_SEND_SECONDS: UndoSendSeconds = 10
 const MOBILE_LAYOUT_QUERY = '(max-width: 900px)'
 const COMPACT_DENSITY_QUERY = '(max-height: 820px), (max-width: 1366px)'
 const AUTO_COLLAPSE_SIDEBAR_QUERY = '(max-width: 1366px) and (min-width: 901px)'
@@ -98,6 +102,12 @@ function providerFor(provider: Provider) {
 
 function isSupportedProvider(value: unknown): value is Provider {
   return value === 'google' || value === 'qq' || value === 'outlook' || value === 'other'
+}
+
+function asUndoSendSeconds(value: unknown): UndoSendSeconds {
+  return value === 0 || value === 5 || value === 10 || value === 20 || value === 30
+    ? value
+    : DEFAULT_UNDO_SEND_SECONDS
 }
 
 function connectionDiagnosticError(error: unknown) {
@@ -596,6 +606,24 @@ function ConversationStack({ thread, selectedId, loadingId, onSelect }: { thread
   )
 }
 
+function ToastView({ toast, onAction }: { toast: Toast; onAction: (toast: Toast) => void }) {
+  return (
+    <motion.div
+      className={`toast toast-${toast.tone} ${toast.action ? 'toast-actionable' : ''}`}
+      initial={{ opacity: 0, y: 12, scale: 0.98 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      exit={{ opacity: 0, y: 12 }}
+      style={{ '--toast-duration': `${toast.durationMs}ms` } as React.CSSProperties}
+      role="status"
+    >
+      <Icon name={toast.tone === 'success' ? 'checkCircle' : toast.tone === 'error' ? 'info' : 'bell'} size={17} />
+      <span>{toast.message}</span>
+      {toast.action && <button type="button" onClick={() => onAction(toast)}>撤销发送</button>}
+      {toast.action && <span className="toast-progress" aria-hidden="true" />}
+    </motion.div>
+  )
+}
+
 function App() {
   const isNativeRuntime = Boolean(window.ipc?.postMessage)
   const prefersReducedMotion = useReducedMotion()
@@ -651,9 +679,11 @@ function App() {
   const [notificationsEnabled, setNotificationsEnabled] = useState(true)
   const [remoteImagesEnabled, setRemoteImagesEnabled] = useState(loadRemoteImages)
   const [hideAds, setHideAds] = useState(loadHideAds)
+  const [undoSendSeconds, setUndoSendSeconds] = useState<UndoSendSeconds>(DEFAULT_UNDO_SEND_SECONDS)
   const [pendingOperations, setPendingOperations] = useState(0)
   const [outboxTotal, setOutboxTotal] = useState(0)
   const [outboxPaused, setOutboxPaused] = useState(0)
+  const [outboxScheduled, setOutboxScheduled] = useState(0)
   const [cacheStats, setCacheStats] = useState<NativeCacheStats | null>(null)
   const [cacheStatsState, setCacheStatsState] = useState<'loading' | 'ready' | 'error'>(isNativeRuntime ? 'loading' : 'ready')
   const [nativeDrafts, setNativeDrafts] = useState<NativeDraft[]>([])
@@ -702,6 +732,7 @@ function App() {
   const isAddingAccountRef = useRef(false)
   const selectedMailRef = useRef<MailMessage | undefined>(undefined)
   const attachmentCancelsRef = useRef(new Map<string, () => void>())
+  const toastTimersRef = useRef(new Map<number, number>())
   const messageHydrationRef = useRef(new Map<string, Promise<NativeMessageResponse>>())
   const mailListRef = useRef<HTMLDivElement>(null)
   const [nativeStateReady, setNativeStateReady] = useState(!isNativeRuntime)
@@ -731,6 +762,8 @@ function App() {
   useEffect(() => () => {
     attachmentCancelsRef.current.forEach((cancel) => cancel())
     attachmentCancelsRef.current.clear()
+    toastTimersRef.current.forEach((timer) => window.clearTimeout(timer))
+    toastTimersRef.current.clear()
   }, [])
 
   useEffect(() => {
@@ -755,10 +788,23 @@ function App() {
     }
   }, [])
 
-  const pushToast = (message: string, tone: ToastTone = 'info') => {
+  const dismissToast = (id: number) => {
+    const timer = toastTimersRef.current.get(id)
+    if (timer != null) window.clearTimeout(timer)
+    toastTimersRef.current.delete(id)
+    setToasts((current) => current.filter((toast) => toast.id !== id))
+  }
+
+  const pushToast = (message: string, tone: ToastTone = 'info', options?: ToastOptions) => {
     const id = Date.now() + Math.random()
-    setToasts((current) => [...current.slice(-2), { id, message, tone }])
-    window.setTimeout(() => setToasts((current) => current.filter((toast) => toast.id !== id)), 3600)
+    const durationMs = Math.max(1_200, options?.durationMs ?? 3_600)
+    setToasts((current) => [...current.slice(-2), { id, message, tone, durationMs, action: options?.action }])
+    const timer = window.setTimeout(() => {
+      toastTimersRef.current.delete(id)
+      setToasts((current) => current.filter((toast) => toast.id !== id))
+      options?.onExpire?.()
+    }, durationMs)
+    toastTimersRef.current.set(id, timer)
   }
 
   const markAccountNeedsReauth = (accountId: string, error: unknown) => {
@@ -786,12 +832,14 @@ function App() {
     if (!isNativeRuntime) {
       setOutboxTotal(0)
       setOutboxPaused(0)
+      setOutboxScheduled(0)
       return
     }
     try {
       const statuses = await mapWithConcurrency(accountList, ACCOUNT_IPC_CONCURRENCY, (account) => invoke<NativeOutboxStatus>('mail.outbox.status', { accountId: account.id }))
       setOutboxTotal(statuses.reduce((total, status) => total + status.total, 0))
       setOutboxPaused(statuses.reduce((total, status) => total + status.paused, 0))
+      setOutboxScheduled(statuses.reduce((total, status) => total + (status.scheduled ?? 0), 0))
     } catch {
       // Outbox telemetry is intentionally non-blocking; the encrypted queue remains native-owned.
     }
@@ -976,6 +1024,7 @@ function App() {
       setNotificationsEnabled(nativeState.notificationsEnabled ?? true)
       setRemoteImagesEnabled(nativeState.remoteImagesEnabled ?? false)
       setHideAds(nativeState.hideAds ?? false)
+      setUndoSendSeconds(asUndoSendSeconds(nativeState.undoSendSeconds))
       setNativeStateReady(true)
       void refreshPendingOperations(nativeState.accounts)
       void refreshOutbox(nativeState.accounts)
@@ -2097,6 +2146,73 @@ function App() {
     }
   }
 
+  const handleUndoSend = async (toast: Toast) => {
+    const action = toast.action
+    if (!action || action.kind !== 'undo-send') return
+    dismissToast(toast.id)
+    try {
+      const result = isNativeRuntime
+        ? await invoke<NativeUndoSendResponse>('mail.outbox.undo', {
+            accountId: action.accountId,
+            outboxId: action.outboxId,
+          })
+        : { accountId: action.accountId, outboxId: action.outboxId, status: 'cancelled' as const }
+      void refreshOutbox()
+      if (result.status !== 'cancelled') {
+        pushToast('邮件已进入发送阶段，无法撤销', 'info')
+        return
+      }
+      pushToast('已撤销发送，邮件仍保留为草稿', 'success')
+      if (action.draftId) {
+        void refreshNativeDrafts()
+        openCompose(action.draftId)
+      }
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : '撤销发送失败，请检查发件箱状态', 'error')
+    }
+  }
+
+  const handleComposeSent = (result: NativeSendResponse) => {
+    setComposeOpen(false)
+    setComposeDraftId(undefined)
+    setComposeMode('new')
+    setComposeSource(undefined)
+    void refreshNativeDrafts()
+    void refreshOutbox()
+    if (result.undoable && result.outboxId) {
+      const fallbackDuration = Math.max(1, result.undoSeconds ?? undoSendSeconds) * 1_000
+      const durationMs = result.undoExpiresAt
+        ? Math.max(1_200, result.undoExpiresAt - Date.now())
+        : fallbackDuration
+      pushToast(`邮件将在 ${result.undoSeconds ?? undoSendSeconds} 秒后发送`, 'success', {
+        durationMs,
+        onExpire: () => { void refreshOutbox() },
+        action: {
+          kind: 'undo-send',
+          accountId: result.accountId,
+          outboxId: result.outboxId,
+          draftId: result.draftId,
+        },
+      })
+      return
+    }
+    pushToast(result.queued
+      ? result.offline
+        ? '邮件已加入发件箱，恢复在线后自动发送'
+        : '网络暂不可用，邮件已加入发件箱，联网后自动重试'
+      : '邮件已发送', 'success')
+  }
+
+  const handleUndoSendSecondsChange = (seconds: UndoSendSeconds) => {
+    const previous = undoSendSeconds
+    setUndoSendSeconds(seconds)
+    if (!isNativeRuntime) return
+    void invoke('app.set_undo_send_seconds', { seconds }).catch((error) => {
+      setUndoSendSeconds(previous)
+      pushToast(error instanceof Error ? error.message : '无法保存撤销发送设置', 'error')
+    })
+  }
+
   const handleOpenProvider = async () => {
     if (isNativeRuntime && customAuthentication === 'oauth2' && accountEmail.trim()) {
       const attempt = invalidateAuthFlow()
@@ -2633,7 +2749,7 @@ function App() {
             <div className={`storage-track ${cacheStatsState === 'loading' ? 'is-loading' : ''}`} role="img" aria-label={cacheCompositionLabel} title={cacheCompositionLabel}>
               {cacheStats && cacheStats.totalBytes > 0 ? <><span className="storage-segment storage-mail" style={{ width: storageShare(cacheMailBytes, cacheStats.totalBytes) }} /><span className="storage-segment storage-attachments" style={{ width: storageShare(cacheAttachmentBytes, cacheStats.totalBytes) }} /><span className="storage-segment storage-other" style={{ width: storageShare(cacheOtherBytes, cacheStats.totalBytes) }} /></> : null}
             </div>
-            <div className="storage-foot"><span aria-live="polite"><Icon name={outboxTotal || pendingOperations ? 'rotate' : 'cloud'} size={13} /> {outboxTotal ? `${outboxTotal} 封待发送${outboxPaused ? ` · ${outboxPaused} 封需重试` : ''}` : pendingOperations ? `${pendingOperations} 项操作待同步` : '离线可查看最近邮件'}</span><div className="storage-foot-actions">{outboxPaused > 0 && <button type="button" onClick={() => { void retryPendingOutbox() }}><Icon name="rotate" size={13} />重试待发送</button>}<button type="button" onClick={handleSync}><Icon name="rotate" size={13} /> {isSyncing ? '同步中…' : '立即同步'}</button></div></div>
+            <div className="storage-foot"><span aria-live="polite"><Icon name={outboxTotal || pendingOperations ? 'rotate' : 'cloud'} size={13} /> {outboxTotal ? `${outboxTotal} 封待发送${outboxScheduled ? ` · ${outboxScheduled} 封可撤销` : ''}${outboxPaused ? ` · ${outboxPaused} 封需重试` : ''}` : pendingOperations ? `${pendingOperations} 项操作待同步` : '离线可查看最近邮件'}</span><div className="storage-foot-actions">{outboxPaused > 0 && <button type="button" onClick={() => { void retryPendingOutbox() }}><Icon name="rotate" size={13} />重试待发送</button>}<button type="button" onClick={handleSync}><Icon name="rotate" size={13} /> {isSyncing ? '同步中…' : '立即同步'}</button></div></div>
           </div>
 
           <div className="sidebar-quick-settings">
@@ -2754,6 +2870,7 @@ function App() {
           <div className="settings-title"><span><Icon name="settings" size={17} />偏好设置</span><TooltipButton label="关闭设置" onClick={() => setSettingsOpen(false)}><Icon name="close" size={17} /></TooltipButton></div>
           <div className="settings-row"><span><Icon name={theme === 'dark' ? 'moon' : 'theme'} size={17} /><span>外观主题<small>{theme === 'dark' ? '深色 · 午夜蓝' : '浅色 · 雪白'}</small></span></span><button type="button" className="theme-switch" onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}><span className={theme === 'light' ? 'is-light' : ''}>{theme === 'dark' ? '深' : '浅'}</span></button></div>
           <div className="settings-row"><span><Icon name="menu" size={17} /><span>界面密度<small>{displayDensity === 'compact' ? '紧凑 · 高信息密度' : viewportRequiresCompactDensity ? '窗口较小，已自动紧凑' : '舒适 · 更大间距'}</small></span></span><button type="button" aria-label="紧凑桌面布局" className={`toggle-switch ${displayDensity === 'compact' ? 'is-on' : ''}`} onClick={() => setDisplayDensity((value) => value === 'compact' ? 'comfortable' : 'compact')}><span /></button></div>
+          <label className="settings-row settings-select-row"><span><Icon name="clock" size={17} /><span>撤销发送<small>{undoSendSeconds === 0 ? '关闭后立即连接邮件服务器发送' : `发送后保留 ${undoSendSeconds} 秒撤销窗口`}</small></span></span><select aria-label="撤销发送等待时间" value={undoSendSeconds} onChange={(event) => handleUndoSendSecondsChange(asUndoSendSeconds(Number(event.target.value)))}><option value={0}>关闭</option><option value={5}>5 秒</option><option value={10}>10 秒</option><option value={20}>20 秒</option><option value={30}>30 秒</option></select></label>
           <label className="settings-row css-row"><span><Icon name="brush" size={17} /><span>用户 CSS<small>{sanitizedCustomCss.removedUnsafeSyntax ? '已过滤外部资源与危险语法' : '可覆盖 MailGo 视觉变量；不加载外部资源'}</small></span></span><textarea value={customCss} onChange={(event) => setCustomCss(event.target.value)} placeholder="例如：:root { --accent: #ff6b8a; }" /></label>
           <AccountSignatureSettings accounts={accounts} initialAccountId={selectedAccountId} onSave={saveAccountSignature} />
           <div className="settings-row"><span><Icon name="cloud" size={17} /><span>关闭时后台运行<small>最小化到系统托盘并继续同步</small></span></span><button type="button" className={`toggle-switch ${minimizeToTray ? 'is-on' : ''}`} onClick={() => { const next = !minimizeToTray; setMinimizeToTray(next); void invoke('app.set_minimize_to_tray', { enabled: next }).catch(() => undefined) }}><span /></button></div>
@@ -2777,11 +2894,11 @@ function App() {
         onDraftChanged={handleDraftChanged}
         onDraftRemoved={handleDraftRemoved}
         onClose={() => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts() }}
-        onSent={(queued) => { setComposeOpen(false); setComposeDraftId(undefined); setComposeMode('new'); setComposeSource(undefined); void refreshNativeDrafts(); void refreshOutbox(); pushToast(queued ? '网络暂不可用，邮件已加入发件箱，联网后自动重试' : '邮件已发送', 'success') }}
+        onSent={handleComposeSent}
         onError={(message) => pushToast(message, 'error')}
       />}</AnimatePresence>
       <AnimatePresence>{isAccountModalOpen && <AccountModal editingAccountId={editingAccountId} provider={provider} setProvider={changeProvider} providerDefinition={selectedProvider} accountEmail={accountEmail} setAccountEmail={setAccountEmail} authorizationCode={authorizationCode} setAuthorizationCode={setAuthorizationCode} showAuthorizationCode={showAuthorizationCode} setShowAuthorizationCode={setShowAuthorizationCode} customImapHost={customImapHost} setCustomImapHost={setCustomImapHost} customImapPort={customImapPort} setCustomImapPort={setCustomImapPort} customImapSecurity={customImapSecurity} setCustomImapSecurity={setCustomImapSecurity} customSmtpHost={customSmtpHost} setCustomSmtpHost={setCustomSmtpHost} customSmtpPort={customSmtpPort} setCustomSmtpPort={setCustomSmtpPort} customSmtpSecurity={customSmtpSecurity} setCustomSmtpSecurity={setCustomSmtpSecurity} customAuthentication={customAuthentication} setCustomAuthentication={setCustomAuthentication} deviceFlow={deviceFlow} diagnostic={editingAccountId ? connectionDiagnostics[editingAccountId] : undefined} isBusy={isAddingAccount} onClose={closeAccountModal} onOpenProvider={() => { void handleOpenProvider() }} onCopy={handleCopy} onAdd={handleAddAccount} onRemove={handleRemoveAccount} onDiagnose={() => { void handleDiagnoseAccount() }} />}</AnimatePresence>
-      <div className="toast-stack" aria-live="polite">{toasts.map((toast) => <motion.div key={toast.id} className={`toast toast-${toast.tone}`} initial={{ opacity: 0, y: 12, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 12 }}><Icon name={toast.tone === 'success' ? 'checkCircle' : toast.tone === 'error' ? 'info' : 'bell'} size={17} /><span>{toast.message}</span></motion.div>)}</div>
+      <div className="toast-stack" aria-live="polite">{toasts.map((toast) => <ToastView key={toast.id} toast={toast} onAction={(item) => { void handleUndoSend(item) }} />)}</div>
     </div>
   )
 }
@@ -2850,7 +2967,7 @@ function AccountModal({ editingAccountId, provider, setProvider, providerDefinit
   return <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><motion.div className="account-modal" initial={{ opacity: 0, y: 14, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 8, scale: 0.98 }} role="dialog" aria-modal="true" aria-labelledby="account-modal-title"><div className="modal-header"><div><Icon name="user" size={21} /><h2 id="account-modal-title">{editingAccountId ? '重新授权账户' : '添加账户'}</h2></div><TooltipButton label="关闭" onClick={onClose} disabled={isBusy}><Icon name="close" size={19} /></TooltipButton></div><div className="account-modal-body"><div className="provider-chooser">{providerDefinitions.map((item) => <button key={item.id} type="button" className={`provider-option ${provider === item.id ? 'is-selected' : ''}`} onClick={() => setProvider(item.id)} disabled={isBusy}><ProviderMark provider={item.id} size="md" /><span><strong>{item.label}</strong><small>{item.description}</small></span>{provider === item.id && <Icon name="checkCircle" size={19} />}</button>)}</div><div className="account-form"><label>邮箱地址<input type="email" value={accountEmail} onChange={(event) => setAccountEmail(event.target.value)} placeholder={provider === 'qq' ? 'yourname@qq.com' : 'name@example.com'} autoFocus disabled={isBusy} /></label>{(provider === 'google' || provider === 'outlook') && <label>认证方式<select value={customAuthentication} onChange={(event) => setCustomAuthentication(event.target.value)} disabled={isBusy}><option value="oauth2">OAuth2 安全授权</option>{provider === 'google' && <option value="app-password">应用专用密码</option>}</select></label>}<label><span className="label-with-action">{credentialLabel}<button type="button" onClick={onOpenProvider} disabled={isBusy}>{isOAuth ? '打开授权页面' : '如何获取授权码？'} <Icon name="link" size={13} /></button></span><span className="secret-input"><input type={showAuthorizationCode ? 'text' : 'password'} value={authorizationCode} onChange={(event) => setAuthorizationCode(event.target.value)} placeholder={isOAuth ? 'OAuth 授权完成后无需粘贴' : '粘贴邮箱授权码'} disabled={isBusy} /><button type="button" onClick={() => setShowAuthorizationCode(!showAuthorizationCode)} aria-label={showAuthorizationCode ? '隐藏授权码' : '显示授权码'} disabled={isBusy}><Icon name={showAuthorizationCode ? 'eyeSlash' : 'eye'} size={17} /></button><button type="button" onClick={onCopy} aria-label="复制授权码" disabled={isBusy}><Icon name="copy" size={17} /></button></span></label>{deviceFlow && <div className="device-flow-box"><div className="device-flow-heading"><span><Icon name="shieldCheck" size={16} />Outlook 设备授权</span><strong>{deviceFlow.status === 'complete' ? '已完成' : deviceFlow.status === 'error' ? '需要重试' : '等待验证'}</strong></div><code>{deviceFlow.userCode}</code><p>{deviceFlow.status === 'complete' ? '设备验证已完成，可以开始同步。' : (deviceFlow.message || '请打开验证页完成 Microsoft 账户授权。')}</p><small>{deviceFlow.verificationUri}</small>{deviceFlow.status !== 'complete' && <button type="button" onClick={onOpenProvider} disabled={isBusy}>{deviceFlow.status === 'error' ? '重新开始授权' : '重新打开验证页'} <Icon name="link" size={13} /></button>}</div>}{provider === 'other' && <div className="custom-transport-fields"><div className="transport-heading"><Icon name="settings" size={15} />自定义服务器</div><div className="transport-row"><label>IMAP 主机<input value={customImapHost} onChange={(event) => setCustomImapHost(event.target.value)} placeholder="imap.example.com" disabled={isBusy} /></label><label>端口<input type="number" min="1" max="65535" value={customImapPort} onChange={(event) => setCustomImapPort(event.target.value)} disabled={isBusy} /></label><label>安全<input value={customImapSecurity} onChange={(event) => setCustomImapSecurity(event.target.value)} placeholder="tls / starttls" disabled={isBusy} /></label></div><div className="transport-row"><label>SMTP 主机<input value={customSmtpHost} onChange={(event) => setCustomSmtpHost(event.target.value)} placeholder="smtp.example.com" disabled={isBusy} /></label><label>端口<input type="number" min="1" max="65535" value={customSmtpPort} onChange={(event) => setCustomSmtpPort(event.target.value)} disabled={isBusy} /></label><label>安全<input value={customSmtpSecurity} onChange={(event) => setCustomSmtpSecurity(event.target.value)} placeholder="tls / starttls" disabled={isBusy} /></label></div><label>认证方式<select value={customAuthentication} onChange={(event) => setCustomAuthentication(event.target.value)} disabled={isBusy}><option value="password">密码 / 授权码</option><option value="app-password">应用专用密码</option><option value="oauth2">OAuth2 Bearer Token</option></select></label></div>}{editingAccountId && <ConnectionDiagnosticCard diagnostic={diagnostic} disabled={isBusy} onDiagnose={onDiagnose} />}<div className="guide-box"><div className="guide-heading"><span><Icon name="key" size={17} />{guideTitle}</span><em>{providerDefinition.label}</em></div>{guide.map((step, index) => <div className="guide-step" key={step}><span className="step-number">{index + 1}</span><span><strong>{step}</strong><small>{isOAuth ? (index === 0 ? 'MailGo 会在本机发起安全授权流程' : index === 1 ? '只授予邮件同步所需的账户权限' : '令牌仅保存到本机系统安全存储') : (index === 0 ? `登录 ${providerDefinition.label}，打开设置页面` : index === 1 ? '找到第三方客户端或账户安全选项' : '复制生成的授权凭据，返回此处粘贴')}</small></span>{index === 0 && <button type="button" onClick={onOpenProvider} disabled={isBusy}>{isOAuth ? '开始授权' : '前往设置'} <Icon name="link" size={13} /></button>}</div>)}</div></div></div><div className="modal-footer"><span><Icon name="shieldCheck" size={17} />凭据仅存本机 · 邮件后台同步</span><div>{editingAccountId && <button className="danger-button" type="button" onClick={onRemove} disabled={isBusy}><Icon name="trash" size={16} />移除账户</button>}<button className="secondary-button" type="button" onClick={onClose} disabled={isBusy}>取消</button><button className="gradient-button" type="button" onClick={onAdd} disabled={isBusy}><Icon name="rotate" size={17} />{isBusy ? '正在保存…' : editingAccountId ? '保存并进入' : '添加并进入'}</button></div></div></motion.div></motion.div>
 }
 
-function ComposeModal({ mode, source, accountId, senderEmail, signature = '', draftId: openDraftId, onClose, onSent, onError, onDraftChanged, onDraftRemoved }: { mode: ComposeMode; source?: MailMessage; accountId?: string; senderEmail?: string; signature?: string; draftId?: string; onClose: () => void; onSent: (queued: boolean) => void; onError: (message: string) => void; onDraftChanged?: (draft: NativeDraft) => void; onDraftRemoved?: (draftId: string) => void }) {
+function ComposeModal({ mode, source, accountId, senderEmail, signature = '', draftId: openDraftId, onClose, onSent, onError, onDraftChanged, onDraftRemoved }: { mode: ComposeMode; source?: MailMessage; accountId?: string; senderEmail?: string; signature?: string; draftId?: string; onClose: () => void; onSent: (result: NativeSendResponse) => void; onError: (message: string) => void; onDraftChanged?: (draft: NativeDraft) => void; onDraftRemoved?: (draftId: string) => void }) {
   const [to, setTo] = useState('')
   const [cc, setCc] = useState('')
   const [bcc, setBcc] = useState('')
@@ -3451,7 +3568,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
     }
     setSending(true)
     const uploadIds: string[] = []
-    let queued = false
+    let sendResult: NativeSendResponse | undefined
     try {
       if (isNativeRuntime) {
         await waitForAttachmentJobs()
@@ -3481,7 +3598,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
         const currentDraftId = draftIdRef.current
         const effectiveHtml = htmlMode || currentInlineImages.length > 0
         const outgoingBody = appendAccountSignature(body, accountSignature)
-        const result = await invoke<{ queued?: boolean }>('mail.send', {
+        sendResult = await invoke<NativeSendResponse>('mail.send', {
           accountId,
           to: to.trim(),
           ...(cc.trim() ? { cc: cc.trim() } : {}),
@@ -3492,18 +3609,27 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
           ...(references.length ? { references } : {}),
           ...(effectiveHtml && (outgoingBody.trim() || currentInlineImages.length) ? { htmlBody: composeHtmlBody(outgoingBody, currentInlineImages) } : {}),
           ...(uploadIds.length ? { attachmentIds: uploadIds } : {}),
-          ...(persistedIds.length ? { draftId: currentDraftId, draftAttachmentIds: persistedIds } : {}),
+          ...(currentDraftId ? { draftId: currentDraftId } : {}),
+          ...(persistedIds.length ? { draftAttachmentIds: persistedIds } : {}),
         })
-        queued = Boolean(result.queued)
       } else {
         await new Promise((resolve) => window.setTimeout(resolve, 700))
+        sendResult = {
+          sent: false,
+          queued: true,
+          accountId: accountId ?? 'demo-account',
+          outboxId: `demo-${Date.now()}`,
+          undoable: true,
+          undoSeconds: DEFAULT_UNDO_SEND_SECONDS,
+          undoExpiresAt: Date.now() + DEFAULT_UNDO_SEND_SECONDS * 1_000,
+        }
       }
       const sentDraftId = draftIdRef.current
-      if (isNativeRuntime && accountId && sentDraftId) {
+      if (isNativeRuntime && accountId && sentDraftId && !sendResult.undoable) {
         await invoke('drafts.remove', { accountId, id: sentDraftId }, 30_000).catch(() => undefined)
         onDraftRemoved?.(sentDraftId)
       }
-      onSent(Boolean(isNativeRuntime && queued))
+      onSent(sendResult)
     } catch (error) {
       await mapWithConcurrency(uploadIds, ACCOUNT_IPC_CONCURRENCY, (uploadId) => invoke('mail.attachment.upload.cancel', { uploadId }).catch(() => undefined))
       onError(error instanceof Error ? error.message : '邮件发送失败，请稍后重试')
@@ -3528,7 +3654,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
       {inlineImages.length > 0 && <div className="compose-inline-images" aria-label="待发送内嵌图片">{inlineImages.map((image) => <div className={`compose-inline-image is-${image.status}`} key={image.localId}>{image.previewUrl ? <img src={image.previewUrl} alt={image.fileName} /> : <span className="compose-inline-placeholder"><Icon name="image" size={22} /></span>}<span>{image.fileName}<small>{image.status === 'saving' ? '加密保存中…' : image.status === 'failed' ? '保存失败' : image.status === 'removing' ? '移除中…' : '已保存'}</small></span><button type="button" disabled={image.status === 'saving' || image.status === 'removing'} onClick={() => { trackAttachmentJob(removeComposeAttachment(image, true)) }} aria-label={'移除内嵌图片 ' + image.fileName}>×</button></div>)}</div>}
       {attachments.length > 0 && <div className="compose-attachments" aria-label="待发送附件">{attachments.map((attachment) => <div className={`compose-attachment is-${attachment.status}`} key={attachment.localId}><span>{attachment.fileName}</span><small>{Math.max(1, Math.round(attachment.size / 1024))} KB · {attachment.status === 'saving' ? '加密保存中…' : attachment.status === 'failed' ? '保存失败' : attachment.status === 'removing' ? '移除中…' : '已保存'}</small><button type="button" disabled={attachment.status === 'saving' || attachment.status === 'removing'} onClick={() => { trackAttachmentJob(removeComposeAttachment(attachment, false)) }} aria-label={'移除附件 ' + attachment.fileName}>×</button></div>)}</div>}
       {uploadingName && <div className="compose-uploading" aria-live="polite"><Icon name="rotate" size={14} />{uploadingName}</div>}
-      <div className="compose-footer"><div><TooltipButton label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={19} /></TooltipButton><input ref={fileInputRef} type="file" multiple hidden onChange={addFiles} /><TooltipButton label="插入图片" onClick={() => imageInputRef.current?.click()}><Icon name="image" size={19} /></TooltipButton><input ref={imageInputRef} type="file" accept="image/*" multiple hidden onChange={addInlineImages} /><TooltipButton label={htmlEnabled ? (inlineImages.length > 0 ? '内嵌图片需要 HTML 格式' : '关闭 HTML 格式') : '启用 HTML 格式'} active={htmlEnabled} onClick={() => { if (inlineImages.length > 0) { onError('已插入内嵌图片，HTML 格式必须保持开启'); return } setHtmlMode((value) => !value) }}><span className="reply-a">A</span></TooltipButton></div><div className="compose-send-actions">{draftId && <button type="button" className="danger-button" onClick={() => { void discard() }} disabled={isSending}><Icon name="trash" size={16} />丢弃草稿</button>}<button type="button" className="gradient-button" onClick={send} disabled={isSending}>{isSending ? (uploadingName || '发送中…') : '发送'}<Icon name="send" size={17} /></button></div></div>
+      <div className="compose-footer"><div><TooltipButton label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={19} /></TooltipButton><input ref={fileInputRef} type="file" multiple hidden onChange={addFiles} /><TooltipButton label="插入图片" onClick={() => imageInputRef.current?.click()}><Icon name="image" size={19} /></TooltipButton><input ref={imageInputRef} type="file" accept="image/*" multiple hidden onChange={addInlineImages} /><TooltipButton label={htmlEnabled ? (inlineImages.length > 0 ? '内嵌图片需要 HTML 格式' : '关闭 HTML 格式') : '启用 HTML 格式'} active={htmlEnabled} onClick={() => { if (inlineImages.length > 0) { onError('已插入内嵌图片，HTML 格式必须保持开启'); return } setHtmlMode((value) => !value) }}><span className="reply-a">A</span></TooltipButton></div><div className="compose-send-actions">{draftId && <button type="button" className="danger-button" onClick={() => { void discard() }} disabled={isSending}><Icon name="trash" size={16} />丢弃草稿</button>}<button type="button" className="gradient-button" onClick={send} disabled={isSending || (isNativeRuntime && !draftReady)}>{isSending ? (uploadingName || '发送中…') : isNativeRuntime && !draftReady ? '准备中…' : '发送'}<Icon name="send" size={17} /></button></div></div>
     </motion.div>
   </motion.div>
 }

@@ -1,8 +1,9 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -25,9 +26,11 @@ const MAX_FILE_NAME_BYTES: usize = 255;
 const MAX_CONTENT_TYPE_BYTES: usize = 128;
 const MAX_FAILURE_BYTES: usize = 256;
 const MAX_RETRY_ATTEMPTS: u32 = 8;
+pub const MAX_UNDO_SEND_SECONDS: u64 = 30;
 
 static OUTBOX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static FLUSH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static SCHEDULER_WAKE: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
 
 fn outbox_guard() -> std::sync::MutexGuard<'static, ()> {
     OUTBOX_LOCK
@@ -51,6 +54,8 @@ pub struct QueuedAttachment {
 pub struct QueuedMessage {
     pub id: String,
     pub account_id: String,
+    #[serde(default)]
+    pub draft_id: Option<String>,
     pub to: String,
     #[serde(default)]
     pub cc: String,
@@ -91,6 +96,15 @@ pub struct OutboxStatus {
     pub total: usize,
     pub pending: usize,
     pub paused: usize,
+    pub scheduled: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CancelScheduledResult {
+    Cancelled,
+    Missing,
+    TooLate,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -98,9 +112,18 @@ pub struct FlushSummary {
     pub sent: usize,
     pub retried: usize,
     pub paused: usize,
+    pub authentication_failed: bool,
 }
 
-pub fn enqueue(cache_root: &Path, mut message: QueuedMessage) -> Result<QueuedMessage> {
+pub fn enqueue(cache_root: &Path, message: QueuedMessage) -> Result<QueuedMessage> {
+    enqueue_with_delay(cache_root, message, 0)
+}
+
+pub fn enqueue_with_delay(
+    cache_root: &Path,
+    mut message: QueuedMessage,
+    delay_seconds: u64,
+) -> Result<QueuedMessage> {
     let _outbox_guard = outbox_guard();
     if message.id.is_empty() {
         message.id = format!("outbox-{:016x}", rand::random::<u64>());
@@ -113,7 +136,7 @@ pub fn enqueue(cache_root: &Path, mut message: QueuedMessage) -> Result<QueuedMe
     };
     message.updated_at = timestamp;
     message.attempts = 0;
-    message.next_attempt_at = timestamp;
+    message.next_attempt_at = timestamp.saturating_add(delay_seconds.min(MAX_UNDO_SEND_SECONDS));
     message.paused = false;
     message.last_error = None;
     validate(&message)?;
@@ -127,6 +150,7 @@ pub fn enqueue(cache_root: &Path, mut message: QueuedMessage) -> Result<QueuedMe
     store.messages.truncate(MAX_MESSAGES);
     validate_store(&store)?;
     persist(cache_root, &store)?;
+    notify_scheduler();
     Ok(message)
 }
 
@@ -139,11 +163,44 @@ pub fn status(cache_root: &Path, account_id: &str) -> Result<OutboxStatus> {
         .filter(|item| item.account_id == account_id)
         .collect::<Vec<_>>();
     let paused = messages.iter().filter(|item| item.paused).count();
+    let now = now_seconds();
+    let scheduled = messages
+        .iter()
+        .filter(|item| !item.paused && item.attempts == 0 && item.next_attempt_at > now)
+        .count();
     Ok(OutboxStatus {
         total: messages.len(),
         pending: messages.len().saturating_sub(paused),
         paused,
+        scheduled,
     })
+}
+
+pub fn cancel_scheduled(
+    cache_root: &Path,
+    account_id: &str,
+    message_id: &str,
+) -> Result<CancelScheduledResult> {
+    let _outbox_guard = outbox_guard();
+    validate_account_id(account_id)?;
+    validate_message_id(message_id)?;
+    let mut store = load(cache_root)?;
+    let now = now_seconds();
+    let Some(index) = store
+        .messages
+        .iter()
+        .position(|item| item.account_id == account_id && item.id == message_id)
+    else {
+        return Ok(CancelScheduledResult::Missing);
+    };
+    let message = &store.messages[index];
+    if message.paused || message.attempts > 0 || message.next_attempt_at <= now {
+        return Ok(CancelScheduledResult::TooLate);
+    }
+    store.messages.remove(index);
+    persist(cache_root, &store)?;
+    notify_scheduler();
+    Ok(CancelScheduledResult::Cancelled)
 }
 
 pub fn retry_all(cache_root: &Path, account_id: &str) -> Result<usize> {
@@ -165,6 +222,7 @@ pub fn retry_all(cache_root: &Path, account_id: &str) -> Result<usize> {
     }
     if changed > 0 {
         persist(cache_root, &store)?;
+        notify_scheduler();
     }
     Ok(changed)
 }
@@ -182,6 +240,7 @@ pub fn remove(cache_root: &Path, account_id: &str, message_id: &str) -> Result<b
         return Ok(false);
     }
     persist(cache_root, &store)?;
+    notify_scheduler();
     Ok(true)
 }
 
@@ -193,6 +252,7 @@ pub fn remove_account(cache_root: &Path, account_id: &str) -> Result<()> {
     store.messages.retain(|item| item.account_id != account_id);
     if original_len != store.messages.len() {
         persist(cache_root, &store)?;
+        notify_scheduler();
     }
     Ok(())
 }
@@ -216,6 +276,31 @@ pub fn resume_account(cache_root: &Path, account_id: &str) -> Result<usize> {
     }
     if changed > 0 {
         persist(cache_root, &store)?;
+        notify_scheduler();
+    }
+    Ok(changed)
+}
+
+pub fn pause_account(cache_root: &Path, account_id: &str, reason: &str) -> Result<usize> {
+    let _outbox_guard = outbox_guard();
+    validate_account_id(account_id)?;
+    let mut store = load(cache_root)?;
+    let now = now_seconds();
+    let safe_reason = reason.chars().take(MAX_FAILURE_BYTES).collect::<String>();
+    let mut changed = 0;
+    for message in &mut store.messages {
+        if message.account_id != account_id || message.paused {
+            continue;
+        }
+        message.paused = true;
+        message.next_attempt_at = 0;
+        message.last_error = Some(safe_reason.clone());
+        message.updated_at = now;
+        changed += 1;
+    }
+    if changed > 0 {
+        persist(cache_root, &store)?;
+        notify_scheduler();
     }
     Ok(changed)
 }
@@ -276,10 +361,16 @@ pub fn flush_due(
         match crate::send::send_message(profile.clone(), &outgoing, &attachments) {
             Ok(()) => {
                 remove(cache_root, account_id, &message.id)?;
+                if let Some(draft_id) = message.draft_id.as_deref() {
+                    if let Err(error) = crate::drafts::remove(cache_root, account_id, draft_id) {
+                        tracing::warn!(account_id = %account_id, "could not remove delivered outbox draft: {error}");
+                    }
+                }
                 summary.sent += 1;
             }
             Err(error) => {
                 let retryable = crate::send::is_retryable_error(&error);
+                let authentication_failed = is_authentication_error(&error);
                 record_failure(
                     cache_root,
                     account_id,
@@ -288,7 +379,7 @@ pub fn flush_due(
                     crate::send::retry_after_seconds(&error),
                     if retryable {
                         "网络暂不可用，MailGo 将自动重试"
-                    } else if is_authentication_error(&error) {
+                    } else if authentication_failed {
                         "账户需要重新授权后才能发送"
                     } else {
                         "发送失败，请检查账户或邮件内容"
@@ -298,6 +389,7 @@ pub fn flush_due(
                     summary.retried += 1;
                 } else {
                     summary.paused += 1;
+                    summary.authentication_failed |= authentication_failed;
                 }
             }
         }
@@ -336,7 +428,68 @@ fn record_failure(
         let delay = retry_after.unwrap_or(fallback).clamp(30, 3_600);
         message.next_attempt_at = now.saturating_add(delay);
     }
-    persist(cache_root, &store)
+    persist(cache_root, &store)?;
+    notify_scheduler();
+    Ok(())
+}
+
+pub fn due_account_ids(cache_root: &Path) -> Result<Vec<String>> {
+    let _outbox_guard = outbox_guard();
+    let now = now_seconds();
+    let mut seen = HashSet::new();
+    Ok(load(cache_root)?
+        .messages
+        .into_iter()
+        .filter(|message| {
+            !message.paused
+                && message.next_attempt_at <= now
+                && seen.insert(message.account_id.clone())
+        })
+        .map(|message| message.account_id)
+        .collect())
+}
+
+pub fn next_due_delay(cache_root: &Path) -> Result<Option<Duration>> {
+    let _outbox_guard = outbox_guard();
+    let now = now_seconds();
+    Ok(load(cache_root)?
+        .messages
+        .iter()
+        .filter(|message| !message.paused)
+        .map(|message| message.next_attempt_at.saturating_sub(now))
+        .min()
+        .map(Duration::from_secs))
+}
+
+pub fn scheduler_generation() -> u64 {
+    *SCHEDULER_WAKE
+        .get_or_init(|| (Mutex::new(0), Condvar::new()))
+        .0
+        .lock()
+        .expect("MailGo outbox scheduler lock poisoned")
+}
+
+pub fn wait_for_scheduler_change(observed: u64, timeout: Duration) {
+    let (generation, wake) = SCHEDULER_WAKE.get_or_init(|| (Mutex::new(0), Condvar::new()));
+    let generation = generation
+        .lock()
+        .expect("MailGo outbox scheduler lock poisoned");
+    if *generation != observed {
+        return;
+    }
+    drop(
+        wake.wait_timeout_while(generation, timeout, |current| *current == observed)
+            .expect("MailGo outbox scheduler wait poisoned"),
+    );
+}
+
+pub fn notify_scheduler() {
+    let (generation, wake) = SCHEDULER_WAKE.get_or_init(|| (Mutex::new(0), Condvar::new()));
+    let mut generation = generation
+        .lock()
+        .expect("MailGo outbox scheduler lock poisoned");
+    *generation = generation.wrapping_add(1);
+    wake.notify_one();
 }
 
 fn is_authentication_error(error: &anyhow::Error) -> bool {
@@ -411,6 +564,9 @@ fn validate_store(store: &OutboxStore) -> Result<()> {
 fn validate(message: &QueuedMessage) -> Result<()> {
     validate_account_id(&message.account_id)?;
     validate_message_id(&message.id)?;
+    if let Some(draft_id) = &message.draft_id {
+        validate_message_id(draft_id)?;
+    }
     validate_text(&message.to, MAX_RECIPIENT_BYTES, "to", false)?;
     validate_text(&message.cc, MAX_RECIPIENT_BYTES, "cc", true)?;
     validate_text(&message.bcc, MAX_RECIPIENT_BYTES, "bcc", true)?;
@@ -549,6 +705,7 @@ mod tests {
         QueuedMessage {
             id: "outbox-fixture".into(),
             account_id: "account-1".into(),
+            draft_id: Some("draft-fixture".into()),
             to: "person@example.com".into(),
             cc: String::new(),
             bcc: String::new(),
@@ -616,6 +773,7 @@ mod tests {
             "lastError": null
         }))
         .expect("legacy outbox message");
+        assert!(message.draft_id.is_none());
         assert!(message.in_reply_to.is_none());
         assert!(message.references.is_empty());
         validate(&message).expect("legacy outbox message remains valid");
@@ -656,5 +814,60 @@ mod tests {
             &anyhow!("SMTP authentication failed").context("send message")
         ));
         let _ = profile_for(ProviderKind::Google);
+    }
+
+    #[test]
+    fn delayed_messages_can_only_be_cancelled_before_they_are_due() {
+        let root = std::env::temp_dir().join(format!(
+            "mailgo-outbox-undo-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let generation = scheduler_generation();
+        let scheduled = enqueue_with_delay(&root, fixture(), MAX_UNDO_SEND_SECONDS)
+            .expect("enqueue scheduled message");
+        assert!(scheduler_generation() != generation);
+        assert_eq!(status(&root, "account-1").unwrap().scheduled, 1);
+        let delay = next_due_delay(&root).unwrap().expect("scheduled delay");
+        assert!(delay > Duration::ZERO);
+        assert!(delay <= Duration::from_secs(MAX_UNDO_SEND_SECONDS));
+        assert_eq!(
+            cancel_scheduled(&root, "account-1", &scheduled.id).unwrap(),
+            CancelScheduledResult::Cancelled
+        );
+        assert_eq!(status(&root, "account-1").unwrap().total, 0);
+        assert_eq!(
+            cancel_scheduled(&root, "account-1", &scheduled.id).unwrap(),
+            CancelScheduledResult::Missing
+        );
+
+        let due = enqueue(&root, fixture()).expect("enqueue immediately due message");
+        assert_eq!(
+            cancel_scheduled(&root, "account-1", &due.id).unwrap(),
+            CancelScheduledResult::TooLate
+        );
+        assert_eq!(status(&root, "account-1").unwrap().total, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pausing_an_account_removes_it_from_the_due_schedule() {
+        let root = std::env::temp_dir().join(format!(
+            "mailgo-outbox-pause-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        enqueue(&root, fixture()).expect("enqueue due message");
+        assert_eq!(due_account_ids(&root).unwrap(), vec!["account-1"]);
+        assert_eq!(
+            pause_account(&root, "account-1", "账户需要重新授权后才能发送").unwrap(),
+            1
+        );
+        assert!(due_account_ids(&root).unwrap().is_empty());
+        let status = status(&root, "account-1").unwrap();
+        assert_eq!(status.paused, 1);
+        assert_eq!(status.pending, 0);
+        assert!(next_due_delay(&root).unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
     }
 }
