@@ -64,6 +64,9 @@ try {
     & npm run test:threading
     if ($LASTEXITCODE -ne 0) { throw "conversation threading checks failed with exit code $LASTEXITCODE" }
 
+    & npm run test:connection-diagnostics
+    if ($LASTEXITCODE -ne 0) { throw "connection diagnostic checks failed with exit code $LASTEXITCODE" }
+
     & cargo fmt --manifest-path 'native\Cargo.toml' -- --check
     if ($LASTEXITCODE -ne 0) { throw "cargo fmt check failed with exit code $LASTEXITCODE" }
 

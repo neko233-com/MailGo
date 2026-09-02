@@ -10,6 +10,7 @@ use crate::providers::{Authentication, ProviderProfile, TransportSecurity};
 const MAX_RECIPIENTS_PER_FIELD: usize = 50;
 const MAX_RECIPIENTS_PER_MESSAGE: usize = 100;
 const SMTP_IO_TIMEOUT: Duration = Duration::from_secs(60);
+const SMTP_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Sending can fail after the message has been fully validated, for example when a laptop goes
 /// offline or an SMTP service temporarily throttles the connection. These failures are safe to
@@ -108,6 +109,52 @@ fn error_chain_text(error: &anyhow::Error) -> String {
         .to_ascii_lowercase()
 }
 
+/// Return a stable, privacy-safe SMTP diagnostic category. Provider response text can contain
+/// account-specific information, so only this bounded category is sent to the renderer or log.
+pub fn error_category(error: &anyhow::Error) -> &'static str {
+    let message = error_chain_text(error);
+    let response_code = smtp_response_code(&message);
+    if matches!(response_code, Some(530 | 534 | 535 | 538))
+        || [
+            "authentication",
+            "authorization",
+            "invalid credential",
+            "requires authorization",
+            "auth failed",
+        ]
+        .iter()
+        .any(|marker| message.contains(marker))
+    {
+        return "authentication";
+    }
+    if [
+        "rate limit",
+        "too many requests",
+        "too many connections",
+        "connection limit exceeded",
+        "throttl",
+        "server busy",
+        "system busy",
+        "try again later",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+    {
+        return "rate-limit";
+    }
+    if is_retryable_error(error) {
+        return "network";
+    }
+    if error.chain().any(|source| {
+        source
+            .downcast_ref::<lettre::transport::smtp::Error>()
+            .is_some_and(|smtp| smtp.is_tls())
+    }) {
+        return "tls";
+    }
+    "provider"
+}
+
 /// Extract a numeric Retry-After hint when the transport includes one in its error text. The
 /// value is capped by the outbox caller and is never persisted as provider response text.
 pub fn retry_after_seconds(error: &anyhow::Error) -> Option<u64> {
@@ -160,17 +207,29 @@ pub fn send_message(
     }
     let built_message = build_message(message, attachments)?;
 
-    let credentials = Credentials::new(
-        message.from.to_string(),
-        crate::oauth::access_token(message.credential),
-    );
+    smtp_transport(&profile, message.from, message.credential, SMTP_IO_TIMEOUT)?
+        .send(&built_message)
+        .context("send message")?;
+    Ok(())
+}
+
+fn smtp_transport(
+    profile: &ProviderProfile,
+    email: &str,
+    credential: &str,
+    timeout: Duration,
+) -> Result<SmtpTransport> {
+    if credential.trim().is_empty() {
+        return Err(anyhow!("account requires authorization before connecting"));
+    }
+    let credentials = Credentials::new(email.to_string(), crate::oauth::access_token(credential));
     let mut transport = match profile.smtp.security {
         TransportSecurity::Tls => SmtpTransport::relay(&profile.smtp.host),
         TransportSecurity::StartTls => SmtpTransport::starttls_relay(&profile.smtp.host),
     }
     .with_context(|| format!("configure SMTP host {}", profile.smtp.host))?
     .port(profile.smtp.port)
-    .timeout(Some(SMTP_IO_TIMEOUT))
+    .timeout(Some(timeout))
     .credentials(credentials);
 
     transport = match profile.authentication {
@@ -179,10 +238,18 @@ pub fn send_message(
             transport.authentication(vec![Mechanism::Plain, Mechanism::Login])
         }
     };
-    transport
-        .build()
-        .send(&built_message)
-        .context("send message")?;
+    Ok(transport.build())
+}
+
+/// Authenticate to the configured SMTP server and issue NOOP. This validates outgoing-mail
+/// credentials without constructing or transmitting a message envelope.
+pub fn test_connection(profile: &ProviderProfile, email: &str, credential: &str) -> Result<()> {
+    let connected = smtp_transport(profile, email, credential, SMTP_DIAGNOSTIC_TIMEOUT)?
+        .test_connection()
+        .context("test SMTP connection")?;
+    if !connected {
+        return Err(anyhow!("SMTP server rejected the connection test"));
+    }
     Ok(())
 }
 
@@ -577,6 +644,25 @@ mod tests {
         assert_eq!(
             retry_after_seconds(&anyhow!("Retry-After: 45").context("send message")),
             Some(45)
+        );
+    }
+
+    #[test]
+    fn diagnostic_errors_are_reduced_to_stable_privacy_safe_categories() {
+        assert_eq!(
+            error_category(&anyhow!(
+                "permanent error (535): Authentication failed for diagnostic account"
+            )),
+            "authentication"
+        );
+        assert_eq!(
+            error_category(&anyhow!("server busy; try again later")),
+            "rate-limit"
+        );
+        assert_eq!(error_category(&anyhow!("connection refused")), "network");
+        assert_eq!(
+            error_category(&anyhow!("permanent error (550): mailbox unavailable")),
+            "provider"
         );
     }
 }

@@ -113,6 +113,22 @@ export interface NativeSyncResponse {
   failed: { accountId: string; message: string }[]
 }
 
+export type NativeConnectionDiagnosticStatus = 'ok' | 'authentication' | 'rate-limit' | 'network' | 'tls' | 'provider'
+
+export interface NativeConnectionDiagnosticChannel {
+  ok: boolean
+  status: NativeConnectionDiagnosticStatus
+  latencyMs: number
+}
+
+export interface NativeConnectionDiagnostic {
+  accountId: string
+  checkedAt: string
+  ok: boolean
+  incoming: NativeConnectionDiagnosticChannel
+  outgoing: NativeConnectionDiagnosticChannel
+}
+
 export interface NativeSearchResponse {
   messages: NativeCachedMessage[]
   truncated: boolean

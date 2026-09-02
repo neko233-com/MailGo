@@ -16,6 +16,7 @@
     "test:ipc-capability": "node scripts/test-ipc-capability.mjs",
     "test:security-policy": "node scripts/test-security-policy.mjs",
     "test:threading": "node scripts/test-threading.mjs",
+    "test:connection-diagnostics": "node scripts/test-connection-diagnostics.mjs",
     "package:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1",
     "package:msix": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-msix.ps1",
     "release:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1"

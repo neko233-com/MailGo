@@ -5,6 +5,7 @@ MailGo is a Windows-first local-first email workspace for multiple Google, QQ, O
 The current foundation includes:
 
 - React + Vite desktop UI with three-pane unified inbox.
+- Gmail/Foxmail-style desktop density is compact by default and user-switchable, with a 960×640 minimum three-pane layout, bounded HTML-message typography, and a smaller 1280×800 native opening window for high-DPI laptops.
 - Resizable Windows windows stay usable below the desktop four-pane breakpoint: mail list and reading view become a single-column flow, with drawer navigation, authorization help, and a title-bar compose entry.
 - `motion` transitions with `prefers-reduced-motion` support.
 - Tree-shakeable `reicon-react` icon components.
@@ -22,6 +23,7 @@ The current foundation includes:
 - The native shell starts from the real local account/cache state; demo messages are browser-preview-only, and first launch provides a direct add-account path.
 - Optional offline-only mode is enforced by the native boundary: cached mail remains readable, network sync/search are paused, outgoing mail is queued encrypted, and local flag/move mutations replay when online mode is restored.
 - Provider quick links and guided authorization-code onboarding.
+- Stored accounts have an account-scoped connection diagnostic that authenticates to IMAP and SMTP in parallel, issues NOOP only, reports bounded privacy-safe status/latency, and never sends a message.
 - Safe HTML preview mode, attachments, smart categories (including Apple Connect and Apple advertising), search, unread filter, star, reply, compose, theme switching, and user CSS overrides.
 - Local-only advertising classification can optionally hide ads from normal lists while keeping likely Apple Connect notifications and smart-category access visible; the category is heuristic and never presented as sender authentication.
 - Rust `neko233-com/rdesktop` WebView2 shell with custom frameless title bar and preserved WebView data directory under `%LOCALAPPDATA%\\MailGo\\WebView2`.

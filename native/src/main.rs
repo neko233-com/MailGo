@@ -813,6 +813,47 @@ enum ManualAccountSyncOutcome {
     Failed(Value),
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionDiagnosticChannel {
+    ok: bool,
+    status: &'static str,
+    latency_ms: u64,
+}
+
+fn connection_diagnostic_channel(
+    account_id: &str,
+    channel: &'static str,
+    elapsed: Duration,
+    result: Result<()>,
+    categorize: impl FnOnce(&anyhow::Error) -> &'static str,
+) -> ConnectionDiagnosticChannel {
+    let latency_ms = u64::try_from(elapsed.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(120_000);
+    match result {
+        Ok(()) => ConnectionDiagnosticChannel {
+            ok: true,
+            status: "ok",
+            latency_ms,
+        },
+        Err(error) => {
+            let status = categorize(&error);
+            tracing::warn!(
+                account_id,
+                channel,
+                category = status,
+                "account connection diagnostic failed"
+            );
+            ConnectionDiagnosticChannel {
+                ok: false,
+                status,
+                latency_ms,
+            }
+        }
+    }
+}
+
 fn manual_sync_failure(account_id: &str, message: impl Into<String>) -> ManualAccountSyncOutcome {
     ManualAccountSyncOutcome::Failed(json!({
         "accountId": account_id,
@@ -1884,6 +1925,66 @@ fn handle_ipc(
                 }
                 clear_credential_snapshots(&mut previous_credentials);
                 Ok(json!({ "removed": id }))
+            }
+            "accounts.diagnose" => {
+                ensure_network_allowed(shared)?;
+                let account_id = string_field(&message.payload, "accountId")?;
+                let account = account_for(shared, &account_id)?;
+                let _sync_lease = try_begin_account_sync(shared, &account_id)?;
+                let profile = profile_for_account(&account)?;
+                let credential = load_credential(&account)?;
+                let provider = profile.provider;
+                let email = account.email.as_str();
+                let credential = credential.as_str();
+                let incoming_profile = profile.clone();
+                let outgoing_profile = profile;
+                let (incoming_attempt, outgoing_attempt) = std::thread::scope(|scope| {
+                    let incoming = scope.spawn(move || {
+                        let started = Instant::now();
+                        let result = sync::test_connection(&incoming_profile, email, credential);
+                        (started.elapsed(), result)
+                    });
+                    let outgoing = scope.spawn(move || {
+                        let started = Instant::now();
+                        let result = send::test_connection(&outgoing_profile, email, credential);
+                        (started.elapsed(), result)
+                    });
+                    let incoming = incoming.join().unwrap_or_else(|_| {
+                        (
+                            Duration::ZERO,
+                            Err(anyhow!("IMAP diagnostic worker stopped")),
+                        )
+                    });
+                    let outgoing = outgoing.join().unwrap_or_else(|_| {
+                        (
+                            Duration::ZERO,
+                            Err(anyhow!("SMTP diagnostic worker stopped")),
+                        )
+                    });
+                    (incoming, outgoing)
+                });
+                let incoming = connection_diagnostic_channel(
+                    &account_id,
+                    "imap",
+                    incoming_attempt.0,
+                    incoming_attempt.1,
+                    |error| sync::error_category(error, provider),
+                );
+                let outgoing = connection_diagnostic_channel(
+                    &account_id,
+                    "smtp",
+                    outgoing_attempt.0,
+                    outgoing_attempt.1,
+                    send::error_category,
+                );
+                let ok = incoming.ok && outgoing.ok;
+                Ok(json!({
+                    "accountId": account_id,
+                    "checkedAt": chrono::Utc::now().to_rfc3339(),
+                    "ok": ok,
+                    "incoming": incoming,
+                    "outgoing": outgoing,
+                }))
             }
             "accounts.export" => {
                 let app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
@@ -3102,6 +3203,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn connection_diagnostics_expose_only_bounded_status_and_latency() {
+        let successful = connection_diagnostic_channel(
+            "account-test",
+            "imap",
+            Duration::from_millis(47),
+            Ok(()),
+            |_| "provider",
+        );
+        assert!(successful.ok);
+        assert_eq!(successful.status, "ok");
+        assert_eq!(successful.latency_ms, 47);
+
+        let failed = connection_diagnostic_channel(
+            "account-test",
+            "smtp",
+            Duration::from_secs(121),
+            Err(anyhow!("diagnostic-sensitive-marker")),
+            |_| "authentication",
+        );
+        assert!(!failed.ok);
+        assert_eq!(failed.status, "authentication");
+        assert_eq!(failed.latency_ms, 120_000);
+        let serialized = serde_json::to_string(&failed).expect("serialize diagnostic result");
+        assert!(!serialized.contains("diagnostic-sensitive-marker"));
+    }
+
+    #[test]
     fn attachment_chunks_are_bounded_and_resumable() {
         let (next, done) = attachment_chunk_bounds(ATTACHMENT_CHUNK_BYTES + 10, 0).unwrap();
         assert_eq!(next, ATTACHMENT_CHUNK_BYTES);
@@ -3551,9 +3679,9 @@ fn main() -> Result<()> {
         },
         window: WindowConfig {
             title: "MailGo".to_string(),
-            width: 1440,
-            height: 900,
-            min_size: Some((1120, 720)),
+            width: 1280,
+            height: 800,
+            min_size: Some((960, 640)),
             decorations: false,
             resizable: true,
             icon: Some(app_window_icon()?),

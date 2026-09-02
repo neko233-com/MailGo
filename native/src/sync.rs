@@ -385,6 +385,18 @@ fn authenticate(
     }
 }
 
+/// Authenticate to IMAP and issue NOOP without selecting or downloading a mailbox. The caller
+/// owns concurrency control, so diagnostics cannot race an account synchronization lease.
+pub fn test_connection(profile: &ProviderProfile, email: &str, credential: &str) -> Result<()> {
+    if credential.trim().is_empty() {
+        return Err(anyhow!("account requires authorization before connecting"));
+    }
+    let mut session = authenticate(profile, email, credential)?;
+    let result = session.noop().context("test IMAP connection");
+    session.logout().ok();
+    result
+}
+
 fn body_session_fingerprint(profile: &ProviderProfile, email: &str, credential: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(profile.provider.as_str().as_bytes());
