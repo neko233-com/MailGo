@@ -45,6 +45,7 @@ export interface MailMessage {
   nativeFolder?: string
   outboxId?: string
   outboxState?: NativeOutboxItemState
+  outboxScheduledAt?: number
 }
 
 export interface MailAccount {
@@ -110,6 +111,8 @@ export interface NativeSendResponse {
   undoable?: boolean
   undoSeconds?: number
   undoExpiresAt?: number
+  scheduled?: boolean
+  scheduledFor?: number
 }
 
 export interface NativeUndoSendResponse {
@@ -188,6 +191,8 @@ export interface NativeOutboxStatus {
   pending: number
   paused: number
   scheduled?: number
+  userScheduled?: number
+  undoable?: number
 }
 
 export type NativeOutboxItemState = 'scheduled' | 'pending' | 'retrying' | 'paused'
@@ -211,6 +216,7 @@ export interface NativeOutboxItem {
   createdAt: number
   updatedAt: number
   nextAttemptAt: number
+  scheduledAt?: number
   attempts: number
   state: NativeOutboxItemState
   lastError?: string

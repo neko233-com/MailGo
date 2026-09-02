@@ -9,6 +9,7 @@ import { Icon, type IconName } from './components/Icon'
 import { OutboxDetail } from './components/OutboxDetail'
 import { RecipientInput } from './components/RecipientInput'
 import { RichTextEditor } from './components/RichTextEditor'
+import { ScheduleSendControl } from './components/ScheduleSendControl'
 import { buildComposeThreadHeaders, type ComposeMode } from './compose-thread'
 import { sanitizeCustomCss } from './customCss'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails, sampleOutboxItems } from './data'
@@ -17,6 +18,7 @@ import { invoke, readNativeState } from './lib/ipc'
 import { inspectExternalLink, type ExternalLinkInspection } from './linkSafety'
 import { appendSignatureToComposeHtml, plainTextToComposeHtml, sanitizeComposeHtml } from './richText'
 import { appendAccountSignature, normalizeAccountSignature } from './signature'
+import { formatScheduledAt } from './scheduleSend'
 import { buildMailThreads, type MailThread } from './threading'
 import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeConnectionDiagnostic, NativeConnectionDiagnosticChannel, NativeDeviceStartResponse, NativeDraft, NativeDraftAttachment, NativeLocalSearchResponse, NativeMailboxResponse, NativeMessageResponse, NativeOutboxActionResponse, NativeOutboxItem, NativeOutboxRecallResponse, NativeOutboxSnapshot, NativeQueueStatus, NativeSearchResponse, NativeSendResponse, NativeSyncItem, NativeSyncResponse, NativeUndoSendResponse, Provider, SmartCategory, ThemeMode } from './types'
 
@@ -455,7 +457,7 @@ function draftToUi(draft: NativeDraft, account: MailAccount): MailMessage {
 }
 
 function outboxToUi(item: NativeOutboxItem, account: MailAccount): MailMessage {
-  const date = new Date(item.updatedAt * 1_000)
+  const date = new Date((item.scheduledAt ?? item.updatedAt) * 1_000)
   const validDate = !Number.isNaN(date.getTime()) ? date : null
   const recipient = item.to.split(/[,;]/).map((value) => value.trim()).find(Boolean) ?? '未填写收件人'
   return {
@@ -472,14 +474,15 @@ function outboxToUi(item: NativeOutboxItem, account: MailAccount): MailMessage {
     preview: item.lastError || item.preview || '等待后台发送',
     timestamp: validDate ? validDate.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : '—',
     receivedAt: validDate?.toISOString(),
-    dateGroup: '待发送',
+    dateGroup: item.scheduledAt ? '定时发送' : '待发送',
     unread: false,
     starred: false,
     accent: account.accent,
-    avatar: item.state === 'paused' ? '!' : '发',
+    avatar: item.state === 'paused' ? '!' : item.scheduledAt ? '时' : '发',
     body: [item.preview || '无纯文本摘要'],
     outboxId: item.id,
     outboxState: item.state,
+    outboxScheduledAt: item.scheduledAt,
   }
 }
 
@@ -760,6 +763,7 @@ function App() {
   const [outboxTotal, setOutboxTotal] = useState(0)
   const [outboxPaused, setOutboxPaused] = useState(0)
   const [outboxScheduled, setOutboxScheduled] = useState(0)
+  const [outboxUndoable, setOutboxUndoable] = useState(0)
   const [nativeOutboxItems, setNativeOutboxItems] = useState<NativeOutboxItem[]>(() => isNativeRuntime ? [] : sampleOutboxItems)
   const [outboxAction, setOutboxAction] = useState<OutboxAction | null>(null)
   const [pendingOutboxDiscard, setPendingOutboxDiscard] = useState<NativeOutboxItem | null>(null)
@@ -921,7 +925,13 @@ function App() {
       startTransition(() => setNativeOutboxItems(items))
       setOutboxTotal(snapshots.reduce((total, snapshot) => total + snapshot.status.total, 0))
       setOutboxPaused(snapshots.reduce((total, snapshot) => total + snapshot.status.paused, 0))
-      setOutboxScheduled(snapshots.reduce((total, snapshot) => total + (snapshot.status.scheduled ?? 0), 0))
+      setOutboxScheduled(snapshots.reduce((total, snapshot) => total + (snapshot.status.userScheduled
+        ?? snapshot.items.filter((item) => item.state === 'scheduled' && Boolean(item.scheduledAt)).length), 0))
+      setOutboxUndoable(snapshots.reduce((total, snapshot) => {
+        const explicit = snapshot.status.userScheduled
+          ?? snapshot.items.filter((item) => item.state === 'scheduled' && Boolean(item.scheduledAt)).length
+        return total + (snapshot.status.undoable ?? Math.max(0, (snapshot.status.scheduled ?? 0) - explicit))
+      }, 0))
     } catch {
       // The encrypted queue remains native-owned; a transient summary read must not interrupt mail actions.
     }
@@ -931,7 +941,8 @@ function App() {
     if (isNativeRuntime) return
     setOutboxTotal(nativeOutboxItems.length)
     setOutboxPaused(nativeOutboxItems.filter((item) => item.state === 'paused').length)
-    setOutboxScheduled(nativeOutboxItems.filter((item) => item.state === 'scheduled').length)
+    setOutboxScheduled(nativeOutboxItems.filter((item) => item.state === 'scheduled' && Boolean(item.scheduledAt)).length)
+    setOutboxUndoable(nativeOutboxItems.filter((item) => item.state === 'scheduled' && !item.scheduledAt).length)
   }, [isNativeRuntime, nativeOutboxItems])
 
   const refreshNativeDrafts = async (accountList: MailAccount[] = accounts) => {
@@ -2305,7 +2316,7 @@ function App() {
     try {
       if (!isNativeRuntime) {
         setNativeOutboxItems((current) => current.map((candidate) => candidate.id === item.id
-          ? { ...candidate, state: 'pending' as const, attempts: 0, lastError: undefined, nextAttemptAt: Math.floor(Date.now() / 1_000) }
+          ? { ...candidate, state: 'pending' as const, attempts: 0, lastError: undefined, nextAttemptAt: Math.floor(Date.now() / 1_000), scheduledAt: undefined }
           : candidate))
         pushToast('已进入后台发送队列', 'success')
         return
@@ -2414,6 +2425,10 @@ function App() {
     setComposeSource(undefined)
     void refreshNativeDrafts()
     void refreshOutbox()
+    if (result.scheduled && result.scheduledFor) {
+      pushToast(`已安排在 ${formatScheduledAt(result.scheduledFor)} 发送`, 'success')
+      return
+    }
     if (result.undoable && result.outboxId) {
       const fallbackDuration = Math.max(1, result.undoSeconds ?? undoSendSeconds) * 1_000
       const durationMs = result.undoExpiresAt
@@ -2927,10 +2942,10 @@ function App() {
         {isMobileSidebarOpen && <button className="mobile-overlay" type="button" aria-label="关闭导航" onClick={() => setMobileSidebarOpen(false)} />}
         <aside className={`sidebar ${isMobileSidebarOpen ? 'is-mobile-open' : ''}`}>
           <div className="sidebar-top">
-            <button className="compose-button" type="button" onClick={() => openCompose()}><Icon name="edit" size={19} /><span>写邮件</span><span className="compose-shortcut">C</span></button>
+            <button className="compose-button" type="button" aria-label="写邮件" title="写邮件" onClick={() => openCompose()}><Icon name="edit" size={19} /><span>写邮件</span><span className="compose-shortcut">C</span></button>
             <nav className="folder-nav" aria-label="邮件文件夹">
               {displayedFolderLabels.map((folder) => (
-                <button key={folder.id} type="button" className={`nav-row ${selectedFolder === folder.id && !selectedCategory && !selectedNativeFolder ? 'is-selected' : ''}`} onClick={() => selectFolder(folder.id)}>
+                <button key={folder.id} type="button" aria-label={`${folder.label}${folder.unread > 0 ? `，${folder.unread} 封未读` : ''}`} title={folder.label} className={`nav-row ${selectedFolder === folder.id && !selectedCategory && !selectedNativeFolder ? 'is-selected' : ''}`} onClick={() => selectFolder(folder.id)}>
                   <span className="nav-icon"><Icon name={folder.icon as IconName} size={19} weight={selectedFolder === folder.id ? 'Filled' : 'Outline'} /></span>
                   <span>{folder.label}</span>
                   {folder.unread > 0 && <span className={`nav-count ${selectedFolder === folder.id ? 'nav-count-selected' : ''}`}>{formatCount(folder.unread)}</span>}
@@ -2944,7 +2959,7 @@ function App() {
                   const selected = Boolean(selectedNativeFolder && selectedNativeFolder.accountId === account.id && isSameNativeFolder(selectedNativeFolder.name, folder))
                   const unread = allMails.filter((mail) => mail.accountId === account.id && mail.nativeFolder && isSameNativeFolder(mail.nativeFolder, folder) && mail.unread).length
                   const folderLabel = nativeFolderLabel(folder, nativeFolderLabels[account.id]?.[folder])
-                  return <button key={`${account.id}::${folder}`} type="button" className={`nav-row server-folder-row ${selected ? 'is-selected' : ''}`} onClick={() => selectNativeFolder(account, folder)} title={`${account.label} · ${folderLabel}`}>
+                  return <button key={`${account.id}::${folder}`} type="button" aria-label={`${account.label} · ${folderLabel}${unread > 0 ? `，${unread} 封未读` : ''}`} className={`nav-row server-folder-row ${selected ? 'is-selected' : ''}`} onClick={() => selectNativeFolder(account, folder)} title={`${account.label} · ${folderLabel}`}>
                     <span className="nav-icon"><Icon name="folder" size={17} weight={selected ? 'Filled' : 'Outline'} /></span>
                     <span className="server-folder-copy"><span>{folderLabel}</span><small>{account.label}</small></span>
                     {unread > 0 && <span className={`nav-count ${selected ? 'nav-count-selected' : ''}`}>{formatCount(unread)}</span>}
@@ -2958,7 +2973,7 @@ function App() {
             <div className="section-label-row"><span>智能分类</span><TooltipButton label="管理分类" onClick={() => setSettingsOpen(true)}><Icon name="settings" size={15} /></TooltipButton></div>
             <div className="smart-list">
               {smartCategories.map((category) => (
-                <button key={category.id} type="button" className={`smart-row ${selectedCategory === category.id ? 'is-selected' : ''}`} onClick={() => selectCategory(category.id)}>
+                <button key={category.id} type="button" aria-label={category.label} title={category.label} className={`smart-row ${selectedCategory === category.id ? 'is-selected' : ''}`} onClick={() => selectCategory(category.id)}>
                   <span className="smart-dot" style={{ background: category.color }}><Icon name={category.icon} size={14} /></span><span>{category.label}</span>
                 </button>
               ))}
@@ -2969,7 +2984,7 @@ function App() {
             <div className="section-label-row"><span>账户</span><TooltipButton label="添加账户" onClick={openNewAccount}><Icon name="add" size={16} /></TooltipButton></div>
             <div className="account-list">
               {accounts.map((account) => (
-                <button key={account.id} type="button" className={`account-row ${selectedAccountId === account.id && !selectedNativeFolder ? 'is-selected' : ''}`} onClick={() => { setSelectedAccountId(account.id); setSelectedCategory(null); setSelectedNativeFolder(null); setSelectedFolder('inbox'); setSelectedMailIds([]); setMobilePane('list'); setMobileSidebarOpen(false) }}>
+                <button key={account.id} type="button" aria-label={`${account.label}，${account.unread} 封未读`} title={account.label} className={`account-row ${selectedAccountId === account.id && !selectedNativeFolder ? 'is-selected' : ''}`} onClick={() => { setSelectedAccountId(account.id); setSelectedCategory(null); setSelectedNativeFolder(null); setSelectedFolder('inbox'); setSelectedMailIds([]); setMobilePane('list'); setMobileSidebarOpen(false) }}>
                   <ProviderMark provider={account.provider} size="sm" />
                   <span className="account-copy"><strong>{account.label}</strong><small>{account.email}</small></span>
                   {account.unread > 0 && <span className="account-count">{account.unread}</span>}
@@ -2984,7 +2999,7 @@ function App() {
             <div className={`storage-track ${cacheStatsState === 'loading' ? 'is-loading' : ''}`} role="img" aria-label={cacheCompositionLabel} title={cacheCompositionLabel}>
               {cacheStats && cacheStats.totalBytes > 0 ? <><span className="storage-segment storage-mail" style={{ width: storageShare(cacheMailBytes, cacheStats.totalBytes) }} /><span className="storage-segment storage-attachments" style={{ width: storageShare(cacheAttachmentBytes, cacheStats.totalBytes) }} /><span className="storage-segment storage-other" style={{ width: storageShare(cacheOtherBytes, cacheStats.totalBytes) }} /></> : null}
             </div>
-            <div className="storage-foot"><span aria-live="polite"><Icon name={outboxTotal || pendingOperations ? 'rotate' : 'cloud'} size={13} /> {outboxTotal ? `${outboxTotal} 封待发送${outboxScheduled ? ` · ${outboxScheduled} 封可撤销` : ''}${outboxPaused ? ` · ${outboxPaused} 封需重试` : ''}` : pendingOperations ? `${pendingOperations} 项操作待同步` : '离线可查看最近邮件'}</span><div className="storage-foot-actions">{outboxPaused > 0 && <button type="button" onClick={() => { void retryPendingOutbox() }}><Icon name="rotate" size={13} />重试待发送</button>}<button type="button" onClick={handleSync}><Icon name="rotate" size={13} /> {isSyncing ? '同步中…' : '立即同步'}</button></div></div>
+            <div className="storage-foot"><span aria-live="polite"><Icon name={outboxTotal || pendingOperations ? 'rotate' : 'cloud'} size={13} /> {outboxTotal ? `${outboxTotal} 封待发送${outboxScheduled ? ` · ${outboxScheduled} 封定时` : ''}${outboxUndoable ? ` · ${outboxUndoable} 封可撤销` : ''}${outboxPaused ? ` · ${outboxPaused} 封需重试` : ''}` : pendingOperations ? `${pendingOperations} 项操作待同步` : '离线可查看最近邮件'}</span><div className="storage-foot-actions">{outboxPaused > 0 && <button type="button" onClick={() => { void retryPendingOutbox() }}><Icon name="rotate" size={13} />重试待发送</button>}<button type="button" onClick={handleSync}><Icon name="rotate" size={13} /> {isSyncing ? '同步中…' : '立即同步'}</button></div></div>
           </div>
 
           <div className="sidebar-quick-settings">
@@ -3050,7 +3065,7 @@ function App() {
                   {item.type === 'group'
                     ? <div className="mail-group-label">{item.label}</div>
                     : <div className={`mail-row ${latest?.outboxId ? 'is-outbox-row' : ''} ${item.thread.messages.some((mail) => mail.id === selectedMailId) ? 'is-selected' : ''} ${item.thread.unreadCount > 0 ? 'is-unread' : ''}`} onClick={() => { void selectMail(item.thread.latest) }}>
-                        {latest?.outboxId ? <span className={`outbox-row-state is-${latest.outboxState}`} title={latest.outboxState === 'paused' ? '需要处理' : latest.outboxState === 'scheduled' ? '等待撤销窗口' : latest.outboxState === 'retrying' ? '自动重试中' : '等待发送'}><Icon name={latest.outboxState === 'paused' ? 'info' : latest.outboxState === 'scheduled' ? 'clock' : 'rotate'} size={15} /></span> : <><label className="checkbox-wrap row-checkbox" onClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`选择会话 ${latest?.subject}`} checked={item.thread.messages.every((mail) => selectedMailIds.includes(mail.id))} onChange={() => toggleThreadSelection(item.thread)} /><span /></label><button type="button" className={`star-button ${latest?.starred ? 'is-starred' : ''}`} aria-label={latest?.starred ? '取消最新邮件星标' : '为最新邮件添加星标'} onClick={(event) => { event.stopPropagation(); if (latest) toggleStar(latest) }}><Icon name="star" size={18} weight={latest?.starred ? 'Filled' : 'Outline'} /></button></>}
+                        {latest?.outboxId ? <span className={`outbox-row-state is-${latest.outboxState}`} title={latest.outboxState === 'paused' ? '需要处理' : latest.outboxState === 'scheduled' ? latest.outboxScheduledAt ? '定时发送' : '等待撤销窗口' : latest.outboxState === 'retrying' ? '自动重试中' : '等待发送'}><Icon name={latest.outboxState === 'paused' ? 'info' : latest.outboxState === 'scheduled' ? 'clock' : 'rotate'} size={15} /></span> : <><label className="checkbox-wrap row-checkbox" onClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`选择会话 ${latest?.subject}`} checked={item.thread.messages.every((mail) => selectedMailIds.includes(mail.id))} onChange={() => toggleThreadSelection(item.thread)} /><span /></label><button type="button" className={`star-button ${latest?.starred ? 'is-starred' : ''}`} aria-label={latest?.starred ? '取消最新邮件星标' : '为最新邮件添加星标'} onClick={(event) => { event.stopPropagation(); if (latest) toggleStar(latest) }}><Icon name="star" size={18} weight={latest?.starred ? 'Filled' : 'Outline'} /></button></>}
                         <div className="mail-row-copy"><div className="mail-row-top"><strong>{item.thread.participants.join('、') || latest?.senderName}{item.thread.messages.length > 1 && <span className="thread-count">{item.thread.messages.length}</span>}</strong><time>{latest?.timestamp}</time></div><div className="mail-row-subject">{latest?.subject}</div><p>{latest?.preview}</p></div>
                       </div>}
                 </div>
@@ -3795,7 +3810,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
   useEffect(() => {
     const handleEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return
-      if (event.target instanceof HTMLElement && event.target.closest('.rich-compose-link')) return
+      if (event.target instanceof HTMLElement && event.target.closest('.rich-compose-link, .compose-schedule-menu')) return
       event.preventDefault()
       event.stopImmediatePropagation()
       void requestClose()
@@ -3825,7 +3840,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
     }
   }
 
-  const send = async () => {
+  const send = async (scheduledFor?: number) => {
     if (!to.trim().includes('@')) {
       onError('请输入有效的收件人地址')
       return
@@ -3881,18 +3896,29 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
           ...(uploadIds.length ? { attachmentIds: uploadIds } : {}),
           ...(currentDraftId ? { draftId: currentDraftId } : {}),
           ...(persistedIds.length ? { draftAttachmentIds: persistedIds } : {}),
+          ...(scheduledFor ? { scheduledFor } : {}),
         })
       } else {
         await new Promise((resolve) => window.setTimeout(resolve, 700))
-        sendResult = {
-          sent: false,
-          queued: true,
-          accountId: accountId ?? 'demo-account',
-          outboxId: `demo-${Date.now()}`,
-          undoable: true,
-          undoSeconds: DEFAULT_UNDO_SEND_SECONDS,
-          undoExpiresAt: Date.now() + DEFAULT_UNDO_SEND_SECONDS * 1_000,
-        }
+        sendResult = scheduledFor
+          ? {
+              sent: false,
+              queued: true,
+              accountId: accountId ?? 'demo-account',
+              outboxId: `demo-${Date.now()}`,
+              scheduled: true,
+              scheduledFor,
+              undoable: false,
+            }
+          : {
+              sent: false,
+              queued: true,
+              accountId: accountId ?? 'demo-account',
+              outboxId: `demo-${Date.now()}`,
+              undoable: true,
+              undoSeconds: DEFAULT_UNDO_SEND_SECONDS,
+              undoExpiresAt: Date.now() + DEFAULT_UNDO_SEND_SECONDS * 1_000,
+            }
       }
       const sentDraftId = draftIdRef.current
       if (isNativeRuntime && accountId && sentDraftId && !sendResult.queued) {
@@ -3926,7 +3952,7 @@ function ComposeModal({ mode, source, accountId, senderEmail, signature = '', dr
       {inlineImages.length > 0 && <div className="compose-inline-images" aria-label="待发送内嵌图片">{inlineImages.map((image) => <div className={`compose-inline-image is-${image.status}`} key={image.localId}>{image.previewUrl ? <img src={image.previewUrl} alt={image.fileName} /> : <span className="compose-inline-placeholder"><Icon name="image" size={22} /></span>}<span>{image.fileName}<small>{image.status === 'saving' ? '加密保存中…' : image.status === 'failed' ? '保存失败' : image.status === 'removing' ? '移除中…' : '已保存'}</small></span><button type="button" disabled={image.status === 'saving' || image.status === 'removing'} onClick={() => { trackAttachmentJob(removeComposeAttachment(image, true)) }} aria-label={'移除内嵌图片 ' + image.fileName}>×</button></div>)}</div>}
       {attachments.length > 0 && <div className="compose-attachments" aria-label="待发送附件">{attachments.map((attachment) => <div className={`compose-attachment is-${attachment.status}`} key={attachment.localId}><span>{attachment.fileName}</span><small>{Math.max(1, Math.round(attachment.size / 1024))} KB · {attachment.status === 'saving' ? '加密保存中…' : attachment.status === 'failed' ? '保存失败' : attachment.status === 'removing' ? '移除中…' : '已保存'}</small><button type="button" disabled={attachment.status === 'saving' || attachment.status === 'removing'} onClick={() => { trackAttachmentJob(removeComposeAttachment(attachment, false)) }} aria-label={'移除附件 ' + attachment.fileName}>×</button></div>)}</div>}
       {uploadingName && <div className="compose-uploading" aria-live="polite"><Icon name="rotate" size={14} />{uploadingName}</div>}
-      <div className="compose-footer"><div><TooltipButton label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={19} /></TooltipButton><input ref={fileInputRef} type="file" multiple hidden onChange={addFiles} /><TooltipButton label="插入图片" onClick={() => imageInputRef.current?.click()}><Icon name="image" size={19} /></TooltipButton><input ref={imageInputRef} type="file" accept="image/*" multiple hidden onChange={addInlineImages} /><TooltipButton label={htmlEnabled ? (inlineImages.length > 0 ? '内嵌图片需要 HTML 格式' : '切换为纯文本（移除格式）') : '启用富文本格式'} active={htmlEnabled} onClick={() => { if (inlineImages.length > 0) { onError('已插入内嵌图片，HTML 格式必须保持开启'); return } if (htmlMode) { setRichBody(''); setHtmlMode(false) } else { setRichBody(plainTextToComposeHtml(body)); setHtmlMode(true) } }}><span className="reply-a">A</span></TooltipButton></div><div className="compose-send-actions">{draftId && <button type="button" className="danger-button" onClick={() => { void discard() }} disabled={isSending}><Icon name="trash" size={16} />丢弃草稿</button>}<button type="button" className="gradient-button" onClick={send} disabled={isSending || (isNativeRuntime && !draftReady)}>{isSending ? (uploadingName || '发送中…') : isNativeRuntime && !draftReady ? '准备中…' : '发送'}<Icon name="send" size={17} /></button></div></div>
+      <div className="compose-footer"><div><TooltipButton label="添加附件" onClick={() => fileInputRef.current?.click()}><Icon name="paperclip" size={19} /></TooltipButton><input ref={fileInputRef} type="file" multiple hidden onChange={addFiles} /><TooltipButton label="插入图片" onClick={() => imageInputRef.current?.click()}><Icon name="image" size={19} /></TooltipButton><input ref={imageInputRef} type="file" accept="image/*" multiple hidden onChange={addInlineImages} /><TooltipButton label={htmlEnabled ? (inlineImages.length > 0 ? '内嵌图片需要 HTML 格式' : '切换为纯文本（移除格式）') : '启用富文本格式'} active={htmlEnabled} onClick={() => { if (inlineImages.length > 0) { onError('已插入内嵌图片，HTML 格式必须保持开启'); return } if (htmlMode) { setRichBody(''); setHtmlMode(false) } else { setRichBody(plainTextToComposeHtml(body)); setHtmlMode(true) } }}><span className="reply-a">A</span></TooltipButton></div><div className="compose-send-actions">{draftId && <button type="button" className="danger-button" onClick={() => { void discard() }} disabled={isSending}><Icon name="trash" size={16} />丢弃草稿</button>}<ScheduleSendControl disabled={isSending || (isNativeRuntime && !draftReady)} label={isSending ? (uploadingName || '发送中…') : isNativeRuntime && !draftReady ? '准备中…' : '发送'} onSendNow={() => { void send() }} onSchedule={(timestamp) => { void send(timestamp) }} /></div></div>
     </motion.div>
   </motion.div>
 }

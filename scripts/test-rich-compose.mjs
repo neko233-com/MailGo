@@ -36,7 +36,7 @@ for (const icon of ['Bold', 'Italic', 'TextUnderline', 'OrderedList', 'Unordered
   assert.match(icons, new RegExp(`reicon-react/icons/${icon}`))
 }
 assert.match(app, /<RichTextEditor/)
-assert.match(app, /event\.target\.closest\('\.rich-compose-link'\)/)
+assert.match(app, /event\.target\.closest\('\.rich-compose-link, \.compose-schedule-menu'\)/)
 assert.match(app, /htmlBody: richBody/)
 assert.match(app, /composeHtmlBody\(body, currentInlineImages, htmlMode \? richBody : undefined, accountSignature\)/)
 assert.match(types, /htmlBody\?: string/)

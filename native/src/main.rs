@@ -1128,6 +1128,16 @@ fn optional_u16_field(payload: &Value, name: &str) -> Option<u16> {
         .and_then(|value| u16::try_from(value).ok())
 }
 
+fn optional_u64_field(payload: &Value, name: &str) -> Result<Option<u64>> {
+    match payload.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| anyhow!("field {name} must be an unsigned integer")),
+    }
+}
+
 fn valid_account_id(value: &str) -> bool {
     let stem = value.split('.').next().unwrap_or_default();
     !value.is_empty()
@@ -3219,6 +3229,8 @@ fn handle_ipc(
                     "htmlBody",
                     MAX_MESSAGE_BODY_BYTES,
                 )?;
+                let scheduled_for = optional_u64_field(&message.payload, "scheduledFor")?
+                    .map(|timestamp_ms| timestamp_ms / 1_000);
                 let attachment_ids = match message.payload.get("attachmentIds") {
                     None => Vec::new(),
                     Some(value) => value
@@ -3325,7 +3337,7 @@ fn handle_ipc(
                     let app = shared.lock().map_err(|_| anyhow!("state lock poisoned"))?;
                     (app.state.offline_mode, app.state.undo_send_seconds)
                 };
-                if offline_mode || undo_send_seconds > 0 {
+                if scheduled_for.is_some() || offline_mode || undo_send_seconds > 0 {
                     let validation_message = send::OutgoingMessage {
                         from: &account.email,
                         credential: "",
@@ -3339,39 +3351,46 @@ fn handle_ipc(
                         references: &references,
                     };
                     send::validate_message(&validation_message, &attachments)?;
-                    let undoable = !offline_mode && undo_send_seconds > 0;
-                    let queued = outbox::enqueue_with_delay(
-                        &cache_dir(),
-                        outbox::QueuedMessage {
-                            id: String::new(),
-                            account_id: account_id.clone(),
-                            draft_id: draft_id.clone(),
-                            to,
-                            cc: cc.unwrap_or_default(),
-                            bcc: bcc.unwrap_or_default(),
-                            subject,
-                            text_body,
-                            html_body,
-                            in_reply_to,
-                            references,
-                            attachments: attachments
-                                .into_iter()
-                                .map(|attachment| outbox::QueuedAttachment {
-                                    file_name: attachment.file_name,
-                                    content_type: attachment.content_type,
-                                    content_id: attachment.content_id,
-                                    bytes: attachment.bytes,
-                                })
-                                .collect(),
-                            created_at: 0,
-                            updated_at: 0,
-                            attempts: 0,
-                            next_attempt_at: 0,
-                            paused: false,
-                            last_error: None,
-                        },
-                        if undoable { undo_send_seconds } else { 0 },
-                    )?;
+                    let explicitly_scheduled = scheduled_for.is_some();
+                    let undoable = !explicitly_scheduled && !offline_mode && undo_send_seconds > 0;
+                    let queued_message = outbox::QueuedMessage {
+                        id: String::new(),
+                        account_id: account_id.clone(),
+                        draft_id: draft_id.clone(),
+                        to,
+                        cc: cc.unwrap_or_default(),
+                        bcc: bcc.unwrap_or_default(),
+                        subject,
+                        text_body,
+                        html_body,
+                        in_reply_to,
+                        references,
+                        attachments: attachments
+                            .into_iter()
+                            .map(|attachment| outbox::QueuedAttachment {
+                                file_name: attachment.file_name,
+                                content_type: attachment.content_type,
+                                content_id: attachment.content_id,
+                                bytes: attachment.bytes,
+                            })
+                            .collect(),
+                        created_at: 0,
+                        updated_at: 0,
+                        attempts: 0,
+                        next_attempt_at: 0,
+                        scheduled_at: None,
+                        paused: false,
+                        last_error: None,
+                    };
+                    let queued = if let Some(scheduled_at) = scheduled_for {
+                        outbox::enqueue_at(&cache_dir(), queued_message, scheduled_at)?
+                    } else {
+                        outbox::enqueue_with_delay(
+                            &cache_dir(),
+                            queued_message,
+                            if undoable { undo_send_seconds } else { 0 },
+                        )?
+                    };
                     if let Ok(mut app) = shared.lock() {
                         for upload_id in &attachment_ids {
                             app.attachment_uploads.remove(upload_id);
@@ -3384,6 +3403,8 @@ fn handle_ipc(
                         "undoable": undoable,
                         "undoSeconds": if undoable { undo_send_seconds } else { 0 },
                         "undoExpiresAt": if undoable { queued.next_attempt_at.saturating_mul(1_000) } else { 0 },
+                        "scheduled": explicitly_scheduled,
+                        "scheduledFor": queued.scheduled_at.unwrap_or_default().saturating_mul(1_000),
                         "draftId": draft_id,
                         "outboxId": queued.id,
                         "accountId": account_id,
@@ -3439,6 +3460,7 @@ fn handle_ipc(
                                 updated_at: 0,
                                 attempts: 0,
                                 next_attempt_at: 0,
+                                scheduled_at: None,
                                 paused: false,
                                 last_error: None,
                             },
@@ -3552,6 +3574,18 @@ mod tests {
         assert!(sanitized.contains("cid:local-image"));
         assert!(!sanitized.contains("script"));
         assert!(!sanitized.contains("tracker.example"));
+
+        assert_eq!(
+            optional_u64_field(
+                &json!({ "scheduledFor": 1_800_000_000_000u64 }),
+                "scheduledFor"
+            )
+            .unwrap(),
+            Some(1_800_000_000_000)
+        );
+        assert!(optional_u64_field(&json!({ "scheduledFor": -1 }), "scheduledFor").is_err());
+        assert!(optional_u64_field(&json!({ "scheduledFor": 1.5 }), "scheduledFor").is_err());
+        assert!(optional_u64_field(&json!({ "scheduledFor": "later" }), "scheduledFor").is_err());
     }
 
     #[test]

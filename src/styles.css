@@ -582,7 +582,7 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .external-link-actions button:disabled { cursor: default; opacity: .66; transform: none; }
 
 .compose-backdrop { align-items: end; justify-items: end; padding: 0 30px 30px 0; }
-.compose-modal { width: min(600px, calc(100vw - 60px)); overflow: hidden; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
+.compose-modal { width: min(600px, calc(100vw - 60px)); overflow: visible; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
 .compose-header { height: 48px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px 0 17px; border-bottom: 1px solid var(--line); color: var(--text); background: var(--surface-strong); }
 .compose-header > div { display: flex; }
 .compose-recipient-row { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--line); }
@@ -657,6 +657,33 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .compose-send-actions { align-items: center; gap: 8px !important; }
 .compose-send-actions .danger-button { height: 37px; padding: 0 11px; font-size: 11px; }
 .compose-footer .gradient-button { min-width: 82px; min-height: 37px; }
+.schedule-send-control { position: relative; display: flex; }
+.compose-send-split { display: flex; align-items: stretch; }
+.compose-send-split .compose-send-now { min-width: 72px; border-radius: 9px 0 0 9px; box-shadow: none; }
+.compose-send-split .compose-send-now:hover { transform: none; box-shadow: none; }
+.compose-schedule-toggle { width: 32px; min-height: 37px; display: inline-flex; align-items: center; justify-content: center; padding: 0; border-left: 1px solid rgba(6, 46, 111, .18); border-radius: 0 9px 9px 0; color: #062e6f; background: #c2e7ff; }
+:root:not([data-theme='light']) .compose-schedule-toggle { color: #041e49; background: #a8c7fa; }
+.compose-schedule-toggle:hover:not(:disabled) { background: #b5ddf8; }
+.compose-schedule-menu { position: absolute; right: 0; bottom: calc(100% + 7px); z-index: 26; width: min(286px, calc(100vw - 24px)); max-height: min(350px, calc(100vh - 86px)); overflow: auto; padding: 6px; border: 1px solid var(--line-strong); border-radius: 10px; color: var(--text); background: var(--surface); box-shadow: var(--shadow); }
+.compose-schedule-heading { min-height: 31px; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 1px 4px 5px 7px; border-bottom: 1px solid var(--line); font-size: 11px; font-weight: 650; }
+.compose-schedule-heading > span { display: inline-flex; align-items: center; gap: 6px; }
+.compose-schedule-heading > span svg { color: var(--accent); }
+.compose-schedule-heading > button { width: 25px; height: 25px; display: grid; place-items: center; border-radius: 6px; color: var(--muted); background: transparent; }
+.compose-schedule-heading > button:hover { color: var(--text); background: var(--surface-hover); }
+.compose-schedule-options { display: grid; gap: 2px; padding: 5px 0; }
+.compose-schedule-options > button { min-height: 39px; display: flex; align-items: center; gap: 8px; padding: 4px 7px; border-radius: 7px; color: var(--muted-strong); background: transparent; text-align: left; }
+.compose-schedule-options > button:hover, .compose-schedule-options > button:focus-visible { color: var(--text); background: var(--surface-hover); }
+.compose-schedule-options > button > span { min-width: 0; flex: 1; display: grid; gap: 2px; }
+.compose-schedule-options strong { font-size: 10.5px; font-weight: 650; }
+.compose-schedule-options small { color: var(--muted); font-size: 9px; }
+.compose-schedule-options > button > svg { flex: 0 0 auto; color: var(--muted); }
+.compose-schedule-menu form { display: grid; gap: 6px; padding: 7px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-strong); }
+.compose-schedule-menu form label { display: grid; gap: 5px; color: var(--muted); font-size: 9px; }
+.compose-schedule-menu input { width: 100%; height: 30px; padding: 0 7px; border: 1px solid var(--line-strong); border-radius: 6px; color: var(--text); background: var(--surface); font-size: 10px; color-scheme: inherit; }
+.compose-schedule-menu form p { margin: 0; color: var(--danger); font-size: 9px; line-height: 1.35; }
+.compose-schedule-menu form > button { min-height: 29px; border-radius: 6px; color: white; background: #0b57d0; font-size: 10px; font-weight: 650; }
+.compose-schedule-menu form > button:hover { background: #0849b5; }
+.compose-schedule-note { display: block; padding: 7px 6px 2px; color: var(--muted); font-size: 8.5px; line-height: 1.45; }
 
 .settings-popover { position: fixed; top: 58px; right: 142px; z-index: 35; width: 350px; max-height: calc(100vh - 72px); overflow: auto; border: 1px solid var(--line-strong); border-radius: 14px; background: var(--surface); box-shadow: var(--shadow); }
 .settings-title { height: 48px; padding: 0 10px 0 15px; border-bottom: 1px solid var(--line); }
@@ -809,6 +836,9 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .app-shell.is-compact-density .compose-signature-preview { padding: 0 12px 7px; }
 .app-shell.is-compact-density .compose-footer { padding: 5px 8px; }
 .app-shell.is-compact-density .compose-footer .gradient-button { min-height: 29px; }
+.app-shell.is-compact-density .compose-schedule-toggle { width: 29px; min-height: 29px; }
+.app-shell.is-compact-density .compose-schedule-menu { width: 272px; max-height: min(326px, calc(100vh - 64px)); }
+.app-shell.is-compact-density .compose-schedule-options > button { min-height: 34px; }
 .app-shell.is-compact-density .settings-popover { top: 40px; right: 116px; width: 310px; max-height: calc(100vh - 48px); border-radius: 9px; }
 .app-shell.is-compact-density .settings-title { height: 36px; }
 .app-shell.is-compact-density .settings-row { gap: 9px; padding: 8px 11px; }

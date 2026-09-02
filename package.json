@@ -22,6 +22,7 @@
     "test:link-safety": "node scripts/test-link-safety.mjs",
     "test:recipients": "node scripts/test-recipients.mjs",
     "test:undo-send": "node scripts/test-undo-send.mjs",
+    "test:schedule-send": "node scripts/test-schedule-send.mjs",
     "test:outbox": "node scripts/test-outbox.mjs",
     "test:conditional-refresh": "node scripts/test-conditional-refresh.mjs",
     "test:rich-compose": "node scripts/test-rich-compose.mjs",

@@ -82,6 +82,9 @@ try {
     & npm run test:undo-send
     if ($LASTEXITCODE -ne 0) { throw "undo-send checks failed with exit code $LASTEXITCODE" }
 
+    & npm run test:schedule-send
+    if ($LASTEXITCODE -ne 0) { throw "scheduled-send checks failed with exit code $LASTEXITCODE" }
+
     & npm run test:outbox
     if ($LASTEXITCODE -ne 0) { throw "local outbox checks failed with exit code $LASTEXITCODE" }
 

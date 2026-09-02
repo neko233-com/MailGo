@@ -18,6 +18,11 @@ const statusCopy = {
   paused: { label: '需要处理', detail: '自动重试已暂停，请重新授权或手动重试。' },
 } as const
 
+const userScheduledCopy = {
+  label: '定时发送',
+  detail: '已加密保存在本机，将在计划时间由后台自动发送。',
+} as const
+
 function formatOutboxTime(timestamp: number) {
   if (!timestamp) return '—'
   const date = new Date(timestamp * 1_000)
@@ -41,7 +46,10 @@ function recipientRows(item: NativeOutboxItem) {
 }
 
 export function OutboxDetail({ item, account, busyAction, onBack, onEdit, onRetry, onDiscard }: OutboxDetailProps) {
-  const status = statusCopy[item.state]
+  const hasUserSchedule = Boolean(item.scheduledAt)
+  const isUserScheduled = item.state === 'scheduled' && hasUserSchedule
+  const status = isUserScheduled ? userScheduledCopy : statusCopy[item.state]
+  const plannedAttemptAt = item.scheduledAt ?? item.nextAttemptAt
   const busy = Boolean(busyAction)
   return (
     <>
@@ -49,7 +57,7 @@ export function OutboxDetail({ item, account, busyAction, onBack, onEdit, onRetr
         <div className="reading-actions">
           <button type="button" className="mobile-only-button reading-back-button icon-button" aria-label="返回邮件列表" onClick={onBack}>列表</button>
           <button type="button" className="toolbar-action" onClick={onEdit} disabled={busy}><Icon name="edit" size={17} /><span>{busyAction === 'edit' ? '正在打开…' : '编辑并继续'}</span></button>
-          <button type="button" className="toolbar-action" onClick={onRetry} disabled={busy}><Icon name="rotate" size={17} /><span>{busyAction === 'retry' ? '正在重试…' : '立即重试'}</span></button>
+          <button type="button" className="toolbar-action" onClick={onRetry} disabled={busy}><Icon name="rotate" size={17} /><span>{busyAction === 'retry' ? '正在发送…' : hasUserSchedule ? '立即发送' : '立即重试'}</span></button>
           <button type="button" className="toolbar-action is-danger" onClick={onDiscard} disabled={busy}><Icon name="trash" size={17} /><span>删除待发送</span></button>
         </div>
       </div>
@@ -69,7 +77,7 @@ export function OutboxDetail({ item, account, busyAction, onBack, onEdit, onRetr
           <div><strong>{status.label}</strong><p>{item.lastError || status.detail}</p></div>
           <dl>
             <div><dt>加入发件箱</dt><dd>{formatOutboxTime(item.createdAt)}</dd></div>
-            {item.nextAttemptAt > 0 && <div><dt>下次尝试</dt><dd>{formatOutboxTime(item.nextAttemptAt)}</dd></div>}
+            {plannedAttemptAt > 0 && <div><dt>{hasUserSchedule ? '计划发送' : '下次尝试'}</dt><dd>{formatOutboxTime(plannedAttemptAt)}</dd></div>}
             <div><dt>尝试次数</dt><dd>{item.attempts} 次</dd></div>
           </dl>
         </section>

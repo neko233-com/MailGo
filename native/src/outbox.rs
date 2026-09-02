@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::providers::ProviderProfile;
 
-const STORE_SCHEMA_VERSION: u32 = 1;
+const STORE_SCHEMA_VERSION: u32 = 2;
 const STORE_FILE: &str = "outbox.bin";
 const STORE_BACKUP_FILE: &str = "outbox.bin.bak";
 const STORE_TEMP_FILE: &str = "outbox.bin.tmp";
@@ -27,6 +27,8 @@ const MAX_FAILURE_BYTES: usize = 256;
 const MAX_PREVIEW_CHARS: usize = 240;
 const MAX_RETRY_ATTEMPTS: u32 = 8;
 pub const MAX_UNDO_SEND_SECONDS: u64 = 30;
+pub const MIN_SCHEDULE_LEAD_SECONDS: u64 = 60;
+pub const MAX_SCHEDULE_AHEAD_SECONDS: u64 = 366 * 24 * 60 * 60;
 
 static OUTBOX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static IN_FLIGHT_IDS: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
@@ -79,6 +81,8 @@ pub struct QueuedMessage {
     #[serde(default)]
     pub next_attempt_at: u64,
     #[serde(default)]
+    pub scheduled_at: Option<u64>,
+    #[serde(default)]
     pub paused: bool,
     #[serde(default)]
     pub last_error: Option<String>,
@@ -98,6 +102,8 @@ pub struct OutboxStatus {
     pub pending: usize,
     pub paused: usize,
     pub scheduled: usize,
+    pub user_scheduled: usize,
+    pub undoable: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -132,6 +138,7 @@ pub struct OutboxListItem {
     pub created_at: u64,
     pub updated_at: u64,
     pub next_attempt_at: u64,
+    pub scheduled_at: Option<u64>,
     pub attempts: u32,
     pub state: OutboxItemState,
     pub last_error: Option<String>,
@@ -240,8 +247,37 @@ pub fn enqueue(cache_root: &Path, message: QueuedMessage) -> Result<QueuedMessag
 
 pub fn enqueue_with_delay(
     cache_root: &Path,
-    mut message: QueuedMessage,
+    message: QueuedMessage,
     delay_seconds: u64,
+) -> Result<QueuedMessage> {
+    let next_attempt_at = now_seconds().saturating_add(delay_seconds.min(MAX_UNDO_SEND_SECONDS));
+    enqueue_for(cache_root, message, next_attempt_at, None)
+}
+
+pub fn enqueue_at(
+    cache_root: &Path,
+    message: QueuedMessage,
+    scheduled_at: u64,
+) -> Result<QueuedMessage> {
+    let now = now_seconds();
+    if scheduled_at < now.saturating_add(MIN_SCHEDULE_LEAD_SECONDS) {
+        return Err(anyhow!(
+            "scheduled send must be at least one minute in the future"
+        ));
+    }
+    if scheduled_at > now.saturating_add(MAX_SCHEDULE_AHEAD_SECONDS) {
+        return Err(anyhow!(
+            "scheduled send cannot be more than one year in the future"
+        ));
+    }
+    enqueue_for(cache_root, message, scheduled_at, Some(scheduled_at))
+}
+
+fn enqueue_for(
+    cache_root: &Path,
+    mut message: QueuedMessage,
+    next_attempt_at: u64,
+    scheduled_at: Option<u64>,
 ) -> Result<QueuedMessage> {
     let _outbox_guard = outbox_guard();
     if message.id.is_empty() {
@@ -255,7 +291,8 @@ pub fn enqueue_with_delay(
     };
     message.updated_at = timestamp;
     message.attempts = 0;
-    message.next_attempt_at = timestamp.saturating_add(delay_seconds.min(MAX_UNDO_SEND_SECONDS));
+    message.next_attempt_at = next_attempt_at;
+    message.scheduled_at = scheduled_at;
     message.paused = false;
     message.last_error = None;
     validate(&message)?;
@@ -309,6 +346,7 @@ pub fn snapshot(cache_root: &Path, account_id: &str) -> Result<OutboxSnapshot> {
             created_at: message.created_at,
             updated_at: message.updated_at,
             next_attempt_at: message.next_attempt_at,
+            scheduled_at: message.scheduled_at,
             attempts: message.attempts,
             state: if message.paused {
                 OutboxItemState::Paused
@@ -341,11 +379,22 @@ fn status_for(messages: &[QueuedMessage], now: u64) -> OutboxStatus {
         .iter()
         .filter(|item| !item.paused && item.attempts == 0 && item.next_attempt_at > now)
         .count();
+    let user_scheduled = messages
+        .iter()
+        .filter(|item| {
+            !item.paused
+                && item.attempts == 0
+                && item.next_attempt_at > now
+                && item.scheduled_at.is_some()
+        })
+        .count();
     OutboxStatus {
         total: messages.len(),
         pending: messages.len().saturating_sub(paused),
         paused,
         scheduled,
+        user_scheduled,
+        undoable: scheduled.saturating_sub(user_scheduled),
     }
 }
 
@@ -548,6 +597,7 @@ pub fn retry_all(cache_root: &Path, account_id: &str) -> Result<usize> {
         }
         message.attempts = 0;
         message.next_attempt_at = now;
+        message.scheduled_at = None;
         message.paused = false;
         message.last_error = None;
         message.updated_at = now;
@@ -582,6 +632,7 @@ pub fn retry_queued(
     let now = now_seconds();
     message.attempts = 0;
     message.next_attempt_at = now;
+    message.scheduled_at = None;
     message.paused = false;
     message.last_error = None;
     message.updated_at = now;
@@ -642,7 +693,7 @@ pub fn resume_account(cache_root: &Path, account_id: &str) -> Result<usize> {
             continue;
         }
         message.attempts = 0;
-        message.next_attempt_at = now;
+        message.next_attempt_at = message.scheduled_at.filter(|at| *at > now).unwrap_or(now);
         message.paused = false;
         message.last_error = None;
         message.updated_at = now;
@@ -925,8 +976,9 @@ fn decode(bytes: &[u8]) -> Result<OutboxStore> {
     if decoded.len() > MAX_STORE_BYTES {
         return Err(anyhow!("outbox store is too large"));
     }
-    let store: OutboxStore = serde_json::from_slice(&decoded).context("parse outbox")?;
+    let mut store: OutboxStore = serde_json::from_slice(&decoded).context("parse outbox")?;
     validate_store(&store)?;
+    store.schema_version = STORE_SCHEMA_VERSION;
     Ok(store)
 }
 
@@ -1001,6 +1053,18 @@ fn validate(message: &QueuedMessage) -> Result<()> {
     if let Some(error) = &message.last_error {
         if error.len() > MAX_FAILURE_BYTES || error.chars().any(|character| character == '\0') {
             return Err(anyhow!("outbox failure detail is unsafe"));
+        }
+    }
+    if let Some(scheduled_at) = message.scheduled_at {
+        if scheduled_at < message.created_at
+            || scheduled_at
+                > message
+                    .created_at
+                    .saturating_add(MAX_SCHEDULE_AHEAD_SECONDS)
+        {
+            return Err(anyhow!(
+                "outbox scheduled send time is outside the safe range"
+            ));
         }
     }
     Ok(())
@@ -1103,6 +1167,7 @@ mod tests {
             updated_at: 1,
             attempts: 0,
             next_attempt_at: 1,
+            scheduled_at: None,
             paused: false,
             last_error: None,
         }
@@ -1304,7 +1369,21 @@ mod tests {
         assert!(message.draft_id.is_none());
         assert!(message.in_reply_to.is_none());
         assert!(message.references.is_empty());
+        assert!(message.scheduled_at.is_none());
         validate(&message).expect("legacy outbox message remains valid");
+    }
+
+    #[test]
+    fn legacy_outbox_store_upgrades_without_inventing_a_schedule() {
+        let payload = serde_json::to_vec(&OutboxStore {
+            schema_version: 1,
+            messages: vec![fixture()],
+        })
+        .expect("serialize legacy outbox");
+        let encrypted = crate::sync::protect_cache(&payload).expect("encrypt legacy outbox");
+        let upgraded = decode(&encrypted).expect("decode legacy outbox");
+        assert_eq!(upgraded.schema_version, STORE_SCHEMA_VERSION);
+        assert!(upgraded.messages[0].scheduled_at.is_none());
     }
 
     #[test]
@@ -1363,7 +1442,13 @@ mod tests {
         let scheduled = enqueue_with_delay(&root, fixture(), MAX_UNDO_SEND_SECONDS)
             .expect("enqueue scheduled message");
         assert!(scheduler_generation() != generation);
-        assert_eq!(status(&root, "account-1").unwrap().scheduled, 1);
+        let delayed_status = status(&root, "account-1").unwrap();
+        assert_eq!(delayed_status.scheduled, 1);
+        assert_eq!(delayed_status.user_scheduled, 0);
+        assert_eq!(delayed_status.undoable, 1);
+        assert!(snapshot(&root, "account-1").unwrap().items[0]
+            .scheduled_at
+            .is_none());
         let delay = next_due_delay(&root).unwrap().expect("scheduled delay");
         assert!(delay > Duration::ZERO);
         assert!(delay <= Duration::from_secs(MAX_UNDO_SEND_SECONDS));
@@ -1384,6 +1469,76 @@ mod tests {
         );
         assert_eq!(status(&root, "account-1").unwrap().total, 1);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_schedule_stays_distinct_and_can_be_sent_immediately() {
+        let root = std::env::temp_dir().join(format!(
+            "mailgo-outbox-explicit-schedule-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let scheduled_at = now_seconds().saturating_add(MIN_SCHEDULE_LEAD_SECONDS + 5);
+        let mut message = fixture();
+        message.created_at = 0;
+        message.updated_at = 0;
+        let saved = enqueue_at(&root, message, scheduled_at).expect("enqueue explicit schedule");
+        assert_eq!(saved.scheduled_at, Some(scheduled_at));
+        assert_eq!(saved.next_attempt_at, scheduled_at);
+        assert!(due_account_ids(&root).unwrap().is_empty());
+
+        let scheduled_status = status(&root, "account-1").unwrap();
+        assert_eq!(scheduled_status.scheduled, 1);
+        assert_eq!(scheduled_status.user_scheduled, 1);
+        assert_eq!(scheduled_status.undoable, 0);
+        let scheduled_snapshot = snapshot(&root, "account-1").unwrap();
+        assert_eq!(scheduled_snapshot.items[0].scheduled_at, Some(scheduled_at));
+        assert_eq!(
+            scheduled_snapshot.items[0].state,
+            OutboxItemState::Scheduled
+        );
+
+        assert_eq!(
+            pause_account(&root, "account-1", "authorization required").unwrap(),
+            1
+        );
+        assert_eq!(resume_account(&root, "account-1").unwrap(), 1);
+        let resumed = snapshot(&root, "account-1").unwrap();
+        assert_eq!(resumed.items[0].next_attempt_at, scheduled_at);
+        assert_eq!(resumed.items[0].scheduled_at, Some(scheduled_at));
+
+        assert_eq!(
+            retry_queued(&root, "account-1", &saved.id).unwrap(),
+            RetryOutboxStatus::Retried
+        );
+        let immediate = snapshot(&root, "account-1").unwrap();
+        assert_eq!(immediate.items[0].state, OutboxItemState::Pending);
+        assert!(immediate.items[0].scheduled_at.is_none());
+        assert_eq!(due_account_ids(&root).unwrap(), vec!["account-1"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_schedule_rejects_past_and_unbounded_times() {
+        let root = std::env::temp_dir().join(format!(
+            "mailgo-outbox-schedule-bounds-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let now = now_seconds();
+        assert!(enqueue_at(
+            &root,
+            fixture(),
+            now.saturating_add(MIN_SCHEDULE_LEAD_SECONDS - 1)
+        )
+        .is_err());
+        assert!(enqueue_at(
+            &root,
+            fixture(),
+            now.saturating_add(MAX_SCHEDULE_AHEAD_SECONDS + 60)
+        )
+        .is_err());
+        assert!(!root.exists());
     }
 
     #[test]

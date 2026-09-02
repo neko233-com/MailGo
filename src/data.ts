@@ -225,6 +225,23 @@ const sampleOutboxNow = Math.floor(Date.now() / 1_000)
 
 export const sampleOutboxItems: NativeOutboxItem[] = [
   {
+    id: 'demo-outbox-scheduled',
+    accountId: 'qq-personal',
+    draftId: 'demo-draft-scheduled',
+    to: 'release-review@example.invalid',
+    cc: '',
+    bcc: '',
+    subject: '明早发布确认',
+    preview: '发布清单已经复核，请在计划时间发送给评审组。',
+    createdAt: sampleOutboxNow - 300,
+    updatedAt: sampleOutboxNow - 60,
+    nextAttemptAt: sampleOutboxNow + 7_200,
+    scheduledAt: sampleOutboxNow + 7_200,
+    attempts: 0,
+    state: 'scheduled',
+    attachments: [],
+  },
+  {
     id: 'demo-outbox-retry',
     accountId: 'google-work',
     draftId: 'demo-draft-retry',
