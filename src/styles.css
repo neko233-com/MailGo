@@ -233,7 +233,7 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .mail-virtual-space { position: relative; width: 100%; }
 .virtual-mail-item { position: absolute; top: 0; left: 0; width: 100%; }
 .mail-group-label { height: 100%; display: flex; align-items: center; padding: 0 18px; color: var(--muted); background: var(--bg-raised); font-size: 10px; font-weight: 650; }
-.mail-row { height: 100%; min-height: 54px; box-sizing: border-box; display: flex; align-items: center; gap: 3px; margin: 0; padding: 4px 8px 4px 9px; border-bottom: 1px solid var(--line); border-radius: 0; cursor: pointer; transition: background .16s ease, box-shadow .16s ease; }
+.mail-row { height: 100%; min-height: 48px; box-sizing: border-box; display: flex; align-items: center; gap: 3px; margin: 0; padding: 4px 8px 4px 9px; border-bottom: 1px solid var(--line); border-radius: 0; cursor: pointer; transition: background .16s ease, box-shadow .16s ease; }
 .mail-row:hover { background: var(--surface-hover); }
 .mail-row.is-outbox-row { gap: 8px; }
 .outbox-row-state { width: 22px; height: 22px; flex: 0 0 22px; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; color: var(--accent); background: var(--accent-soft); }
@@ -253,9 +253,11 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .mail-row.is-unread .mail-row-top strong { font-weight: 700; }
 .thread-count { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 17px; margin-left: 6px; padding: 0 5px; border-radius: 9px; color: var(--accent); background: var(--accent-soft); font-size: 9px; font-weight: 750; vertical-align: 1px; }
 .mail-row-top time { flex: 0 0 auto; color: var(--muted); font-size: 10px; }
-.mail-row-subject { overflow: hidden; margin-top: 1px; color: var(--muted-strong); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.mail-row-summary { min-width: 0; display: flex; align-items: baseline; gap: 5px; margin-top: 1px; }
+.mail-row-subject { min-width: 0; max-width: 62%; overflow: hidden; flex: 0 1 auto; color: var(--muted-strong); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .mail-row.is-unread .mail-row-subject { color: var(--text); font-weight: 600; }
-.mail-row-copy p { overflow: hidden; margin: 1px 0 0; color: var(--muted); font-size: 9px; line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
+.mail-row-copy p { min-width: 0; overflow: hidden; flex: 1; margin: 0; color: var(--muted); font-size: 9px; line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
+.mail-row-copy p::before { content: '—'; margin-right: 5px; color: var(--muted); }
 .star-button { width: 25px; height: 25px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 25px; color: #8b949f; background: transparent; border-radius: 50%; }
 .star-button:hover { color: #ffbd43; background: rgba(255, 189, 67, .12); }
 .star-button.is-starred, .reading-star.is-starred { color: #ffbd43; }
@@ -819,8 +821,8 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .toast-info svg { color: #8ba1ff; }
 
 .app-shell.is-compact-density { font-size: 10.5px; }
-.app-shell.is-compact-density .titlebar { height: 34px; gap: 4px; padding-inline: 6px; }
-.app-shell.is-compact-density .titlebar-brand { width: 170px; flex-basis: 170px; font-size: 13px; }
+.app-shell.is-compact-density .titlebar { height: 32px; gap: 4px; padding-inline: 5px; }
+.app-shell.is-compact-density .titlebar-brand { width: 162px; flex-basis: 162px; font-size: 12.5px; }
 .app-shell.is-compact-density .brand-mark { width: 18px; height: 18px; flex-basis: 18px; }
 .app-shell.is-compact-density .titlebar-menu { width: 24px; height: 24px; flex-basis: 24px; }
 .app-shell.is-compact-density .titlebar-search .search-wrap { height: 25px; padding-inline: 8px; }
@@ -828,8 +830,8 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .app-shell.is-compact-density .titlebar-utilities .icon-button { width: 23px; height: 23px; }
 .app-shell.is-compact-density .sync-summary { height: 23px; padding-inline: 5px; font-size: 8.5px; }
 .app-shell.is-compact-density .window-controls .icon-button { width: 25px; height: 22px; }
-.app-shell.is-compact-density .workspace { height: calc(100% - 34px); grid-template-columns: 184px minmax(300px, 340px) minmax(0, 1fr); }
-.app-shell.is-compact-density .workspace.is-sidebar-collapsed { grid-template-columns: 48px minmax(300px, 340px) minmax(0, 1fr); }
+.app-shell.is-compact-density .workspace { height: calc(100% - 32px); grid-template-columns: 176px minmax(288px, 320px) minmax(0, 1fr); }
+.app-shell.is-compact-density .workspace.is-sidebar-collapsed { grid-template-columns: 44px minmax(288px, 320px) minmax(0, 1fr); }
 .app-shell.is-compact-density .sidebar { padding: 4px 6px 2px; }
 .app-shell.is-compact-density .compose-button { min-height: 27px; margin-bottom: 3px; border-radius: 7px; font-size: 10.5px; }
 .app-shell.is-compact-density .nav-row { height: 23px; font-size: 10.5px; }
@@ -851,15 +853,15 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .app-shell.is-compact-density .storage-foot-actions { width: 100%; justify-content: space-between; gap: 4px; }
 .app-shell.is-compact-density .storage-foot-actions button { white-space: nowrap; }
 .app-shell.is-compact-density .sidebar-footer { height: 23px; }
-.app-shell.is-compact-density .panel-toolbar { height: 29px; padding: 1px 7px 1px 10px; }
+.app-shell.is-compact-density .panel-toolbar { height: 27px; padding: 1px 7px 1px 9px; }
 .app-shell.is-compact-density .mailbox-heading { gap: 0; }
 .app-shell.is-compact-density .mailbox-heading strong { font-size: 12px; }
-.app-shell.is-compact-density .inbox-tabs { height: 25px; }
+.app-shell.is-compact-density .inbox-tabs { height: 23px; }
 .app-shell.is-compact-density .inbox-tabs button { font-size: 9px; }
-.app-shell.is-compact-density .list-toolbar { height: 24px; }
+.app-shell.is-compact-density .list-toolbar { height: 22px; }
 .app-shell.is-compact-density .toolbar-action { height: 21px; font-size: 8.5px; }
 .app-shell.is-compact-density .mail-group-label { padding-inline: 16px; font-size: 9px; }
-.app-shell.is-compact-density .mail-row { min-height: 36px; padding-block: 1px; }
+.app-shell.is-compact-density .mail-row { min-height: 32px; padding-block: 1px; }
 .app-shell.is-compact-density .mail-row-top strong { font-size: 10.5px; }
 .app-shell.is-compact-density .mail-row-top time { font-size: 8.5px; }
 .app-shell.is-compact-density .mail-row-subject { font-size: 9.5px; }
@@ -867,13 +869,14 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .app-shell.is-compact-density .star-button { width: 20px; height: 20px; flex-basis: 20px; }
 .app-shell.is-compact-density .outbox-row-state { width: 19px; height: 19px; flex-basis: 19px; }
 .app-shell.is-compact-density .list-loading-strip { min-height: 22px; }
-.app-shell.is-compact-density .list-footer { height: 24px; }
-.app-shell.is-compact-density .reading-toolbar { height: 29px; }
+.app-shell.is-compact-density .list-footer { height: 22px; }
+.app-shell.is-compact-density .reading-toolbar { height: 27px; padding-inline: 9px; }
+.app-shell.is-compact-density .reading-actions > span { display: none; }
 .app-shell.is-compact-density .reading-actions .icon-button { width: 22px; height: 22px; }
 .app-shell.is-compact-density .mail-content-scale { height: 22px; }
 .app-shell.is-compact-density .mail-content-scale button { width: 22px; font-size: 8.5px; }
 .app-shell.is-compact-density .mail-content-scale output { min-width: 31px; font-size: 8px; }
-.app-shell.is-compact-density .reading-scroll { padding: 7px clamp(9px, 1vw, 14px) 10px; }
+.app-shell.is-compact-density .reading-scroll { padding: 6px clamp(8px, .9vw, 12px) 9px; }
 .app-shell.is-compact-density .outbox-summary { gap: 8px; margin-top: 8px; padding: 8px 10px; }
 .app-shell.is-compact-density .outbox-state-mark { width: 28px; height: 28px; }
 .app-shell.is-compact-density .outbox-recipient-card,
@@ -902,7 +905,7 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .app-shell.is-compact-density .reply-composer { margin-top: 8px; }
 .app-shell.is-compact-density .reply-input { min-height: 52px; padding-block: 6px 5px; }
 .app-shell.is-compact-density .reply-tools { margin-top: 8px; }
-.app-shell.is-compact-density .auth-panel { top: 34px; }
+.app-shell.is-compact-density .auth-panel { top: 32px; }
 .app-shell.is-compact-density .auth-panel-header { height: 42px; }
 .app-shell.is-compact-density .auth-panel-header strong { font-size: 14px; }
 .app-shell.is-compact-density .auth-tabs { height: 34px; }

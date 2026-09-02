@@ -58,8 +58,8 @@ const DEFAULT_MAIL_CONTENT_SCALE: MailContentScale = 80
 const MOBILE_LAYOUT_QUERY = '(max-width: 720px)'
 const COMPACT_DENSITY_QUERY = '(max-height: 820px), (max-width: 1366px)'
 const AUTO_COLLAPSE_SIDEBAR_QUERY = '(max-width: 1366px) and (min-width: 721px)'
-const COMPACT_MAIL_GROUP_HEIGHT = 16
-const COMPACT_MAIL_ROW_HEIGHT = 36
+const COMPACT_MAIL_GROUP_HEIGHT = 14
+const COMPACT_MAIL_ROW_HEIGHT = 32
 const COMFORTABLE_MAIL_GROUP_HEIGHT = 22
 const COMFORTABLE_MAIL_ROW_HEIGHT = 48
 const MOBILE_MAIL_GROUP_HEIGHT = 18
@@ -3233,7 +3233,7 @@ function App() {
                     ? <div className="mail-group-label">{item.label}</div>
                     : <div className={`mail-row ${latest?.outboxId ? 'is-outbox-row' : ''} ${latest?.snoozedUntil ? 'is-snoozed-row' : ''} ${item.thread.messages.some((mail) => mail.id === selectedMailId) ? 'is-selected' : ''} ${item.thread.unreadCount > 0 ? 'is-unread' : ''}`} onClick={() => { void selectMail(item.thread.latest) }}>
                         {latest?.outboxId ? <span className={`outbox-row-state is-${latest.outboxState}`} title={latest.outboxState === 'paused' ? '需要处理' : latest.outboxState === 'scheduled' ? latest.outboxScheduledAt ? '定时发送' : '等待撤销窗口' : latest.outboxState === 'retrying' ? '自动重试中' : '等待发送'}><Icon name={latest.outboxState === 'paused' ? 'info' : latest.outboxState === 'scheduled' ? 'clock' : 'rotate'} size={15} /></span> : <><label className="checkbox-wrap row-checkbox" onClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`选择会话 ${latest?.subject}`} checked={item.thread.messages.every((mail) => selectedMailIdSet.has(mail.id))} onChange={() => toggleThreadSelection(item.thread)} /><span /></label><button type="button" className={`star-button ${latest?.starred ? 'is-starred' : ''}`} aria-label={latest?.starred ? '取消最新邮件星标' : '为最新邮件添加星标'} onClick={(event) => { event.stopPropagation(); if (latest) toggleStar(latest) }}><Icon name="star" size={18} weight={latest?.starred ? 'Filled' : 'Outline'} /></button></>}
-                        <div className="mail-row-copy"><div className="mail-row-top"><strong>{item.thread.participants.join('、') || latest?.senderName}{item.thread.messages.length > 1 && <span className="thread-count">{item.thread.messages.length}</span>}</strong><time>{latest?.timestamp}</time></div><div className="mail-row-subject">{latest?.subject}</div><p>{latest?.preview}</p></div>
+                        <div className="mail-row-copy"><div className="mail-row-top"><strong>{item.thread.participants.join('、') || latest?.senderName}{item.thread.messages.length > 1 && <span className="thread-count">{item.thread.messages.length}</span>}</strong><time>{latest?.timestamp}</time></div><div className="mail-row-summary"><div className="mail-row-subject">{latest?.subject}</div><p>{latest?.preview}</p></div></div>
                       </div>}
                 </div>
               })}
