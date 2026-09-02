@@ -42,6 +42,7 @@ type ToastOptions = { action?: ToastAction; durationMs?: number; onExpire?: () =
 type ActionMenu = 'bulk' | 'message'
 type MobilePane = 'list' | 'reading'
 type MailContentScale = 70 | 80 | 90 | 100
+type MessageHydrationPriority = 'foreground' | 'read-ahead'
 type MailMoveTarget = { folder: string; label: string; icon: IconName }
 type OutboxAction = { id: string; kind: 'edit' | 'retry' | 'discard' }
 type VirtualMailItem =
@@ -1668,17 +1669,20 @@ function App() {
     || Boolean(selectedNativeFolder) && Boolean(mailboxMeta[nativeMailboxKey(selectedNativeFolder!.accountId, selectedNativeFolder!.name)]?.hasMore)
   )
 
-  const requestNativeMessage = useCallback((mail: MailMessage) => {
+  const requestNativeMessage = useCallback((mail: MailMessage, priority: MessageHydrationPriority = 'foreground') => {
     const existing = messageHydrationRef.current.get(mail.id)
     if (existing) return existing
     const request = invoke<NativeMessageResponse>('mail.get', {
       accountId: mail.accountId,
       folder: mail.nativeFolder ?? 'INBOX',
       uid: mail.nativeUid,
+      priority,
     }, 60_000)
     messageHydrationRef.current.set(mail.id, request)
     request.then(
-      () => messageHydrationRef.current.delete(mail.id),
+      () => window.setTimeout(() => {
+        if (messageHydrationRef.current.get(mail.id) === request) messageHydrationRef.current.delete(mail.id)
+      }, 1_000),
       () => messageHydrationRef.current.delete(mail.id),
     )
     return request
@@ -1801,7 +1805,7 @@ function App() {
       if (disposed) return
       if (isForeground) setLoadingMessageId(candidate.id)
       try {
-        const result = await requestNativeMessage(candidate)
+        const result = await requestNativeMessage(candidate, isForeground ? 'foreground' : 'read-ahead')
         if (disposed || !result.message) return
         const account = accountsById.get(candidate.accountId)
         if (!account) return

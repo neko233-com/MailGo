@@ -90,6 +90,7 @@ type BodySessionSlot = Arc<Mutex<Option<PooledBodySession>>>;
 type BodySessionRegistry = HashMap<String, BodySessionSlot>;
 
 static BODY_SESSIONS: OnceLock<Mutex<BodySessionRegistry>> = OnceLock::new();
+static READ_AHEAD_BODY_SESSION: OnceLock<Mutex<ReadAheadBodySession>> = OnceLock::new();
 
 #[derive(Debug, Clone, Default)]
 struct AttachmentCacheUsage {
@@ -135,6 +136,28 @@ struct PooledBodySession {
     selected_folder: Option<String>,
     last_used: Instant,
     session: imap::Session<imap::Connection>,
+}
+
+#[derive(Default)]
+struct ReadAheadBodySession {
+    account_id: Option<String>,
+    session: Option<PooledBodySession>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyFetchPriority {
+    Foreground,
+    ReadAhead,
+}
+
+impl BodyFetchPriority {
+    pub fn parse(value: Option<&str>) -> Result<Self> {
+        match value.unwrap_or("foreground") {
+            "foreground" => Ok(Self::Foreground),
+            "read-ahead" => Ok(Self::ReadAhead),
+            _ => Err(anyhow!("unsupported message fetch priority")),
+        }
+    }
 }
 
 fn cache_write_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -657,12 +680,9 @@ fn body_session_slot(account_id: &str) -> Result<BodySessionSlot> {
 }
 
 fn clear_body_session(account_id: &str) {
-    let Some(sessions) = BODY_SESSIONS.get() else {
-        return;
-    };
-    let slot = sessions
-        .lock()
-        .ok()
+    let slot = BODY_SESSIONS
+        .get()
+        .and_then(|sessions| sessions.lock().ok())
         .and_then(|mut sessions| sessions.remove(account_id));
     if let Some(slot) = slot {
         if let Ok(mut session) = slot.lock() {
@@ -671,10 +691,24 @@ fn clear_body_session(account_id: &str) {
             }
         }
     }
+    if let Some(read_ahead) = READ_AHEAD_BODY_SESSION.get() {
+        if let Ok(mut read_ahead) = read_ahead.lock() {
+            if read_ahead
+                .account_id
+                .as_deref()
+                .is_some_and(|current| current.eq_ignore_ascii_case(account_id))
+            {
+                read_ahead.account_id = None;
+                if let Some(mut session) = read_ahead.session.take() {
+                    session.session.logout().ok();
+                }
+            }
+        }
+    }
 }
 
-fn fetch_raw_message_with_pooled_session(
-    account_id: &str,
+fn fetch_raw_message_in_session(
+    pooled: &mut Option<PooledBodySession>,
     profile: &ProviderProfile,
     email: &str,
     credential: &str,
@@ -682,10 +716,6 @@ fn fetch_raw_message_with_pooled_session(
     uid: u32,
 ) -> Result<(Vec<u8>, bool, bool)> {
     let fingerprint = body_session_fingerprint(profile, email, credential);
-    let slot = body_session_slot(account_id)?;
-    let mut pooled = slot
-        .lock()
-        .map_err(|_| anyhow!("IMAP body session lock poisoned"))?;
     let must_reconnect = pooled.as_ref().is_none_or(|session| {
         session.credential_fingerprint != fingerprint
             || session.last_used.elapsed() > BODY_SESSION_IDLE_TTL
@@ -758,6 +788,50 @@ fn fetch_raw_message_with_pooled_session(
         }
     }
     result
+}
+
+fn fetch_raw_message_with_pooled_session(
+    account_id: &str,
+    profile: &ProviderProfile,
+    email: &str,
+    credential: &str,
+    folder: &str,
+    uid: u32,
+    priority: BodyFetchPriority,
+) -> Result<(Vec<u8>, bool, bool)> {
+    match priority {
+        BodyFetchPriority::Foreground => {
+            let slot = body_session_slot(account_id)?;
+            let mut pooled = slot
+                .lock()
+                .map_err(|_| anyhow!("IMAP foreground body session lock poisoned"))?;
+            fetch_raw_message_in_session(&mut pooled, profile, email, credential, folder, uid)
+        }
+        BodyFetchPriority::ReadAhead => {
+            let mut read_ahead = READ_AHEAD_BODY_SESSION
+                .get_or_init(|| Mutex::new(ReadAheadBodySession::default()))
+                .lock()
+                .map_err(|_| anyhow!("IMAP read-ahead body session lock poisoned"))?;
+            let same_account = read_ahead
+                .account_id
+                .as_deref()
+                .is_some_and(|current| current.eq_ignore_ascii_case(account_id));
+            if !same_account {
+                if let Some(mut stale) = read_ahead.session.take() {
+                    stale.session.logout().ok();
+                }
+                read_ahead.account_id = Some(account_id.to_string());
+            }
+            fetch_raw_message_in_session(
+                &mut read_ahead.session,
+                profile,
+                email,
+                credential,
+                folder,
+                uid,
+            )
+        }
+    }
 }
 
 fn detect_incremental_mode(
@@ -2898,6 +2972,7 @@ pub fn fetch_message(
     credential: &str,
     folder: &str,
     uid: u32,
+    priority: BodyFetchPriority,
     cache_root: &Path,
 ) -> Result<MailDetail> {
     retry_imap_operation(account_id, "full message fetch", profile.provider, || {
@@ -2908,6 +2983,7 @@ pub fn fetch_message(
             credential,
             folder,
             uid,
+            priority,
             cache_root,
         )
     })
@@ -2920,11 +2996,12 @@ fn fetch_message_once(
     credential: &str,
     folder: &str,
     uid: u32,
+    priority: BodyFetchPriority,
     cache_root: &Path,
 ) -> Result<MailDetail> {
     validate_mailbox_name(folder)?;
     let (raw, unread, starred) = fetch_raw_message_with_pooled_session(
-        account_id, &profile, email, credential, folder, uid,
+        account_id, &profile, email, credential, folder, uid, priority,
     )?;
     let (mut message, payloads) =
         parse_full_with_attachments(account_id, folder, uid, unread, starred, &raw)?;
@@ -5449,6 +5526,31 @@ mod tests {
         let rotated = body_session_fingerprint(&profile, "person@example.invalid", "secret-two");
         assert_eq!(first, same);
         assert_ne!(first, rotated);
+    }
+
+    #[test]
+    fn foreground_and_read_ahead_body_fetches_have_independent_lanes() {
+        assert_eq!(
+            BodyFetchPriority::parse(None).unwrap(),
+            BodyFetchPriority::Foreground
+        );
+        assert_eq!(
+            BodyFetchPriority::parse(Some("read-ahead")).unwrap(),
+            BodyFetchPriority::ReadAhead
+        );
+        assert!(BodyFetchPriority::parse(Some("background-unbounded")).is_err());
+
+        let account_id = "fixture-priority-lanes";
+        let foreground = body_session_slot(account_id).unwrap();
+        let foreground_guard = foreground.lock().unwrap();
+        let read_ahead_guard = READ_AHEAD_BODY_SESSION
+            .get_or_init(|| Mutex::new(ReadAheadBodySession::default()))
+            .try_lock()
+            .expect("read-ahead must not wait for the foreground account session");
+        assert!(read_ahead_guard.session.is_none());
+        drop(read_ahead_guard);
+        drop(foreground_guard);
+        clear_body_session(account_id);
     }
 
     #[test]

@@ -2762,6 +2762,11 @@ fn handle_ipc(
                 let uid = u32_field(&message.payload, "uid")?;
                 let folder = optional_string_field(&message.payload, "folder")
                     .unwrap_or_else(|| "INBOX".to_string());
+                let priority = match message.payload.get("priority") {
+                    None => sync::BodyFetchPriority::parse(None),
+                    Some(Value::String(value)) => sync::BodyFetchPriority::parse(Some(value)),
+                    Some(_) => Err(anyhow!("invalid message fetch priority")),
+                }?;
                 let account = account_for(shared, &account_id)?;
                 let cached_message =
                     sync::load_cached_message(&cache_dir(), &account_id, &folder, uid)?;
@@ -2785,6 +2790,7 @@ fn handle_ipc(
                     &credential,
                     &folder,
                     uid,
+                    priority,
                     &cache_dir(),
                 )?;
                 if let Err(error) =
