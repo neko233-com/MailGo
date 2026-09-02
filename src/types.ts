@@ -2,7 +2,7 @@ export type Provider = 'google' | 'qq' | 'outlook' | 'other'
 
 export type ThemeMode = 'dark' | 'light'
 
-export type FolderId = 'inbox' | 'starred' | 'outbox' | 'sent' | 'drafts' | 'archive' | 'spam' | 'trash'
+export type FolderId = 'inbox' | 'starred' | 'snoozed' | 'outbox' | 'sent' | 'drafts' | 'archive' | 'spam' | 'trash'
 
 export type SmartCategory = 'apple-connect' | 'apple-ads' | 'social' | 'ads' | 'finance'
 
@@ -46,6 +46,7 @@ export interface MailMessage {
   outboxId?: string
   outboxState?: NativeOutboxItemState
   outboxScheduledAt?: number
+  snoozedUntil?: number
 }
 
 export interface MailAccount {
@@ -397,4 +398,16 @@ export interface NativeMailboxResponse {
 export interface NativeMessageResponse {
   offline: boolean
   message: NativeCachedMessage
+}
+
+export interface NativeSnoozedItem {
+  message: NativeCachedMessage
+  createdAt: number
+  wakeAt: number
+}
+
+export interface NativeSnoozeSnapshot {
+  items: NativeSnoozedItem[]
+  nextWakeAt?: number
+  removed?: boolean
 }

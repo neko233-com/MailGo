@@ -213,6 +213,7 @@ export const sampleMails: MailMessage[] = [
 export const folderLabels = [
   { id: 'inbox' as const, label: '收件箱', icon: 'inbox', unread: 12 },
   { id: 'starred' as const, label: '星标', icon: 'star', unread: 0 },
+  { id: 'snoozed' as const, label: '稍后处理', icon: 'clock', unread: 0 },
   { id: 'outbox' as const, label: '发件箱', icon: 'clock', unread: 0 },
   { id: 'sent' as const, label: '已发送', icon: 'send', unread: 0 },
   { id: 'drafts' as const, label: '草稿箱', icon: 'document', unread: 3 },

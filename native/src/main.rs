@@ -33,6 +33,7 @@ mod oauth;
 mod outbox;
 mod providers;
 mod send;
+mod snooze;
 mod storage;
 mod sync;
 mod tray;
@@ -1970,6 +1971,7 @@ fn handle_ipc(
                     for account in &imported_accounts {
                         outbox::remove_account(&cache_dir(), &account.id)?;
                         drafts::remove_account(&cache_dir(), &account.id)?;
+                        snooze::remove_account(&cache_dir(), &account.id)?;
                         sync::remove_account_cache(&cache_dir(), &account.id)?;
                         delete_credential_if_present(&account.id).with_context(|| {
                             format!("remove credential for account {}", account.id)
@@ -2020,6 +2022,7 @@ fn handle_ipc(
                 let cleanup_result = (|| -> Result<()> {
                     outbox::remove_account(&cache_dir(), &id)?;
                     drafts::remove_account(&cache_dir(), &id)?;
+                    snooze::remove_account(&cache_dir(), &id)?;
                     sync::remove_account_cache(&cache_dir(), &id)?;
                     delete_credential_if_present(&id)?;
                     Ok(())
@@ -2766,6 +2769,38 @@ fn handle_ipc(
                 }
                 Ok(json!({ "offline": false, "message": detail.message }))
             }
+            "mail.snooze.snapshot" => Ok(serde_json::to_value(snooze::snapshot(&cache_dir())?)?),
+            "mail.snooze" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
+                let uid = u32_field(&message.payload, "uid")?;
+                let folder = optional_string_field(&message.payload, "folder")
+                    .unwrap_or_else(|| "INBOX".to_string());
+                let wake_at = optional_u64_field(&message.payload, "wakeAt")?
+                    .ok_or_else(|| anyhow!("wakeAt is required"))?
+                    / 1_000;
+                let cached = sync::load_cached_message(&cache_dir(), &account_id, &folder, uid)?
+                    .ok_or_else(|| anyhow!("message is not available in the local cache"))?;
+                Ok(serde_json::to_value(snooze::schedule(
+                    &cache_dir(),
+                    cached,
+                    wake_at,
+                )?)?)
+            }
+            "mail.unsnooze" => {
+                let account_id = string_field(&message.payload, "accountId")?;
+                account_for(shared, &account_id)?;
+                let uid = u32_field(&message.payload, "uid")?;
+                let folder = optional_string_field(&message.payload, "folder")
+                    .unwrap_or_else(|| "INBOX".to_string());
+                let (removed, snapshot) =
+                    snooze::unsnooze(&cache_dir(), &account_id, &folder, uid)?;
+                Ok(json!({
+                    "removed": removed,
+                    "items": snapshot.items,
+                    "nextWakeAt": snapshot.next_wake_at,
+                }))
+            }
             "mail.attachment.upload.start" => {
                 let file_name =
                     valid_upload_file_name(&string_field(&message.payload, "fileName")?)?;
@@ -3125,6 +3160,9 @@ fn handle_ipc(
                 };
                 if let Err(error) = cache_result {
                     tracing::warn!(account_id = %account_id, uid, "update local mail operation failed: {error}");
+                }
+                if let Err(error) = snooze::unsnooze(&cache_dir(), &account_id, &folder, uid) {
+                    tracing::warn!(account_id = %account_id, uid, "remove moved message from snooze store failed: {error}");
                 }
                 Ok(json!({
                     "accountId": account_id,

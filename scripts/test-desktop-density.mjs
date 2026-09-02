@@ -43,7 +43,7 @@ assert(app.includes('aria-label="邮件正文显示比例"'), 'mail readers must
 assert(app.includes("readLocalStorageValue('mailgo-mail-content-scale-v2')"), 'mail content scaling must survive restarts while superseding the oversized scale range')
 assert(app.includes("readLocalStorageValue('mailgo-display-density-v3')"), 'the denser desktop default must supersede stale comfortable-mode preferences')
 assert(app.includes('aria-label={`${folder.label}${folder.unread > 0'), 'collapsed folder buttons must retain meaningful accessible names')
-assert(app.includes('aria-label={`${account.label}，${account.unread} 封未读`}'), 'collapsed account buttons must retain meaningful accessible names')
+assert(app.includes('aria-label={`${account.label}，${displayedUnread} 封未读`}'), 'collapsed account buttons must retain meaningful accessible names')
 assert(nativeMain.includes('width: 1180,') && nativeMain.includes('height: 720,'), 'native window must open at a compact desktop size')
 assert(nativeMain.includes('min_size: Some((920, 600))'), 'native window must retain a usable resizable desktop minimum')
 assert(rdesktopConfig.includes('width = 1180') && rdesktopConfig.includes('height = 720'), 'rdesktop configuration must match the native window size')

@@ -1105,6 +1105,7 @@ fn spawn_idle_supervisor(shared: Arc<Mutex<crate::MailGoState>>, cache_root: Pat
 /// dedicated thread so IMAP handshakes never block rdesktop's WebView event loop.
 pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathBuf) {
     spawn_outbox_scheduler(Arc::clone(&shared), cache_root.clone());
+    spawn_snooze_scheduler(Arc::clone(&shared), cache_root.clone());
     spawn_idle_supervisor(Arc::clone(&shared), cache_root.clone());
     thread::Builder::new()
         .name("mailgo-sync-scheduler".into())
@@ -1134,6 +1135,58 @@ pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathB
             }
         })
         .expect("start MailGo sync scheduler");
+}
+
+fn spawn_snooze_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathBuf) {
+    let result = thread::Builder::new()
+        .name("mailgo-snooze-scheduler".into())
+        .spawn(move || loop {
+            let observed = crate::snooze::scheduler_generation();
+            let next_delay = match crate::snooze::next_due_delay(&cache_root) {
+                Ok(delay) => delay,
+                Err(error) => {
+                    tracing::warn!("could not inspect encrypted snooze schedule: {error}");
+                    crate::snooze::wait_for_scheduler_change(observed, OUTBOX_SCHEDULER_BUSY_RETRY);
+                    continue;
+                }
+            };
+            match next_delay {
+                None => {
+                    crate::snooze::wait_for_scheduler_change(observed, OUTBOX_SCHEDULER_IDLE);
+                    continue;
+                }
+                Some(delay) if !delay.is_zero() => {
+                    crate::snooze::wait_for_scheduler_change(
+                        observed,
+                        delay.min(OUTBOX_SCHEDULER_IDLE),
+                    );
+                    continue;
+                }
+                Some(_) => {}
+            }
+
+            match crate::snooze::release_due(&cache_root) {
+                Ok(due) if !due.is_empty() => {
+                    let notifications_enabled = shared
+                        .lock()
+                        .map(|app| app.state.notifications_enabled)
+                        .unwrap_or(false);
+                    if notifications_enabled {
+                        crate::tray::notify_new_mail(
+                            "MailGo",
+                            &format!("{} 封稍后处理邮件已到期", due.len()),
+                        );
+                    }
+                    tracing::info!(released = due.len(), "snoozed messages returned to inbox");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!("could not release due snoozed messages: {error}"),
+            }
+            crate::snooze::wait_for_scheduler_change(observed, OUTBOX_SCHEDULER_BUSY_RETRY);
+        });
+    if let Err(error) = result {
+        tracing::warn!("could not start snooze scheduler: {error}");
+    }
 }
 
 fn run_scheduled_outbox_account(
