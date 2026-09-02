@@ -3,12 +3,14 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import appIconUrl from '../resources/icons/mailgo-64.png'
 import { AccountSignatureSettings } from './components/AccountSignatureSettings'
+import { ExternalLinkDialog } from './components/ExternalLinkDialog'
 import { Icon, type IconName } from './components/Icon'
 import { buildComposeThreadHeaders, type ComposeMode } from './compose-thread'
 import { sanitizeCustomCss } from './customCss'
 import { folderLabels, providerDefinitions, sampleAccounts, sampleMails } from './data'
 import { mapWithConcurrency } from './lib/asyncPool'
 import { invoke, readNativeState } from './lib/ipc'
+import { inspectExternalLink, type ExternalLinkInspection } from './linkSafety'
 import { appendAccountSignature, normalizeAccountSignature } from './signature'
 import { buildMailThreads, type MailThread } from './threading'
 import type { FolderId, MailAccount, MailAttachment, MailMessage, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAttachmentUploadChunkResponse, NativeAttachmentUploadStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeConnectionDiagnostic, NativeConnectionDiagnosticChannel, NativeDeviceStartResponse, NativeDraft, NativeDraftAttachment, NativeLocalSearchResponse, NativeMailboxResponse, NativeMessageResponse, NativeOutboxStatus, NativeQueueStatus, NativeSearchResponse, NativeSyncItem, NativeSyncResponse, Provider, SmartCategory, ThemeMode } from './types'
@@ -631,6 +633,7 @@ function App() {
   const [isSettingsOpen, setSettingsOpen] = useState(false)
   const [openMenu, setOpenMenu] = useState<ActionMenu | null>(null)
   const [isHelpOpen, setHelpOpen] = useState(false)
+  const [pendingExternalLink, setPendingExternalLink] = useState<ExternalLinkInspection | null>(null)
   const [isSyncing, setSyncing] = useState(false)
   const [isLoadingEarlier, setLoadingEarlier] = useState(false)
   const [isMailboxHydrating, setMailboxHydrating] = useState(isNativeRuntime)
@@ -716,13 +719,12 @@ function App() {
     const anchor = event.target instanceof Element ? event.target.closest('a') : null
     const href = anchor?.getAttribute('href')?.trim()
     if (!anchor || !href || href.startsWith('#')) return
-    if (!/^(https:\/\/|mailto:)/i.test(href)) {
-      event.preventDefault()
-      pushToast('已阻止不安全的邮件链接', 'error')
-      return
-    }
     event.preventDefault()
-    void openExternalUrl(href).catch((error) => pushToast(error instanceof Error ? error.message : '无法打开邮件链接', 'error'))
+    try {
+      setPendingExternalLink(inspectExternalLink(href, anchor.textContent ?? undefined))
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : '已阻止不安全的邮件链接', 'error')
+    }
   }
 
   useEffect(() => () => {
@@ -1238,6 +1240,13 @@ function App() {
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
+      if (document.querySelector('.external-link-modal')) {
+        if (event.key === 'Escape') {
+          event.preventDefault()
+          setPendingExternalLink(null)
+        }
+        return
+      }
       const eventTarget = event.target instanceof HTMLElement ? event.target : null
       const isEditableTarget = Boolean(eventTarget?.matches('input, textarea, select, [contenteditable="true"]'))
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
@@ -2756,6 +2765,7 @@ function App() {
       </AnimatePresence>
 
       <AnimatePresence>{isHelpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}</AnimatePresence>
+      <AnimatePresence>{pendingExternalLink && <ExternalLinkDialog inspection={pendingExternalLink} onClose={() => setPendingExternalLink(null)} onOpen={openExternalUrl} onError={(message) => pushToast(message, 'error')} />}</AnimatePresence>
       <AnimatePresence>{isComposeOpen && <ComposeModal
         mode={composeMode}
         source={composeSource}

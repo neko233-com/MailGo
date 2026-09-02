@@ -8,6 +8,8 @@ const assert = (condition, message) => {
 }
 
 const app = read('src/App.tsx')
+const externalLinkDialog = read('src/components/ExternalLinkDialog.tsx')
+const linkSafety = read('src/linkSafety.ts')
 const styles = read('src/styles.css')
 const nativeMain = read('native/src/main.rs')
 const nativeMail = read('native/src/mail.rs')
@@ -35,6 +37,15 @@ assert(nativeMain.includes('"accounts.set_signature" =>'), 'account signature wr
 assert(app.includes('appendAccountSignature(body, accountSignature)'), 'renderer must append the selected account signature only at send time')
 assert(app.includes('textBody: outgoingBody'), 'plain-text sends must use the signature-appended body')
 assert(app.includes('composeHtmlBody(outgoingBody, currentInlineImages)'), 'HTML sends must escape and render the same signature-appended body')
+assert(app.includes('setPendingExternalLink(inspectExternalLink(href, anchor.textContent ?? undefined))'), 'mail HTML links must stop at the inspection boundary')
+assert(!app.includes('void openExternalUrl(href)'), 'mail HTML links must not launch an external handler immediately')
+assert(externalLinkDialog.includes('await onOpen(inspection.url)'), 'external navigation must require explicit dialog confirmation')
+assert(externalLinkDialog.includes('cancelRef.current?.focus()'), 'external-link confirmation must default keyboard focus to cancel')
+assert(externalLinkDialog.includes("event.key !== 'Tab'"), 'external-link confirmation must keep keyboard focus inside the dialog')
+assert(linkSafety.includes("parsed.protocol === 'https:'"), 'link inspection must explicitly allow HTTPS')
+assert(linkSafety.includes("parsed.protocol === 'mailto:'"), 'link inspection must explicitly allow mailto')
+assert(linkSafety.includes('邮件显示文字指向'), 'link inspection must warn when visible and actual hosts differ')
+assert(linkSafety.includes('MAX_EXTERNAL_URL_BYTES = 4 * 1024'), 'renderer and native URL byte budgets must remain aligned')
 
 assert(oauth.includes('CALLBACK_REQUEST_DEADLINE'), 'OAuth callbacks need an absolute request deadline')
 assert(oauth.includes('checked_duration_since(Instant::now())'), 'OAuth read timeout must shrink with the remaining deadline')

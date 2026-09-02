@@ -24,7 +24,7 @@ The current foundation includes:
 - Optional offline-only mode is enforced by the native boundary: cached mail remains readable, network sync/search are paused, outgoing mail is queued encrypted, and local flag/move mutations replay when online mode is restored.
 - Provider quick links and guided authorization-code onboarding.
 - Stored accounts have an account-scoped connection diagnostic that authenticates to IMAP and SMTP in parallel, issues NOOP only, reports bounded privacy-safe status/latency, and never sends a message.
-- Safe HTML preview mode, attachments, smart categories (including Apple Connect and Apple advertising), search, unread filter, star, reply, compose, theme switching, and user CSS overrides.
+- Safe HTML preview mode with an explicit anti-phishing external-link confirmation, attachments, smart categories (including Apple Connect and Apple advertising), search, unread filter, star, reply, compose, theme switching, and user CSS overrides. Link confirmation prominently shows the actual hostname or mail recipient, warns about display-target mismatches, Punycode, IP destinations, non-standard ports, and multiple recipients, and never prefetches the destination.
 - Local-only advertising classification can optionally hide ads from normal lists while keeping likely Apple Connect notifications and smart-category access visible; the category is heuristic and never presented as sender authentication.
 - Rust `neko233-com/rdesktop` WebView2 shell with custom frameless title bar and preserved WebView data directory under `%LOCALAPPDATA%\\MailGo\\WebView2`.
 - The renderer uses Windows system fonts rather than remote web fonts, so the packaged UI has no implicit font-network dependency in offline mode.
