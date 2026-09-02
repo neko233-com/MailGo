@@ -1,6 +1,8 @@
 const CSS_COMMENT_PATTERN = /\/\*[\s\S]*?\*\//g
 const CSS_IMPORT_PATTERN = /@import\b[^;{}]*(?:;|$)/gi
 const CSS_URL_PATTERN = /\burl\s*\([^)]*\)/gi
+const CSS_IMAGE_FUNCTION_PATTERN = /(^|[^a-z0-9_-])(?:-webkit-)?(?:image-set|image|cross-fade)\s*\([^;{}]*\)/gim
+const CSS_SRC_FUNCTION_PATTERN = /(^|[^a-z0-9_-])src\s*\([^;{}]*\)/gim
 const CSS_EXPRESSION_PATTERN = /\bexpression\s*\([^)]*\)/gi
 const CSS_SCRIPT_URL_PATTERN = /\b(?:javascript|vbscript)\s*:[^;{}\s]*/gi
 const CSS_BEHAVIOR_PATTERN = /(^|[;{])([\t\r\n ]*)(?:behavior|-moz-binding)\s*:[^;{}]*(?=;|})/gim
@@ -29,6 +31,8 @@ export function sanitizeCustomCss(input: string): SanitizedCustomCss {
 
   replaceUnsafe(CSS_IMPORT_PATTERN)
   replaceUnsafe(CSS_URL_PATTERN)
+  replaceUnsafe(CSS_IMAGE_FUNCTION_PATTERN, '$1')
+  replaceUnsafe(CSS_SRC_FUNCTION_PATTERN, '$1')
   replaceUnsafe(CSS_EXPRESSION_PATTERN)
   replaceUnsafe(CSS_SCRIPT_URL_PATTERN)
   replaceUnsafe(CSS_BEHAVIOR_PATTERN, '$1$2')

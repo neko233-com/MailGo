@@ -19,6 +19,12 @@ const MAX_ATTACHMENT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ATTACHMENT_NAME_CHARS: usize = 255;
 const MAX_RECIPIENTS_PER_MESSAGE: usize = 128;
 const MAX_RECIPIENT_CHARS: usize = 320;
+const MAX_MIME_BOUNDARY_LINES: usize = 2_048;
+const MAX_MIME_HEADER_FIELDS: usize = 8_192;
+const MAX_MIME_HEADER_BYTES: usize = 2 * 1024 * 1024;
+const MAX_MIME_HEADER_LINE_BYTES: usize = 256 * 1024;
+const MAX_INLINE_IMAGE_REFERENCES: usize = 64;
+const MAX_INLINE_IMAGE_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_MESSAGE_ID_BYTES: usize = 512;
 pub(crate) const MAX_THREAD_REFERENCES: usize = 32;
 pub const CACHE_SCHEMA_VERSION: u32 = 3;
@@ -129,6 +135,7 @@ pub fn parse_header(
 
 /// Parse a full RFC 5322 message. The raw message is never returned to the renderer; only a
 /// bounded, sanitized representation is retained in the offline cache.
+#[cfg(test)]
 pub fn parse_full(
     account_id: &str,
     folder: &str,
@@ -137,14 +144,28 @@ pub fn parse_full(
     starred: bool,
     raw: &[u8],
 ) -> Result<CachedMessage> {
-    if raw.len() > MAX_FULL_MESSAGE_BYTES {
-        return Err(anyhow!("message exceeds the safe MIME size limit"));
-    }
+    parse_full_with_attachments(account_id, folder, uid, unread, starred, raw)
+        .map(|(message, _)| message)
+}
+
+/// Parse and extract a complete message in one pass. This is the hot path used by lazy body
+/// hydration, so decoded MIME parts are never constructed twice for the same network response.
+pub fn parse_full_with_attachments(
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    unread: bool,
+    starred: bool,
+    raw: &[u8],
+) -> Result<(CachedMessage, Vec<AttachmentPayload>)> {
+    validate_mime_structure(raw)?;
     let parsed = MessageParser::default()
         .parse(raw)
         .ok_or_else(|| anyhow!("message could not be parsed"))?;
     ensure_attachment_count(&parsed)?;
-    build_message(account_id, folder, uid, unread, starred, &parsed, Some(raw))
+    let message = build_message(account_id, folder, uid, unread, starred, &parsed, Some(raw))?;
+    let payloads = attachment_payloads(&parsed)?;
+    Ok((message, payloads))
 }
 
 fn build_message(
@@ -166,7 +187,8 @@ fn build_message(
         .unwrap_or_default();
     let html_body = parsed
         .body_html(0)
-        .map(|html| sanitize_html(html.as_ref()))
+        .map(|html| truncate_utf8(html.as_ref(), MAX_CACHED_HTML_BYTES * 2))
+        .map(|html| sanitize_html(&html))
         .filter(|html| !html.is_empty())
         .map(|html| truncate_utf8(&html, MAX_CACHED_HTML_BYTES));
     let preview = bounded_preview(&text_body);
@@ -335,14 +357,17 @@ pub(crate) fn safe_message_id(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
+#[cfg(test)]
 pub fn extract_attachment_payloads(raw: &[u8]) -> Result<Vec<AttachmentPayload>> {
-    if raw.len() > MAX_FULL_MESSAGE_BYTES {
-        return Err(anyhow!("message exceeds the safe MIME size limit"));
-    }
+    validate_mime_structure(raw)?;
     let parsed = MessageParser::default()
         .parse(raw)
         .ok_or_else(|| anyhow!("message could not be parsed"))?;
     ensure_attachment_count(&parsed)?;
+    attachment_payloads(&parsed)
+}
+
+fn attachment_payloads(parsed: &Message<'_>) -> Result<Vec<AttachmentPayload>> {
     let mut payloads = Vec::new();
     let mut total_bytes = 0usize;
     for (index, part) in parsed.attachments().enumerate() {
@@ -365,6 +390,47 @@ pub fn extract_attachment_payloads(raw: &[u8]) -> Result<Vec<AttachmentPayload>>
     Ok(payloads)
 }
 
+fn validate_mime_structure(raw: &[u8]) -> Result<()> {
+    if raw.len() > MAX_FULL_MESSAGE_BYTES {
+        return Err(anyhow!("message exceeds the safe MIME size limit"));
+    }
+    let mut boundary_lines = 0usize;
+    let mut header_fields = 0usize;
+    let mut header_bytes = 0usize;
+    for line in raw.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.starts_with(b"--") {
+            boundary_lines = boundary_lines.saturating_add(1);
+            if boundary_lines > MAX_MIME_BOUNDARY_LINES {
+                return Err(anyhow!("message MIME structure is too complex"));
+            }
+        }
+        let looks_like_header =
+            line.iter()
+                .position(|byte| *byte == b':')
+                .is_some_and(|separator| {
+                    separator > 0
+                        && separator <= 128
+                        && line[..separator]
+                            .iter()
+                            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+                });
+        if looks_like_header {
+            if line.len() > MAX_MIME_HEADER_LINE_BYTES {
+                return Err(anyhow!("message contains an oversized MIME header"));
+            }
+            header_fields = header_fields.saturating_add(1);
+            header_bytes = header_bytes.saturating_add(line.len());
+            if header_fields > MAX_MIME_HEADER_FIELDS || header_bytes > MAX_MIME_HEADER_BYTES {
+                return Err(anyhow!(
+                    "message MIME headers exceed the safe complexity limit"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn ensure_attachment_count(parsed: &Message<'_>) -> Result<()> {
     let count = parsed
         .attachments()
@@ -378,25 +444,58 @@ fn ensure_attachment_count(parsed: &Message<'_>) -> Result<()> {
 
 pub fn embed_inline_images(html: &mut Option<String>, payloads: &[AttachmentPayload]) {
     let Some(html) = html.as_mut() else { return };
+    *html = truncate_utf8(html, MAX_CACHED_HTML_BYTES);
+    let mut embedded_references = 0usize;
     for payload in payloads {
-        if !payload
-            .content_type
-            .to_ascii_lowercase()
-            .starts_with("image/")
-            || payload.bytes.len() > 1024 * 1024
+        let content_type = payload.content_type.to_ascii_lowercase();
+        if !matches!(
+            content_type.as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ) || payload.bytes.len() > MAX_INLINE_IMAGE_BYTES
         {
             continue;
         }
         let Some(content_id) = payload.content_id.as_deref().and_then(safe_content_id) else {
             continue;
         };
+        let needles = [format!("cid:{content_id}"), format!("cid:<{content_id}>")];
+        let reference_count = needles
+            .iter()
+            .map(|needle| count_ascii_case_insensitive(html, needle))
+            .sum::<usize>();
+        if reference_count == 0
+            || embedded_references.saturating_add(reference_count) > MAX_INLINE_IMAGE_REFERENCES
+        {
+            continue;
+        }
         let encoded = STANDARD.encode(&payload.bytes);
-        let data_uri = format!("data:{};base64,{}", payload.content_type, encoded);
-        for needle in [format!("cid:{content_id}"), format!("cid:<{content_id}>")] {
+        let data_uri = format!("data:{content_type};base64,{encoded}");
+        let replaced_bytes = needles.iter().fold(html.len(), |total, needle| {
+            total.saturating_add(
+                count_ascii_case_insensitive(html, needle)
+                    .saturating_mul(data_uri.len().saturating_sub(needle.len())),
+            )
+        });
+        if replaced_bytes > MAX_CACHED_HTML_BYTES {
+            continue;
+        }
+        for needle in needles {
             *html = replace_ascii_case_insensitive(html, &needle, &data_uri);
         }
+        embedded_references = embedded_references.saturating_add(reference_count);
     }
     *html = truncate_utf8(html, MAX_CACHED_HTML_BYTES);
+}
+
+fn count_ascii_case_insensitive(value: &str, needle: &str) -> usize {
+    if needle.is_empty() || value.len() < needle.len() {
+        return 0;
+    }
+    value
+        .as_bytes()
+        .windows(needle.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(needle.as_bytes()))
+        .count()
 }
 
 fn safe_content_id(value: &str) -> Option<String> {
@@ -957,6 +1056,48 @@ mod tests {
         assert!(html
             .as_deref()
             .is_some_and(|value| value.starts_with("<img src=\"data:image/png;base64,")));
+    }
+
+    #[test]
+    fn bounds_repeated_inline_cid_expansion_before_allocating() {
+        let payload = AttachmentPayload {
+            content_type: "image/png".into(),
+            content_id: Some("logo@example.com".into()),
+            bytes: vec![7; MAX_INLINE_IMAGE_BYTES],
+        };
+        let original = "<img src=\"cid:logo@example.com\">".repeat(MAX_INLINE_IMAGE_REFERENCES + 1);
+        let mut html = Some(original.clone());
+        embed_inline_images(&mut html, &[payload]);
+        assert_eq!(html.as_deref(), Some(original.as_str()));
+        assert!(html
+            .as_ref()
+            .is_some_and(|value| value.len() <= MAX_CACHED_HTML_BYTES));
+    }
+
+    #[test]
+    fn embeds_only_allowlisted_raster_inline_images() {
+        let payload = AttachmentPayload {
+            content_type: "image/svg+xml".into(),
+            content_id: Some("vector@example.com".into()),
+            bytes: b"<svg onload='alert(1)'></svg>".to_vec(),
+        };
+        let mut html = Some("<img src=\"cid:vector@example.com\">".to_string());
+        embed_inline_images(&mut html, &[payload]);
+        assert_eq!(
+            html.as_deref(),
+            Some("<img src=\"cid:vector@example.com\">")
+        );
+    }
+
+    #[test]
+    fn rejects_excessive_mime_boundary_complexity_before_parsing() {
+        let mut raw = String::from("From: sender@example.com\r\nSubject: Complex\r\n\r\n");
+        for _ in 0..=MAX_MIME_BOUNDARY_LINES {
+            raw.push_str("--attacker-controlled-boundary\r\n");
+        }
+        let error = parse_full("account", "INBOX", 99, false, false, raw.as_bytes())
+            .expect_err("excessive MIME boundaries must be rejected");
+        assert!(error.to_string().contains("too complex"));
     }
 
     #[test]

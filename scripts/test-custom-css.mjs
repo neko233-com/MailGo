@@ -26,6 +26,17 @@ const blockedLegacySyntax = sanitizeCustomCss('.legacy { behavior: url(#default#
 assert.equal(blockedLegacySyntax.removedUnsafeSyntax, true)
 assert.doesNotMatch(blockedLegacySyntax.css, /behavior|-moz-binding|url\s*\(/i)
 
+const blockedStringImages = sanitizeCustomCss(`
+  .one { background: image-set("https://tracker.invalid/one" 1x); }
+  .two { content: -webkit-image-set("https://tracker.invalid/two" 2x); }
+  .three { background: image("https://tracker.invalid/three"); }
+  .four { background: cross-fade("https://tracker.invalid/four", #fff, 50%); }
+  @font-face { font-family: tracker; src: src("https://tracker.invalid/font"); }
+`)
+assert.equal(blockedStringImages.removedUnsafeSyntax, true)
+assert.doesNotMatch(blockedStringImages.css, /(?:image-set|image|cross-fade|src)\s*\(/i)
+assert.doesNotMatch(blockedStringImages.css, /tracker\.invalid/i)
+
 const escapedImport = sanitizeCustomCss('@im\\port url("https://tracker.invalid/theme.css"); .app-shell { animation: fade-in .2s ease; }')
 assert.equal(escapedImport.removedUnsafeSyntax, true)
 assert.doesNotMatch(escapedImport.css, /@import|url\s*\(/i)

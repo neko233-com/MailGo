@@ -23,6 +23,9 @@ type VirtualMailItem =
 const MAX_CUSTOM_CSS_LENGTH = 64 * 1024
 const INITIAL_MAILBOX_PAGE_SIZE = 48
 const EARLIER_MAILBOX_PAGE_SIZE = 50
+const MOBILE_LAYOUT_QUERY = '(max-width: 900px)'
+const COMPACT_DENSITY_QUERY = '(max-height: 820px), (max-width: 1366px)'
+const AUTO_COLLAPSE_SIDEBAR_QUERY = '(max-width: 1366px) and (min-width: 901px)'
 
 type MailboxPagingMeta = {
   oldestUid?: number
@@ -515,9 +518,10 @@ function App() {
   const [selectedMailId, setSelectedMailId] = useState(() => isNativeRuntime ? '' : 'launch-plan')
   const [selectedMailIds, setSelectedMailIds] = useState<string[]>([])
   const [mobilePane, setMobilePane] = useState<MobilePane>('list')
-  const [isMobileLayout, setMobileLayout] = useState(() => window.matchMedia('(max-width: 760px)').matches)
+  const [isMobileLayout, setMobileLayout] = useState(() => window.matchMedia(MOBILE_LAYOUT_QUERY).matches)
+  const [isCompactDensity, setCompactDensity] = useState(() => window.matchMedia(COMPACT_DENSITY_QUERY).matches)
   const [isMobileSidebarOpen, setMobileSidebarOpen] = useState(false)
-  const [isSidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [isSidebarCollapsed, setSidebarCollapsed] = useState(() => window.matchMedia(AUTO_COLLAPSE_SIDEBAR_QUERY).matches)
   const [isMobileAuthOpen, setMobileAuthOpen] = useState(false)
   const [query, setQuery] = useState('')
   const deferredQuery = useDeferredValue(query)
@@ -634,13 +638,25 @@ function App() {
   }, [])
 
   useEffect(() => {
-    const media = window.matchMedia('(max-width: 760px)')
-    const updateLayout = (event: MediaQueryListEvent) => {
+    const mobileMedia = window.matchMedia(MOBILE_LAYOUT_QUERY)
+    const compactMedia = window.matchMedia(COMPACT_DENSITY_QUERY)
+    const collapseMedia = window.matchMedia(AUTO_COLLAPSE_SIDEBAR_QUERY)
+    const updateMobileLayout = (event: MediaQueryListEvent) => {
       setMobileLayout(event.matches)
       if (!event.matches) setMobileSidebarOpen(false)
     }
-    media.addEventListener('change', updateLayout)
-    return () => media.removeEventListener('change', updateLayout)
+    const updateCompactDensity = (event: MediaQueryListEvent) => setCompactDensity(event.matches)
+    const updateSidebarForDesktop = (event: MediaQueryListEvent) => {
+      if (event.matches) setSidebarCollapsed(true)
+    }
+    mobileMedia.addEventListener('change', updateMobileLayout)
+    compactMedia.addEventListener('change', updateCompactDensity)
+    collapseMedia.addEventListener('change', updateSidebarForDesktop)
+    return () => {
+      mobileMedia.removeEventListener('change', updateMobileLayout)
+      compactMedia.removeEventListener('change', updateCompactDensity)
+      collapseMedia.removeEventListener('change', updateSidebarForDesktop)
+    }
   }, [])
 
   const pushToast = (message: string, tone: ToastTone = 'info') => {
@@ -1256,7 +1272,9 @@ function App() {
   const mailListVirtualizer = useVirtualizer({
     count: virtualMailItems.length,
     getScrollElement: () => mailListRef.current,
-    estimateSize: (index) => virtualMailItems[index]?.type === 'group' ? 32 : 70,
+    estimateSize: (index) => virtualMailItems[index]?.type === 'group'
+      ? (isCompactDensity ? 26 : 30)
+      : (isCompactDensity ? 58 : 64),
     getItemKey: getVirtualMailKey,
     overscan: 8,
     useFlushSync: false,
@@ -2432,7 +2450,7 @@ function App() {
               : offlineMode ? '本地结果' : '本地 + 云端'
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${isCompactDensity ? 'is-compact-density' : ''}`}>
       <style>{`.reicon { width: 1em; height: 1em; }`}</style>
       <header className="titlebar" data-rdesktop-drag="true" onDoubleClick={() => window.__RDESKTOP_WINDOW__?.maximize()}>
         <div className="titlebar-brand" data-no-drag="true">

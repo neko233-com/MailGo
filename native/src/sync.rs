@@ -19,18 +19,22 @@ use native_tls::{TlsConnector, TlsStream};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::mail::{parse_full, parse_header, CachedMailbox, CachedMessage, CACHE_SCHEMA_VERSION};
+use crate::mail::{
+    parse_full_with_attachments, parse_header, CachedMailbox, CachedMessage, CACHE_SCHEMA_VERSION,
+};
 use crate::providers::{Authentication, ProviderKind, ProviderProfile, TransportSecurity};
 
 // RFC 3501 requires a parenthesized data-item list when FETCH requests more than one item.
 // Some servers accept the unparenthesized form, while stricter providers such as QQ return BAD.
-const HEADER_FETCH_QUERY: &str = "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER])";
+const HEADER_FETCH_QUERY: &str = "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]<0.262145>)";
 const FLAGS_FETCH_QUERY: &str = "(UID FLAGS)";
 const SIZE_FETCH_QUERY: &str = "(UID RFC822.SIZE)";
-const FULL_FETCH_QUERY: &str = "(UID FLAGS RFC822)";
+const FULL_FETCH_QUERY: &str = "(UID FLAGS BODY.PEEK[]<0.67108865>)";
 const MAX_HEADER_MESSAGES: usize = 100;
+const MAX_HEADER_FETCH_BATCH: usize = 30;
 const MAX_DISCOVERED_FOLDERS: usize = 64;
 const MAX_UIDS_PER_QUERY: usize = 100_000;
+const MAX_UID_SEARCH_WINDOW: u32 = 100_000;
 const MAX_CACHED_MESSAGES_PER_FOLDER: usize = 5_000;
 const MAX_CACHE_FILE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 256 * 1024;
@@ -458,8 +462,14 @@ fn fetch_raw_message_with_pooled_session(
             .ok_or_else(|| anyhow!("message UID {uid} was not found"))?;
         let raw = item
             .body()
-            .ok_or_else(|| anyhow!("message UID {uid} has no RFC822 body"))?
-            .to_vec();
+            .ok_or_else(|| anyhow!("message UID {uid} has no RFC822 body"))?;
+        if raw.len() > crate::mail::MAX_FULL_MESSAGE_BYTES || raw.len() != advertised_size as usize
+        {
+            return Err(anyhow!(
+                "message UID {uid} returned an invalid or truncated RFC822 body"
+            ));
+        }
+        let raw = raw.to_vec();
         let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
         let starred = item
             .flags()
@@ -1096,8 +1106,13 @@ fn search_account_once(
             }
         };
         folders_searched += 1;
+        let uid_floor = mailbox
+            .uid_next
+            .map(|next| next.saturating_sub(MAX_UID_SEARCH_WINDOW).max(1))
+            .unwrap_or(1);
+        let bounded_query = format!("UID {uid_floor}:* {query}");
         let mut uids = session
-            .uid_search(&query)
+            .uid_search(&bounded_query)
             .with_context(|| format!("search {folder}"))?
             .into_iter()
             .collect::<Vec<_>>();
@@ -1108,46 +1123,18 @@ fn search_account_once(
             truncated = true;
         }
         let selected_uids = uids.into_iter().take(folder_limit).collect::<Vec<_>>();
-        let uid_set = selected_uids
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        if uid_set.is_empty() {
+        if selected_uids.is_empty() {
             continue;
         }
-        let fetched = session
-            .uid_fetch(uid_set, HEADER_FETCH_QUERY)
-            .with_context(|| format!("fetch search results in {folder}"))?;
-        let mut header_bytes = 0usize;
-        let mut folder_messages = Vec::new();
-        for item in fetched.iter() {
-            if messages.len() >= limit {
-                truncated = true;
-                break;
-            }
-            let Some(uid) = item.uid else { continue };
-            let Some(header) = item.header() else {
-                continue;
-            };
-            if header.len() > MAX_HEADER_BYTES {
-                continue;
-            }
-            header_bytes = header_bytes.saturating_add(header.len());
-            if header_bytes > MAX_HEADER_TOTAL_BYTES {
-                truncated = true;
-                break;
-            }
-            let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
-            let starred = item
-                .flags()
-                .iter()
-                .any(|flag| matches!(flag, Flag::Flagged));
-            let Ok(message) = parse_header(account_id, &folder, uid, unread, starred, header)
-            else {
-                continue;
-            };
-            folder_messages.push(message);
+        let folder_messages = fetch_header_messages(
+            &mut session,
+            account_id,
+            &folder,
+            &selected_uids,
+            &format!("fetch search results in {folder}"),
+        )?;
+        if folder_messages.len() < selected_uids.len() {
+            truncated = true;
         }
         save_search_messages(
             cache_root,
@@ -1165,6 +1152,52 @@ fn search_account_once(
         truncated,
         folders_searched,
     })
+}
+
+fn fetch_header_messages(
+    session: &mut imap::Session<imap::Connection>,
+    account_id: &str,
+    folder: &str,
+    uids: &[u32],
+    context: &str,
+) -> Result<Vec<CachedMessage>> {
+    let mut messages = Vec::with_capacity(uids.len());
+    let mut header_bytes = 0usize;
+    for batch in uids.chunks(MAX_HEADER_FETCH_BATCH) {
+        let uid_set = batch
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        if uid_set.is_empty() {
+            continue;
+        }
+        let fetched = session
+            .uid_fetch(uid_set, HEADER_FETCH_QUERY)
+            .with_context(|| context.to_string())?;
+        for item in fetched.iter() {
+            let Some(uid) = item.uid else { continue };
+            let Some(header) = item.header() else {
+                continue;
+            };
+            if header.len() > MAX_HEADER_BYTES {
+                continue;
+            }
+            header_bytes = header_bytes.saturating_add(header.len());
+            if header_bytes > MAX_HEADER_TOTAL_BYTES {
+                return Ok(messages);
+            }
+            let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
+            let starred = item
+                .flags()
+                .iter()
+                .any(|flag| matches!(flag, Flag::Flagged));
+            if let Ok(message) = parse_header(account_id, folder, uid, unread, starred, header) {
+                messages.push(message);
+            }
+        }
+    }
+    Ok(messages)
 }
 
 fn build_search_query(value: &str) -> Result<String> {
@@ -1222,6 +1255,7 @@ fn sync_account_once(
             account_id,
             &folder,
             mailbox.uid_validity,
+            mailbox.uid_next,
             mailbox.highest_mod_seq.or(status_highest_mod_seq),
             incremental_mode,
             cache_root,
@@ -1292,6 +1326,7 @@ fn sync_folder_latest(
     account_id: &str,
     folder: &str,
     uid_validity: Option<u32>,
+    uid_next: Option<u32>,
     highest_mod_seq: Option<u64>,
     incremental_mode: Option<IncrementalMode>,
     cache_root: &Path,
@@ -1331,11 +1366,23 @@ fn sync_folder_latest(
 
     let mut delta = MailboxSyncDelta::default();
 
-    let mut all_uids = session
-        .uid_search("ALL")
-        .with_context(|| format!("search {folder}"))?
-        .into_iter()
-        .collect::<Vec<_>>();
+    let newest_cached_uid = cached.messages.iter().map(|message| message.uid).max();
+    let highest_possible_uid = uid_next
+        .and_then(|next| next.checked_sub(1))
+        .or(newest_cached_uid)
+        .unwrap_or(0);
+    let uid_search_floor = highest_possible_uid
+        .saturating_sub(MAX_UID_SEARCH_WINDOW.saturating_sub(1))
+        .max(1);
+    let mut all_uids = if highest_possible_uid == 0 {
+        Vec::new()
+    } else {
+        session
+            .uid_search(format!("UID {uid_search_floor}:{highest_possible_uid}"))
+            .with_context(|| format!("search {folder}"))?
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
     all_uids.sort_unstable();
     if all_uids.len() > MAX_UIDS_PER_QUERY {
         all_uids.drain(..all_uids.len() - MAX_UIDS_PER_QUERY);
@@ -1345,7 +1392,6 @@ fn sync_folder_latest(
 
     // The header window is fetched only for a cold cache or UIDs newer than the newest cached
     // message. Existing bodies/attachments remain untouched and are refreshed through FLAGS.
-    let newest_cached_uid = cached.messages.iter().map(|message| message.uid).max();
     let new_uid_count = newest_cached_uid
         .map(|newest_uid| all_uids.iter().filter(|uid| **uid > newest_uid).count());
     let selected_uids = match newest_cached_uid {
@@ -1362,51 +1408,27 @@ fn sync_folder_latest(
             .copied()
             .collect::<Vec<_>>(),
     };
-    let uid_set = selected_uids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut fetched_messages = Vec::with_capacity(selected_uids.len());
-    if !uid_set.is_empty() {
-        let fetched = session
-            .uid_fetch(uid_set, HEADER_FETCH_QUERY)
-            .with_context(|| format!("fetch {folder} message headers"))?;
-        let mut header_bytes = 0usize;
-        for item in fetched.iter() {
-            let Some(uid) = item.uid else { continue };
-            let Some(header) = item.header() else {
-                continue;
-            };
-            if header.len() > MAX_HEADER_BYTES {
-                continue;
-            }
-            header_bytes = header_bytes.saturating_add(header.len());
-            if header_bytes > MAX_HEADER_TOTAL_BYTES {
-                break;
-            }
-            let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
-            let starred = item
-                .flags()
-                .iter()
-                .any(|flag| matches!(flag, Flag::Flagged));
-            if let Ok(message) = parse_header(account_id, folder, uid, unread, starred, header) {
-                fetched_messages.push(message);
-            }
-        }
-    }
+    let mut fetched_messages = fetch_header_messages(
+        session,
+        account_id,
+        folder,
+        &selected_uids,
+        &format!("fetch {folder} message headers"),
+    )?;
     fetched_messages.sort_by_key(|message| std::cmp::Reverse(message.uid));
 
     delta.removed_uids.extend(
         cached
             .messages
             .iter()
-            .filter(|message| !current_uids.contains(&message.uid))
+            .filter(|message| {
+                message.uid >= uid_search_floor && !current_uids.contains(&message.uid)
+            })
             .map(|message| message.uid),
     );
     cached
         .messages
-        .retain(|message| current_uids.contains(&message.uid));
+        .retain(|message| message.uid < uid_search_floor || current_uids.contains(&message.uid));
     let refresh_uids = cached
         .messages
         .iter()
@@ -1603,43 +1625,19 @@ fn sync_folder_incremental(
     let delta_headers_complete = header_uids.len() <= MAX_DELTA_HEADER_UIDS;
     header_uids.truncate(MAX_DELTA_HEADER_UIDS);
 
-    let mut fetched_messages = Vec::with_capacity(header_uids.len());
-    if !header_uids.is_empty() {
-        let uid_set = header_uids
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let fetched = match session.uid_fetch(uid_set, HEADER_FETCH_QUERY) {
-            Ok(fetched) => fetched,
-            Err(error) => {
-                tracing::debug!(folder = %folder, "IMAP incremental header fetch failed; using UID fallback: {error}");
-                return Ok(None);
-            }
-        };
-        let mut header_bytes = 0usize;
-        for item in fetched.iter() {
-            let Some(uid) = item.uid else { continue };
-            let Some(header) = item.header() else {
-                continue;
-            };
-            if header.len() > MAX_HEADER_BYTES {
-                continue;
-            }
-            header_bytes = header_bytes.saturating_add(header.len());
-            if header_bytes > MAX_HEADER_TOTAL_BYTES {
-                break;
-            }
-            let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
-            let starred = item
-                .flags()
-                .iter()
-                .any(|flag| matches!(flag, Flag::Flagged));
-            if let Ok(message) = parse_header(account_id, folder, uid, unread, starred, header) {
-                fetched_messages.push(message);
-            }
+    let fetched_messages = match fetch_header_messages(
+        session,
+        account_id,
+        folder,
+        &header_uids,
+        &format!("fetch {folder} incremental message headers"),
+    ) {
+        Ok(messages) => messages,
+        Err(error) => {
+            tracing::debug!(folder = %folder, "IMAP incremental header fetch failed; using UID fallback: {error}");
+            return Ok(None);
         }
-    }
+    };
 
     let fetched_uids = fetched_messages
         .iter()
@@ -1786,7 +1784,7 @@ fn sync_folder_page_once(
     } else {
         before_uid
     };
-    let query = match effective_before_uid {
+    let highest_possible_uid = match effective_before_uid {
         Some(uid) if uid <= 1 => {
             let unread = if folder.eq_ignore_ascii_case("INBOX") {
                 cached
@@ -1821,9 +1819,42 @@ fn sync_folder_page_once(
                 folder_labels: folder_display_labels(&[folder.to_string()]),
             });
         }
-        Some(uid) => format!("UID 1:{}", uid - 1),
-        None => "ALL".to_string(),
+        Some(uid) => uid - 1,
+        None => mailbox
+            .uid_next
+            .and_then(|uid| uid.checked_sub(1))
+            .unwrap_or(0),
     };
+    if highest_possible_uid == 0 {
+        cached.uid_validity = mailbox.uid_validity;
+        cached.highest_mod_seq = mailbox.highest_mod_seq.or(cached.highest_mod_seq);
+        cached.synced_at = now_stamp();
+        cached.has_more = false;
+        save_mailbox(cache_root, account_id, &cached)?;
+        session.logout().ok();
+        return Ok(SyncResult {
+            account_id: account_id.to_string(),
+            folder: folder.to_string(),
+            fetched: 0,
+            unread: cached
+                .messages
+                .iter()
+                .filter(|message| message.unread)
+                .count(),
+            cache_path: cache_root
+                .join(safe_component(account_id))
+                .join(cache_file_name(folder))
+                .display()
+                .to_string(),
+            synced_at: cached.synced_at,
+            folders: vec![folder.to_string()],
+            folder_labels: folder_display_labels(&[folder.to_string()]),
+        });
+    }
+    let uid_floor = highest_possible_uid
+        .saturating_sub(MAX_UID_SEARCH_WINDOW.saturating_sub(1))
+        .max(1);
+    let query = format!("UID {uid_floor}:{highest_possible_uid}");
     let mut uids = session
         .uid_search(query)
         .with_context(|| format!("search older messages in {folder}"))?
@@ -1833,46 +1864,20 @@ fn sync_folder_page_once(
     if uids.len() > MAX_UIDS_PER_QUERY {
         uids.drain(..uids.len() - MAX_UIDS_PER_QUERY);
     }
-    let has_more = uids.len() > page_size;
+    let has_more = uids.len() > page_size || uid_floor > 1;
     let selected_uids = uids
         .iter()
         .rev()
         .take(page_size)
         .copied()
         .collect::<Vec<_>>();
-    let uid_set = selected_uids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut fetched_messages = Vec::with_capacity(selected_uids.len());
-    if !uid_set.is_empty() {
-        let fetched = session
-            .uid_fetch(uid_set, HEADER_FETCH_QUERY)
-            .with_context(|| format!("fetch {folder} message headers"))?;
-        let mut header_bytes = 0usize;
-        for item in fetched.iter() {
-            let Some(uid) = item.uid else { continue };
-            let Some(header) = item.header() else {
-                continue;
-            };
-            if header.len() > MAX_HEADER_BYTES {
-                continue;
-            }
-            header_bytes = header_bytes.saturating_add(header.len());
-            if header_bytes > MAX_HEADER_TOTAL_BYTES {
-                break;
-            }
-            let unread = !item.flags().iter().any(|flag| matches!(flag, Flag::Seen));
-            let starred = item
-                .flags()
-                .iter()
-                .any(|flag| matches!(flag, Flag::Flagged));
-            if let Ok(message) = parse_header(account_id, folder, uid, unread, starred, header) {
-                fetched_messages.push(message);
-            }
-        }
-    }
+    let mut fetched_messages = fetch_header_messages(
+        &mut session,
+        account_id,
+        folder,
+        &selected_uids,
+        &format!("fetch {folder} message headers"),
+    )?;
     fetched_messages.sort_by_key(|message| std::cmp::Reverse(message.uid));
 
     cached.uid_validity = mailbox.uid_validity;
@@ -2209,8 +2214,8 @@ fn fetch_message_once(
     let (raw, unread, starred) = fetch_raw_message_with_pooled_session(
         account_id, &profile, email, credential, folder, uid,
     )?;
-    let mut message = parse_full(account_id, folder, uid, unread, starred, &raw)?;
-    let payloads = crate::mail::extract_attachment_payloads(&raw)?;
+    let (mut message, payloads) =
+        parse_full_with_attachments(account_id, folder, uid, unread, starred, &raw)?;
     crate::mail::embed_inline_images(&mut message.html_body, &payloads);
     store_attachment_payloads(cache_root, account_id, folder, uid, &mut message, &payloads)?;
     Ok(MailDetail { message })
