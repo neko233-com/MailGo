@@ -12,8 +12,8 @@ max_ipc_in_flight = 32
 
 [window]
 title = "MailGo"
-width = 1440
-height = 900
+width = 1180
+height = 720
 resizable = true
 decorations = false
 

@@ -34,6 +34,13 @@ const ATTACHMENT_DOWNLOAD_CONCURRENCY = 3
 const MOBILE_LAYOUT_QUERY = '(max-width: 900px)'
 const COMPACT_DENSITY_QUERY = '(max-height: 820px), (max-width: 1366px)'
 const AUTO_COLLAPSE_SIDEBAR_QUERY = '(max-width: 1366px) and (min-width: 901px)'
+const COMPACT_MAIL_GROUP_HEIGHT = 20
+const COMPACT_MAIL_ROW_HEIGHT = 44
+const COMFORTABLE_MAIL_GROUP_HEIGHT = 26
+const COMFORTABLE_MAIL_ROW_HEIGHT = 54
+const HTML_PRESENTATIONAL_SIZING_ATTRIBUTES = new Set([
+  'border', 'cellpadding', 'cellspacing', 'face', 'height', 'nowrap', 'size', 'width',
+])
 const DANGEROUS_ATTACHMENT_EXTENSIONS = new Set([
   'ade', 'adp', 'app', 'application', 'appinstaller', 'appref-ms', 'appx', 'appxbundle', 'bat',
   'bin', 'cab', 'chm', 'cmd', 'com', 'command', 'cpl', 'desktop', 'dll', 'dmg', 'docm', 'drv',
@@ -119,7 +126,7 @@ function sanitizeHtml(input: string, allowRemoteImages = false) {
         : name === 'src'
           ? /^(cid:|data:image\/(?:png|gif|jpe?g|webp);base64,)/i.test(value) || (allowRemoteImages && /^https:\/\//i.test(value))
           : false
-      if (name.startsWith('on') || ['style', 'srcdoc', 'srcset', 'ping', 'formaction', 'xlink:href'].includes(name)) node.removeAttribute(attribute.name)
+      if (name.startsWith('on') || ['style', 'srcdoc', 'srcset', 'ping', 'formaction', 'xlink:href'].includes(name) || HTML_PRESENTATIONAL_SIZING_ATTRIBUTES.has(name)) node.removeAttribute(attribute.name)
       if (['href', 'src', 'action'].includes(name) && !isSafeUrl) {
         node.removeAttribute(attribute.name)
       }
@@ -1366,8 +1373,8 @@ function App() {
     count: virtualMailItems.length,
     getScrollElement: () => mailListRef.current,
     estimateSize: (index) => virtualMailItems[index]?.type === 'group'
-      ? (isCompactDensity ? 22 : 26)
-      : (isCompactDensity ? 48 : 54),
+      ? (isCompactDensity ? COMPACT_MAIL_GROUP_HEIGHT : COMFORTABLE_MAIL_GROUP_HEIGHT)
+      : (isCompactDensity ? COMPACT_MAIL_ROW_HEIGHT : COMFORTABLE_MAIL_ROW_HEIGHT),
     getItemKey: getVirtualMailKey,
     overscan: 8,
     useFlushSync: false,

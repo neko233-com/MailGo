@@ -316,7 +316,10 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .message-content p { margin: 0 0 12px; white-space: pre-line; }
 .content-mode-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: -6px 0 17px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: var(--surface); font-size: 11px; }
 .text-action { display: inline-flex; align-items: center; gap: 5px; color: #aab4ff; background: transparent; font-size: 11px; }
-.html-rendered { max-width: 100%; overflow: auto; padding: 13px; border: 1px solid var(--line); border-radius: 9px; background: #f7f9fc; color: #25324c; font: 400 13px/1.55 var(--font-ui); overflow-wrap: anywhere; }
+.html-rendered { max-width: 100%; overflow: auto; padding: 13px; border: 1px solid var(--line); border-radius: 9px; background: #f7f9fc; color: #25324c; font: 400 13px/1.5 var(--font-ui); overflow-wrap: anywhere; }
+.html-rendered :where(font, big, small) { font-size: inherit !important; line-height: inherit !important; }
+.html-rendered :where(table) { width: 100% !important; max-width: 100%; border-collapse: collapse; }
+.html-rendered :where(td, th, p, div, span, li, blockquote, pre, code) { max-width: 100%; overflow-wrap: anywhere; }
 .html-rendered :where(h1, h2, h3, h4, h5, h6) { margin: 1em 0 .55em; color: inherit; font-family: var(--font-display); line-height: 1.3; }
 .html-rendered h1 { font-size: 1.42em; }
 .html-rendered h2 { font-size: 1.28em; }
@@ -559,42 +562,75 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .toast-error svg { color: var(--danger); }
 .toast-info svg { color: #8ba1ff; }
 
-.app-shell.is-compact-density .titlebar { height: 46px; gap: 8px; }
-.app-shell.is-compact-density .titlebar-search .search-wrap { height: 34px; }
-.app-shell.is-compact-density .workspace { height: calc(100% - 46px); }
-.app-shell.is-compact-density .sidebar { padding-block: 6px 3px; }
-.app-shell.is-compact-density .compose-button { min-height: 34px; margin-bottom: 5px; }
-.app-shell.is-compact-density .nav-row { height: 30px; }
-.app-shell.is-compact-density .server-folders { margin-top: 6px; padding-top: 6px; }
-.app-shell.is-compact-density .server-folders-list { max-height: min(112px, 17vh); }
-.app-shell.is-compact-density .server-folder-row { height: 27px; }
-.app-shell.is-compact-density .sidebar-section { margin-top: 6px; padding-top: 6px; }
-.app-shell.is-compact-density .smart-row { height: 27px; }
-.app-shell.is-compact-density .account-row { min-height: 38px; }
-.app-shell.is-compact-density .storage-bar { padding-block: 7px 4px; }
-.app-shell.is-compact-density .sidebar-footer { height: 30px; }
-.app-shell.is-compact-density .panel-toolbar { height: 40px; padding-block: 3px; }
-.app-shell.is-compact-density .inbox-tabs { height: 34px; }
-.app-shell.is-compact-density .list-toolbar { height: 32px; }
-.app-shell.is-compact-density .mail-row { min-height: 48px; padding-block: 3px; }
-.app-shell.is-compact-density .list-footer { height: 32px; }
-.app-shell.is-compact-density .reading-toolbar { height: 40px; }
-.app-shell.is-compact-density .reading-scroll { padding: 13px clamp(13px, 1.7vw, 22px) 18px; }
-.app-shell.is-compact-density .reading-heading h1 { font-size: clamp(16px, 1.15vw, 18px); }
-.app-shell.is-compact-density .conversation-stack { margin-top: 10px; }
-.app-shell.is-compact-density .sender-row { margin-top: 11px; padding-bottom: 10px; }
-.app-shell.is-compact-density .message-content { padding-block: 12px 10px; font-size: 12px; line-height: 1.55; }
-.app-shell.is-compact-density .message-content p { margin-bottom: 9px; }
-.app-shell.is-compact-density .html-rendered { font-size: 12px; }
-.app-shell.is-compact-density .attachments { padding-block: 9px 11px; }
-.app-shell.is-compact-density .attachment-card { height: 46px; }
-.app-shell.is-compact-density .reply-input { min-height: 68px; }
-.app-shell.is-compact-density .reply-tools { margin-top: 12px; }
-.app-shell.is-compact-density .auth-panel { top: 46px; }
+.app-shell.is-compact-density { font-size: 12px; }
+.app-shell.is-compact-density .titlebar { height: 42px; gap: 6px; }
+.app-shell.is-compact-density .titlebar-brand { font-size: 15px; }
+.app-shell.is-compact-density .brand-mark { width: 22px; height: 22px; flex-basis: 22px; }
+.app-shell.is-compact-density .titlebar-menu { width: 28px; height: 28px; flex-basis: 28px; }
+.app-shell.is-compact-density .titlebar-search .search-wrap { height: 30px; }
+.app-shell.is-compact-density .titlebar-utilities .icon-button { width: 27px; height: 27px; }
+.app-shell.is-compact-density .sync-summary { height: 27px; padding-inline: 7px; }
+.app-shell.is-compact-density .window-controls .icon-button { width: 29px; height: 26px; }
+.app-shell.is-compact-density .workspace { height: calc(100% - 42px); }
+.app-shell.is-compact-density .sidebar { padding-block: 5px 2px; }
+.app-shell.is-compact-density .compose-button { min-height: 32px; margin-bottom: 4px; border-radius: 9px; }
+.app-shell.is-compact-density .nav-row { height: 28px; }
+.app-shell.is-compact-density .server-folders { margin-top: 5px; padding-top: 5px; }
+.app-shell.is-compact-density .server-folders-heading { padding-bottom: 4px; }
+.app-shell.is-compact-density .server-folders-list { max-height: min(100px, 16vh); }
+.app-shell.is-compact-density .server-folder-row { height: 25px; }
+.app-shell.is-compact-density .sidebar-section { margin-top: 5px; padding-top: 5px; }
+.app-shell.is-compact-density .section-label-row { padding-bottom: 4px; font-size: 10px; }
+.app-shell.is-compact-density .smart-row { height: 25px; }
+.app-shell.is-compact-density .smart-dot { width: 20px; height: 20px; }
+.app-shell.is-compact-density .account-row { min-height: 34px; padding-block: 2px; }
+.app-shell.is-compact-density .account-row .provider-mark { width: 22px; height: 22px; flex-basis: 22px; font-size: 11px; }
+.app-shell.is-compact-density .account-copy { gap: 1px; }
+.app-shell.is-compact-density .storage-bar { padding-block: 5px 3px; }
+.app-shell.is-compact-density .storage-track { margin-block: 6px; }
+.app-shell.is-compact-density .sidebar-footer { height: 27px; }
+.app-shell.is-compact-density .panel-toolbar { height: 36px; padding-block: 2px; }
+.app-shell.is-compact-density .mailbox-heading { gap: 0; }
+.app-shell.is-compact-density .mailbox-heading strong { font-size: 14px; }
+.app-shell.is-compact-density .inbox-tabs { height: 31px; }
+.app-shell.is-compact-density .inbox-tabs button { font-size: 10px; }
+.app-shell.is-compact-density .list-toolbar { height: 29px; }
+.app-shell.is-compact-density .toolbar-action { height: 25px; }
+.app-shell.is-compact-density .mail-group-label { padding-inline: 16px; font-size: 9px; }
+.app-shell.is-compact-density .mail-row { min-height: 44px; padding-block: 2px; }
+.app-shell.is-compact-density .mail-row-copy p { line-height: 1.15; }
+.app-shell.is-compact-density .list-loading-strip { min-height: 26px; }
+.app-shell.is-compact-density .list-footer { height: 29px; }
+.app-shell.is-compact-density .reading-toolbar { height: 36px; }
+.app-shell.is-compact-density .reading-actions .icon-button { width: 26px; height: 26px; }
+.app-shell.is-compact-density .reading-scroll { padding: 11px clamp(12px, 1.5vw, 19px) 15px; }
+.app-shell.is-compact-density .reading-heading h1 { font-size: clamp(15px, 1.05vw, 17px); }
+.app-shell.is-compact-density .message-tags { gap: 4px; margin-top: 6px; }
+.app-shell.is-compact-density .tag { min-height: 20px; padding-inline: 6px; font-size: 9px; }
+.app-shell.is-compact-density .conversation-stack { margin-top: 8px; }
+.app-shell.is-compact-density .conversation-message { min-height: 50px; padding-block: 6px; }
+.app-shell.is-compact-density .sender-row { margin-top: 9px; padding-bottom: 8px; }
+.app-shell.is-compact-density .sender-row .avatar-lg { width: 34px; height: 34px; flex-basis: 34px; font-size: 12px; }
+.app-shell.is-compact-density .sender-copy strong { font-size: 12px; }
+.app-shell.is-compact-density .recipient { margin-top: 3px; font-size: 10px; }
+.app-shell.is-compact-density .message-content { padding-block: 9px 8px; font-size: 12px; line-height: 1.48; }
+.app-shell.is-compact-density .message-content p { margin-bottom: 7px; }
+.app-shell.is-compact-density .content-mode-row { margin-bottom: 11px; padding: 7px 9px; font-size: 10px; }
+.app-shell.is-compact-density .html-rendered { padding: 10px; font-size: 12px; line-height: 1.48; }
+.app-shell.is-compact-density .attachments { padding-block: 7px 9px; }
+.app-shell.is-compact-density .attachments-heading { margin-bottom: 8px; }
+.app-shell.is-compact-density .attachment-grid { gap: 7px; }
+.app-shell.is-compact-density .attachment-card { height: 42px; padding-block: 4px; }
+.app-shell.is-compact-density .file-glyph { width: 26px; height: 31px; flex-basis: 26px; }
+.app-shell.is-compact-density .attachment-copy { gap: 2px; }
+.app-shell.is-compact-density .reply-composer { margin-top: 8px; }
+.app-shell.is-compact-density .reply-input { min-height: 60px; padding-block: 8px 6px; }
+.app-shell.is-compact-density .reply-tools { margin-top: 8px; }
+.app-shell.is-compact-density .auth-panel { top: 42px; }
 
 @media (max-width: 1400px) {
-  .workspace { grid-template-columns: 200px minmax(330px, 390px) minmax(0, 1fr); }
-  .workspace.is-sidebar-collapsed { grid-template-columns: 60px minmax(330px, 390px) minmax(0, 1fr); }
+  .workspace { grid-template-columns: 196px minmax(320px, 360px) minmax(0, 1fr); }
+  .workspace.is-sidebar-collapsed { grid-template-columns: 56px minmax(320px, 360px) minmax(0, 1fr); }
   .titlebar-brand { width: 184px; flex-basis: 184px; }
   .titlebar-search { width: min(620px, 44vw); }
   .reading-actions > span { display: none; }
@@ -602,8 +638,8 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 }
 
 @media (max-width: 1100px) {
-  .workspace { grid-template-columns: 180px minmax(300px, 340px) minmax(0, 1fr); }
-  .workspace.is-sidebar-collapsed { grid-template-columns: 60px minmax(300px, 340px) minmax(0, 1fr); }
+  .workspace { grid-template-columns: 176px minmax(292px, 320px) minmax(0, 1fr); }
+  .workspace.is-sidebar-collapsed { grid-template-columns: 56px minmax(292px, 320px) minmax(0, 1fr); }
   .titlebar-brand { width: 164px; flex-basis: 164px; }
   .titlebar-search { width: min(500px, 40vw); }
   .sync-summary { width: 32px; padding: 0; justify-content: center; overflow: hidden; color: transparent; }

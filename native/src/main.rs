@@ -3679,9 +3679,9 @@ fn main() -> Result<()> {
         },
         window: WindowConfig {
             title: "MailGo".to_string(),
-            width: 1280,
-            height: 800,
-            min_size: Some((960, 640)),
+            width: 1180,
+            height: 720,
+            min_size: Some((920, 600)),
             decorations: false,
             resizable: true,
             icon: Some(app_window_icon()?),

@@ -714,7 +714,19 @@ pub fn sanitize_html(input: &str) -> String {
             if (element == "img" && attribute == "srcset")
                 || matches!(
                     attribute.as_str(),
-                    "style" | "srcdoc" | "ping" | "formaction" | "xlink:href"
+                    "style"
+                        | "srcdoc"
+                        | "ping"
+                        | "formaction"
+                        | "xlink:href"
+                        | "border"
+                        | "cellpadding"
+                        | "cellspacing"
+                        | "face"
+                        | "height"
+                        | "nowrap"
+                        | "size"
+                        | "width"
                 )
             {
                 return None;
@@ -1035,6 +1047,27 @@ mod tests {
         assert!(html.contains("mailto:person@example.com"));
         assert!(html.contains("cid:logo@example.com"));
         assert!(html.contains("noreferrer noopener"));
+    }
+
+    #[test]
+    fn removes_presentational_sizing_that_can_expand_the_reading_pane() {
+        let html = sanitize_html(
+            r#"<font size="7" face="Comic Sans MS">oversized</font><table width="4000" height="3000" cellpadding="900" cellspacing="900" border="200"><tr><td nowrap>content</td></tr></table>"#,
+        );
+        for attribute in [
+            "size=",
+            "face=",
+            "width=",
+            "height=",
+            "cellpadding=",
+            "cellspacing=",
+            "border=",
+            "nowrap",
+        ] {
+            assert!(!html.contains(attribute), "retained {attribute}: {html}");
+        }
+        assert!(html.contains("oversized"));
+        assert!(html.contains("content"));
     }
 
     #[test]
