@@ -174,6 +174,8 @@ pub struct SyncResult {
     pub folder: String,
     pub fetched: usize,
     pub unread: usize,
+    #[serde(default)]
+    pub new_unread: usize,
     pub cache_path: String,
     pub synced_at: String,
     pub folders: Vec<String>,
@@ -191,6 +193,16 @@ impl MailboxSyncDelta {
     fn is_empty(&self) -> bool {
         self.new_messages.is_empty() && self.flag_updates.is_empty() && self.removed_uids.is_empty()
     }
+}
+
+fn count_notifiable_new_unread(
+    snapshot: &crate::rules::RuleSnapshot,
+    messages: &[CachedMessage],
+) -> usize {
+    messages
+        .iter()
+        .filter(|message| message.unread && !crate::rules::is_blocked(snapshot, message))
+        .count()
 }
 
 #[derive(Debug)]
@@ -1028,21 +1040,8 @@ fn run_background_sync(
     ) {
         Ok(result) => {
             let notification = if let Ok(mut app) = shared.lock() {
-                let previous_unread = app
-                    .state
-                    .accounts
-                    .iter()
-                    .find(|stored| stored.id == account.id)
-                    .map(|stored| stored.unread as usize)
-                    .unwrap_or(account.unread as usize);
-                let notification = (app.state.notifications_enabled
-                    && result.unread > previous_unread)
-                    .then(|| {
-                        (
-                            account.label.clone(),
-                            result.unread.saturating_sub(previous_unread),
-                        )
-                    });
+                let notification = (app.state.notifications_enabled && result.new_unread > 0)
+                    .then(|| (account.label.clone(), result.new_unread));
                 crate::record_account_sync_success(&mut app, &result);
                 if let Some(stored) = app
                     .state
@@ -1304,10 +1303,24 @@ fn spawn_snooze_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: Pa
                         .lock()
                         .map(|app| app.state.notifications_enabled)
                         .unwrap_or(false);
-                    if notifications_enabled {
+                    let mail_rules = match crate::rules::snapshot(&cache_root) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "could not load mail rules for snooze notifications"
+                            );
+                            crate::rules::empty_snapshot()
+                        }
+                    };
+                    let notification_count = due
+                        .iter()
+                        .filter(|item| !crate::rules::is_blocked(&mail_rules, &item.message))
+                        .count();
+                    if notifications_enabled && notification_count > 0 {
                         crate::tray::notify_new_mail(
                             "MailGo",
-                            &format!("{} 封稍后处理邮件已到期", due.len()),
+                            &format!("{notification_count} 封稍后处理邮件已到期"),
                         );
                     }
                     tracing::info!(released = due.len(), "snoozed messages returned to inbox");
@@ -1867,10 +1880,21 @@ fn sync_account_once(
     let mut synced_folders = Vec::new();
     let mut inbox_fetched = 0usize;
     let mut inbox_unread = 0usize;
+    let mut inbox_new_unread = 0usize;
     let mut cache_path = cache_root.join(safe_component(account_id)).join(CACHE_FILE);
     let mut metadata_only_folders = 0usize;
     let mut exact_delta_folders = 0usize;
     let mut full_rewrite_folders = 0usize;
+    let mail_rules = match crate::rules::snapshot(cache_root) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not load mail rules for background notification filtering"
+            );
+            crate::rules::empty_snapshot()
+        }
+    };
 
     for folder in discover_folders(&mut session, profile.provider) {
         let status_highest_mod_seq = incremental_status(&mut session, &folder, incremental_mode);
@@ -1903,6 +1927,8 @@ fn sync_account_once(
         if folder.eq_ignore_ascii_case("INBOX") {
             cache_path = path;
             inbox_fetched = outcome.fetched;
+            inbox_new_unread =
+                count_notifiable_new_unread(&mail_rules, &outcome.delta.new_messages);
             inbox_unread = outcome
                 .mailbox
                 .messages
@@ -1941,6 +1967,7 @@ fn sync_account_once(
         folder: "INBOX".to_string(),
         fetched: inbox_fetched,
         unread: inbox_unread,
+        new_unread: inbox_new_unread,
         cache_path: cache_path.display().to_string(),
         synced_at,
         folders: synced_folders,
@@ -2494,6 +2521,7 @@ fn sync_folder_page_once(
                 folder: folder.to_string(),
                 fetched: 0,
                 unread,
+                new_unread: 0,
                 cache_path: cache_root
                     .join(safe_component(account_id))
                     .join(cache_file_name(folder))
@@ -2528,6 +2556,7 @@ fn sync_folder_page_once(
                 .iter()
                 .filter(|message| message.unread)
                 .count(),
+            new_unread: 0,
             cache_path: cache_root
                 .join(safe_component(account_id))
                 .join(cache_file_name(folder))
@@ -2611,6 +2640,7 @@ fn sync_folder_page_once(
         folder: folder.to_string(),
         fetched,
         unread,
+        new_unread: 0,
         cache_path: path.display().to_string(),
         synced_at: cached.synced_at,
         folders: vec![folder.to_string()],
@@ -5242,6 +5272,59 @@ mod tests {
             attachments: Vec::new(),
             raw_path: None,
         }
+    }
+
+    #[test]
+    fn new_mail_notifications_exclude_read_and_blocked_messages() {
+        let snapshot = crate::rules::RuleSnapshot {
+            rules: vec![
+                crate::rules::MailRule {
+                    id: "sender-rule".into(),
+                    account_id: Some("fixture-account".into()),
+                    kind: crate::rules::MailRuleKind::Sender,
+                    value: "blocked@example.invalid".into(),
+                    created_at: 1,
+                },
+                crate::rules::MailRule {
+                    id: "domain-rule".into(),
+                    account_id: None,
+                    kind: crate::rules::MailRuleKind::Domain,
+                    value: "blocked.example".into(),
+                    created_at: 2,
+                },
+                crate::rules::MailRule {
+                    id: "other-account-rule".into(),
+                    account_id: Some("other-account".into()),
+                    kind: crate::rules::MailRuleKind::Sender,
+                    value: "scoped@example.net".into(),
+                    created_at: 3,
+                },
+            ],
+        };
+        let mut sender_blocked = fixture_message(1, "INBOX");
+        sender_blocked.sender_email = "BLOCKED@example.invalid".into();
+        let mut domain_blocked = fixture_message(2, "INBOX");
+        domain_blocked.sender_email = "offer@news.blocked.example".into();
+        let mut already_read = fixture_message(3, "INBOX");
+        already_read.unread = false;
+        let mut wrong_account_scope = fixture_message(4, "INBOX");
+        wrong_account_scope.sender_email = "scoped@example.net".into();
+        let mut visible = fixture_message(5, "INBOX");
+        visible.sender_email = "visible@example.org".into();
+
+        assert_eq!(
+            count_notifiable_new_unread(
+                &snapshot,
+                &[
+                    sender_blocked,
+                    domain_blocked,
+                    already_read,
+                    wrong_account_scope,
+                    visible,
+                ],
+            ),
+            2
+        );
     }
 
     #[test]

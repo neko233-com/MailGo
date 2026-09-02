@@ -398,6 +398,13 @@ pub fn rule_matches(rule: &MailRule, message: &CachedMessage) -> bool {
     }
 }
 
+pub fn is_blocked(snapshot: &RuleSnapshot, message: &CachedMessage) -> bool {
+    snapshot
+        .rules
+        .iter()
+        .any(|rule| rule_matches(rule, message))
+}
+
 pub fn apply_to_message(snapshot: &RuleSnapshot, message: &mut CachedMessage) {
     message.blocked = false;
     message.blocked_rule_id = None;

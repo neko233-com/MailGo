@@ -145,6 +145,7 @@ export interface NativeSyncItem {
   folder: string
   fetched: number
   unread: number
+  newUnread: number
   cachePath: string
   syncedAt: string
   folders?: string[]
