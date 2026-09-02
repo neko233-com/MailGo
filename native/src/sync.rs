@@ -1136,6 +1136,65 @@ pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathB
         .expect("start MailGo sync scheduler");
 }
 
+fn run_scheduled_outbox_account(
+    shared: &Arc<Mutex<crate::MailGoState>>,
+    cache_root: &Path,
+    account_id: &str,
+) {
+    let account = match crate::account_for(shared, account_id) {
+        Ok(account) => account,
+        Err(_) => {
+            if let Err(error) = crate::outbox::remove_account(cache_root, account_id) {
+                tracing::warn!(account_id = %account_id, "could not remove orphaned outbox entries: {error}");
+            }
+            return;
+        }
+    };
+    let _sync_lease = match crate::try_begin_account_sync(shared, account_id) {
+        Ok(lease) => lease,
+        Err(_) => return,
+    };
+    let profile = match crate::profile_for_account(&account) {
+        Ok(profile) => profile,
+        Err(_) => {
+            if let Err(error) = crate::outbox::pause_account(
+                cache_root,
+                account_id,
+                "账户设置无效，请重新配置后再发送",
+            ) {
+                tracing::warn!(account_id = %account_id, "could not pause invalid-account outbox: {error}");
+            }
+            return;
+        }
+    };
+    let credential = match crate::load_credential(&account) {
+        Ok(credential) => credential,
+        Err(error) => {
+            let needs_auth = needs_reauthorization(&error);
+            crate::record_account_sync_failure(shared, account_id, needs_auth);
+            if needs_auth {
+                if let Err(pause_error) = crate::outbox::pause_account(
+                    cache_root,
+                    account_id,
+                    "账户需要重新授权后才能发送",
+                ) {
+                    tracing::warn!(account_id = %account_id, "could not pause unauthorized outbox: {pause_error}");
+                }
+            }
+            return;
+        }
+    };
+    match crate::outbox::flush_due(cache_root, account_id, profile, &account.email, &credential) {
+        Ok(summary) if summary.authentication_failed => {
+            crate::record_account_sync_failure(shared, account_id, true);
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(account_id = %account_id, "scheduled outbox flush failed: {error}");
+        }
+    }
+}
+
 fn spawn_outbox_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathBuf) {
     let result = thread::Builder::new()
         .name("mailgo-outbox-scheduler".into())
@@ -1185,66 +1244,9 @@ fn spawn_outbox_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: Pa
                     continue;
                 }
             };
-            for account_id in account_ids {
-                let account = match crate::account_for(&shared, &account_id) {
-                    Ok(account) => account,
-                    Err(_) => {
-                        if let Err(error) = crate::outbox::remove_account(&cache_root, &account_id) {
-                            tracing::warn!(account_id = %account_id, "could not remove orphaned outbox entries: {error}");
-                        }
-                        continue;
-                    }
-                };
-                let _sync_lease = match crate::try_begin_account_sync(&shared, &account_id) {
-                    Ok(lease) => lease,
-                    Err(_) => continue,
-                };
-                let profile = match crate::profile_for_account(&account) {
-                    Ok(profile) => profile,
-                    Err(_) => {
-                        if let Err(error) = crate::outbox::pause_account(
-                            &cache_root,
-                            &account_id,
-                            "账户设置无效，请重新配置后再发送",
-                        ) {
-                            tracing::warn!(account_id = %account_id, "could not pause invalid-account outbox: {error}");
-                        }
-                        continue;
-                    }
-                };
-                let credential = match crate::load_credential(&account) {
-                    Ok(credential) => credential,
-                    Err(error) => {
-                        let needs_auth = needs_reauthorization(&error);
-                        crate::record_account_sync_failure(&shared, &account_id, needs_auth);
-                        if needs_auth {
-                            if let Err(pause_error) = crate::outbox::pause_account(
-                                &cache_root,
-                                &account_id,
-                                "账户需要重新授权后才能发送",
-                            ) {
-                                tracing::warn!(account_id = %account_id, "could not pause unauthorized outbox: {pause_error}");
-                            }
-                        }
-                        continue;
-                    }
-                };
-                match crate::outbox::flush_due(
-                    &cache_root,
-                    &account_id,
-                    profile,
-                    &account.email,
-                    &credential,
-                ) {
-                    Ok(summary) if summary.authentication_failed => {
-                        crate::record_account_sync_failure(&shared, &account_id, true);
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::warn!(account_id = %account_id, "scheduled outbox flush failed: {error}");
-                    }
-                }
-            }
+            map_with_concurrency(&account_ids, ACCOUNT_SYNC_CONCURRENCY, |account_id| {
+                run_scheduled_outbox_account(&shared, &cache_root, account_id)
+            });
             crate::outbox::wait_for_scheduler_change(observed, OUTBOX_SCHEDULER_BUSY_RETRY);
         });
     if let Err(error) = result {

@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,7 +30,7 @@ pub const MAX_UNDO_SEND_SECONDS: u64 = 30;
 
 static OUTBOX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static IN_FLIGHT_IDS: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
-static FLUSH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static FLUSHING_ACCOUNTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static SCHEDULER_WAKE: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
 
 fn outbox_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -179,6 +178,32 @@ pub enum RetryOutboxStatus {
 
 struct InFlightGuard {
     keys: Vec<(String, String)>,
+}
+
+struct FlushAccountGuard {
+    account_id: String,
+}
+
+impl FlushAccountGuard {
+    fn try_acquire(account_id: &str) -> Option<Self> {
+        let mut flushing = FLUSHING_ACCOUNTS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .expect("MailGo outbox account-flush lock poisoned");
+        flushing.insert(account_id.to_string()).then(|| Self {
+            account_id: account_id.to_string(),
+        })
+    }
+}
+
+impl Drop for FlushAccountGuard {
+    fn drop(&mut self) {
+        FLUSHING_ACCOUNTS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .expect("MailGo outbox account-flush lock poisoned")
+            .remove(&self.account_id);
+    }
 }
 
 impl Drop for InFlightGuard {
@@ -660,17 +685,10 @@ pub fn flush_due(
     email: &str,
     credential: &str,
 ) -> Result<FlushSummary> {
-    if FLUSH_IN_PROGRESS.swap(true, Ordering::AcqRel) {
-        return Ok(FlushSummary::default());
-    }
-    struct FlushReset;
-    impl Drop for FlushReset {
-        fn drop(&mut self) {
-            FLUSH_IN_PROGRESS.store(false, Ordering::Release);
-        }
-    }
-    let _flush_reset = FlushReset;
     validate_account_id(account_id)?;
+    let Some(_flush_account_guard) = FlushAccountGuard::try_acquire(account_id) else {
+        return Ok(FlushSummary::default());
+    };
     let now = now_seconds();
     let (due, _in_flight_guard) = {
         let _outbox_guard = outbox_guard();
@@ -1235,6 +1253,18 @@ mod tests {
             DiscardOutboxStatus::Discarded
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn flush_leases_serialize_one_account_without_blocking_another() {
+        let first_account = format!("account-a-{:016x}", rand::random::<u64>());
+        let second_account = format!("account-b-{:016x}", rand::random::<u64>());
+        let first = FlushAccountGuard::try_acquire(&first_account).expect("first account lease");
+        assert!(FlushAccountGuard::try_acquire(&first_account).is_none());
+        let second = FlushAccountGuard::try_acquire(&second_account).expect("second account lease");
+        drop(first);
+        assert!(FlushAccountGuard::try_acquire(&first_account).is_some());
+        drop(second);
     }
 
     #[test]
