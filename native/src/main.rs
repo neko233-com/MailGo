@@ -3833,6 +3833,129 @@ mod tests {
     }
 
     #[test]
+    fn state_decoder_migrates_every_supported_schema_fixture() {
+        struct Fixture {
+            version: u32,
+            contents: &'static str,
+            expected_signature: &'static str,
+            expected_undo_send_seconds: u64,
+            expected_sent_folder: Option<&'static str>,
+        }
+
+        let fixtures = [
+            Fixture {
+                version: 1,
+                contents: r##"{
+                    "schema_version": 1,
+                    "accounts": [{"id":"schema-1","provider":"qq","label":"QQ v1","email":"schema-1@example.invalid","unread":3,"accent":"#111111","status":"offline","lastSync":"v1"}],
+                    "folder_names": {"schema-1":["Sent Messages"]},
+                    "theme": "light",
+                    "minimize_to_tray": false,
+                    "offline_mode": true,
+                    "notifications_enabled": false,
+                    "remote_images_enabled": true,
+                    "hide_ads": true
+                }"##,
+                expected_signature: "",
+                expected_undo_send_seconds: DEFAULT_UNDO_SEND_SECONDS,
+                expected_sent_folder: None,
+            },
+            Fixture {
+                version: 2,
+                contents: r##"{
+                    "schema_version": 2,
+                    "accounts": [{"id":"schema-2","provider":"qq","label":"QQ v2","email":"schema-2@example.invalid","unread":3,"accent":"#222222","status":"offline","lastSync":"v2","signature":"  Schema 2\r\nSignature  "}],
+                    "folder_names": {"schema-2":["Sent Messages"]},
+                    "theme": "light",
+                    "minimize_to_tray": false,
+                    "offline_mode": true,
+                    "notifications_enabled": false,
+                    "remote_images_enabled": true,
+                    "hide_ads": true
+                }"##,
+                expected_signature: "Schema 2\nSignature",
+                expected_undo_send_seconds: DEFAULT_UNDO_SEND_SECONDS,
+                expected_sent_folder: None,
+            },
+            Fixture {
+                version: 3,
+                contents: r##"{
+                    "schema_version": 3,
+                    "accounts": [{"id":"schema-3","provider":"qq","label":"QQ v3","email":"schema-3@example.invalid","unread":3,"accent":"#333333","status":"offline","lastSync":"v3","signature":"Schema 3"}],
+                    "folder_names": {"schema-3":["Sent Messages"]},
+                    "theme": "light",
+                    "minimize_to_tray": false,
+                    "offline_mode": true,
+                    "notifications_enabled": false,
+                    "remote_images_enabled": true,
+                    "hide_ads": true,
+                    "undo_send_seconds": 20
+                }"##,
+                expected_signature: "Schema 3",
+                expected_undo_send_seconds: 20,
+                expected_sent_folder: None,
+            },
+            Fixture {
+                version: 4,
+                contents: r##"{
+                    "schema_version": 4,
+                    "accounts": [{"id":"schema-4","provider":"qq","label":"QQ v4","email":"schema-4@example.invalid","unread":3,"accent":"#444444","status":"offline","lastSync":"v4","signature":"Schema 4"}],
+                    "folder_names": {"schema-4":["Sent Messages"]},
+                    "folder_roles": {"schema-4":{"sent":"sent messages"}},
+                    "theme": "light",
+                    "minimize_to_tray": false,
+                    "offline_mode": true,
+                    "notifications_enabled": false,
+                    "remote_images_enabled": true,
+                    "hide_ads": true,
+                    "undo_send_seconds": 30
+                }"##,
+                expected_signature: "Schema 4",
+                expected_undo_send_seconds: 30,
+                expected_sent_folder: Some("Sent Messages"),
+            },
+        ];
+
+        assert_eq!(
+            fixtures
+                .iter()
+                .map(|fixture| fixture.version)
+                .collect::<Vec<_>>(),
+            (1..=STATE_SCHEMA_VERSION).collect::<Vec<_>>(),
+            "every supported persisted-state schema needs an executable migration fixture"
+        );
+
+        for fixture in fixtures {
+            let state = decode_persisted_state(fixture.contents)
+                .unwrap_or_else(|error| panic!("migrate schema {}: {error}", fixture.version));
+            let account_id = format!("schema-{}", fixture.version);
+            assert_eq!(state.schema_version, STATE_SCHEMA_VERSION);
+            assert_eq!(state.accounts.len(), 1);
+            assert_eq!(state.accounts[0].id, account_id);
+            assert_eq!(state.accounts[0].signature, fixture.expected_signature);
+            assert_eq!(
+                state.folder_names.get(&account_id),
+                Some(&vec!["Sent Messages".to_string()])
+            );
+            assert_eq!(state.theme, "light");
+            assert!(!state.minimize_to_tray);
+            assert!(state.offline_mode);
+            assert!(!state.notifications_enabled);
+            assert!(state.remote_images_enabled);
+            assert!(state.hide_ads);
+            assert_eq!(state.undo_send_seconds, fixture.expected_undo_send_seconds);
+            assert_eq!(
+                state
+                    .folder_roles
+                    .get(&account_id)
+                    .and_then(|roles| roles.get("sent"))
+                    .map(String::as_str),
+                fixture.expected_sent_folder
+            );
+        }
+    }
+
+    #[test]
     fn undo_send_delay_defaults_and_rejects_unsupported_persisted_values() {
         assert_eq!(PersistedState::default().undo_send_seconds, 10);
         assert_eq!(
