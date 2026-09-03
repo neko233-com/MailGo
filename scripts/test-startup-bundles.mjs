@@ -18,6 +18,8 @@ const assets = readdirSync(assetsRoot)
 
 assert.doesNotMatch(app, /import \{[^}]*sample(?:Accounts|Mails|OutboxItems)[^}]*\} from '\.\/data'/)
 assert.match(app, /import\('\.\/demoData'\)/)
+assert.match(app, /await import\('\.\/linkSafety'\)/)
+assert.ok(assets.some((asset) => asset.startsWith('linkSafety-') && asset.endsWith('.js')), 'missing deferred link safety chunk')
 
 for (const component of [
   'ConfirmDialog',

@@ -16,6 +16,7 @@ use base64::{
 };
 use imap::extensions::idle::{self, SetReadTimeout, WaitOutcome};
 use imap::types::{Flag, UnsolicitedResponse};
+use imap_proto::NameAttribute;
 use native_tls::{TlsConnector, TlsStream};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -208,6 +209,66 @@ pub struct SyncResult {
     pub synced_at: String,
     pub folders: Vec<String>,
     pub folder_labels: HashMap<String, String>,
+    #[serde(default)]
+    pub folder_roles: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SystemFolderRole {
+    Inbox,
+    Sent,
+    Drafts,
+    Spam,
+    Trash,
+    Archive,
+}
+
+impl SystemFolderRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbox => "inbox",
+            Self::Sent => "sent",
+            Self::Drafts => "drafts",
+            Self::Spam => "spam",
+            Self::Trash => "trash",
+            Self::Archive => "archive",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FolderSpecialUse {
+    All,
+    Archive,
+    Drafts,
+    Junk,
+    Sent,
+    Trash,
+}
+
+impl FolderSpecialUse {
+    fn role(self) -> SystemFolderRole {
+        match self {
+            Self::All | Self::Archive => SystemFolderRole::Archive,
+            Self::Drafts => SystemFolderRole::Drafts,
+            Self::Junk => SystemFolderRole::Spam,
+            Self::Sent => SystemFolderRole::Sent,
+            Self::Trash => SystemFolderRole::Trash,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListedFolder {
+    name: String,
+    selectable: bool,
+    special_uses: Vec<FolderSpecialUse>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FolderDiscovery {
+    folders: Vec<String>,
+    roles: HashMap<String, String>,
 }
 
 #[derive(Debug, Default)]
@@ -1888,7 +1949,7 @@ fn search_account_once(
     let query = build_search_query(query)?;
     let limit = limit.clamp(1, MAX_SEARCH_RESULTS_PER_ACCOUNT);
     let mut session = authenticate(&profile, email, credential)?;
-    let folders = discover_folders(&mut session, profile.provider);
+    let folders = discover_folders(&mut session, profile.provider).folders;
     let mut messages = Vec::new();
     let mut truncated = false;
     let mut folders_searched = 0usize;
@@ -2064,7 +2125,8 @@ fn sync_account_once(
         }
     };
 
-    for folder in discover_folders(&mut session, profile.provider) {
+    let FolderDiscovery { folders, mut roles } = discover_folders(&mut session, profile.provider);
+    for folder in folders {
         let status_highest_mod_seq = incremental_status(&mut session, &folder, incremental_mode);
         let Ok(mailbox) = session.select(&folder) else {
             continue;
@@ -2114,6 +2176,11 @@ fn sync_account_once(
         return Err(anyhow!("INBOX is unavailable on the mail server"));
     }
 
+    roles.retain(|_, role_folder| {
+        synced_folders
+            .iter()
+            .any(|folder| folder.eq_ignore_ascii_case(role_folder))
+    });
     let folder_labels = folder_display_labels(&synced_folders);
     tracing::info!(
         account_id = %account_id,
@@ -2140,6 +2207,7 @@ fn sync_account_once(
         synced_at,
         folders: synced_folders,
         folder_labels,
+        folder_roles: roles,
     })
 }
 
@@ -2698,6 +2766,7 @@ fn sync_folder_page_once(
                 synced_at: now_stamp(),
                 folders: vec![folder.to_string()],
                 folder_labels: folder_display_labels(&[folder.to_string()]),
+                folder_roles: HashMap::new(),
             });
         }
         Some(uid) => uid - 1,
@@ -2733,6 +2802,7 @@ fn sync_folder_page_once(
             synced_at: cached.synced_at,
             folders: vec![folder.to_string()],
             folder_labels: folder_display_labels(&[folder.to_string()]),
+            folder_roles: HashMap::new(),
         });
     }
     let uid_floor = highest_possible_uid
@@ -2813,6 +2883,7 @@ fn sync_folder_page_once(
         synced_at: cached.synced_at,
         folders: vec![folder.to_string()],
         folder_labels: folder_display_labels(&[folder.to_string()]),
+        folder_roles: HashMap::new(),
     })
 }
 
@@ -4856,50 +4927,170 @@ fn legacy_cache_file_name(folder: &str) -> String {
 fn discover_folders(
     session: &mut imap::Session<imap::Connection>,
     provider: crate::providers::ProviderKind,
-) -> Vec<String> {
-    let preferred = folders_for(provider);
-    let listed = session
-        .list(None, Some("*"))
-        .map(|names| {
-            let mut bounded = Vec::with_capacity(MAX_DISCOVERED_FOLDERS);
-            for name in names.iter().map(|name| name.name().to_string()) {
-                if !is_safe_discovered_folder(&name) {
-                    continue;
-                }
-                let is_preferred = preferred
+) -> FolderDiscovery {
+    let listed = match session.list(None, Some("*")) {
+        Ok(names) => names
+            .iter()
+            .map(|name| ListedFolder {
+                name: name.name().to_string(),
+                selectable: !name
+                    .attributes()
                     .iter()
-                    .any(|candidate| name.eq_ignore_ascii_case(candidate));
-                if is_preferred || bounded.len() < MAX_DISCOVERED_FOLDERS {
-                    bounded.push(name);
-                }
-            }
-            bounded
-        })
-        .unwrap_or_default();
-    if listed.is_empty() {
-        return preferred.into_iter().map(ToOwned::to_owned).collect();
+                    .any(|attribute| matches!(attribute, NameAttribute::NoSelect)),
+                special_uses: name
+                    .attributes()
+                    .iter()
+                    .filter_map(folder_special_use)
+                    .collect(),
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            tracing::debug!("IMAP LIST unavailable; limiting discovery to INBOX: {error}");
+            Vec::new()
+        }
+    };
+    build_folder_discovery(provider, &listed)
+}
+
+fn folder_special_use(attribute: &NameAttribute<'_>) -> Option<FolderSpecialUse> {
+    match attribute {
+        NameAttribute::All => Some(FolderSpecialUse::All),
+        NameAttribute::Archive => Some(FolderSpecialUse::Archive),
+        NameAttribute::Drafts => Some(FolderSpecialUse::Drafts),
+        NameAttribute::Junk => Some(FolderSpecialUse::Junk),
+        NameAttribute::Sent => Some(FolderSpecialUse::Sent),
+        NameAttribute::Trash => Some(FolderSpecialUse::Trash),
+        _ => None,
+    }
+}
+
+fn preferred_folder_defaults(
+    provider: crate::providers::ProviderKind,
+) -> &'static [(SystemFolderRole, &'static str)] {
+    match provider {
+        crate::providers::ProviderKind::Google => &[
+            (SystemFolderRole::Inbox, "INBOX"),
+            (SystemFolderRole::Sent, "[Gmail]/Sent Mail"),
+            (SystemFolderRole::Drafts, "[Gmail]/Drafts"),
+            (SystemFolderRole::Spam, "[Gmail]/Spam"),
+            (SystemFolderRole::Trash, "[Gmail]/Trash"),
+            (SystemFolderRole::Archive, "[Gmail]/All Mail"),
+        ],
+        crate::providers::ProviderKind::Qq => &[
+            (SystemFolderRole::Inbox, "INBOX"),
+            (SystemFolderRole::Sent, "Sent Messages"),
+            (SystemFolderRole::Drafts, "Drafts"),
+            (SystemFolderRole::Spam, "Spam"),
+            (SystemFolderRole::Trash, "Trash"),
+        ],
+        crate::providers::ProviderKind::Outlook => &[
+            (SystemFolderRole::Inbox, "INBOX"),
+            (SystemFolderRole::Sent, "Sent Items"),
+            (SystemFolderRole::Drafts, "Drafts"),
+            (SystemFolderRole::Spam, "Junk Email"),
+            (SystemFolderRole::Trash, "Deleted Items"),
+            (SystemFolderRole::Archive, "Archive"),
+        ],
+        crate::providers::ProviderKind::Other => &[
+            (SystemFolderRole::Inbox, "INBOX"),
+            (SystemFolderRole::Sent, "Sent"),
+            (SystemFolderRole::Sent, "Sent Items"),
+            (SystemFolderRole::Drafts, "Drafts"),
+            (SystemFolderRole::Spam, "Spam"),
+            (SystemFolderRole::Spam, "Junk"),
+            (SystemFolderRole::Trash, "Trash"),
+            (SystemFolderRole::Trash, "Deleted Items"),
+            (SystemFolderRole::Archive, "Archive"),
+            (SystemFolderRole::Archive, "All Mail"),
+        ],
+    }
+}
+
+fn build_folder_discovery(
+    provider: crate::providers::ProviderKind,
+    listed: &[ListedFolder],
+) -> FolderDiscovery {
+    let mut available = Vec::new();
+    for folder in listed {
+        if !folder.selectable
+            || !is_safe_discovered_folder(&folder.name)
+            || available
+                .iter()
+                .any(|known: &&ListedFolder| known.name.eq_ignore_ascii_case(&folder.name))
+        {
+            continue;
+        }
+        available.push(folder);
     }
 
-    let mut folders = preferred
-        .into_iter()
-        .map(|candidate| {
-            listed
-                .iter()
-                .find(|name| name.eq_ignore_ascii_case(candidate))
-                .cloned()
-                .unwrap_or_else(|| candidate.to_string())
-        })
-        .collect::<Vec<_>>();
-    for name in listed {
-        if !folders
+    let mut discovery = FolderDiscovery::default();
+    let inbox = available
+        .iter()
+        .find(|folder| folder.name.eq_ignore_ascii_case("INBOX"))
+        .map(|folder| folder.name.as_str())
+        .unwrap_or("INBOX");
+    push_discovered_folder(&mut discovery.folders, inbox);
+    discovery.roles.insert(
+        SystemFolderRole::Inbox.as_str().to_string(),
+        inbox.to_string(),
+    );
+
+    for role in [
+        SystemFolderRole::Sent,
+        SystemFolderRole::Drafts,
+        SystemFolderRole::Spam,
+        SystemFolderRole::Trash,
+        SystemFolderRole::Archive,
+    ] {
+        let special_use_order: &[FolderSpecialUse] = match role {
+            SystemFolderRole::Sent => &[FolderSpecialUse::Sent],
+            SystemFolderRole::Drafts => &[FolderSpecialUse::Drafts],
+            SystemFolderRole::Spam => &[FolderSpecialUse::Junk],
+            SystemFolderRole::Trash => &[FolderSpecialUse::Trash],
+            SystemFolderRole::Archive if provider == ProviderKind::Google => {
+                &[FolderSpecialUse::All, FolderSpecialUse::Archive]
+            }
+            SystemFolderRole::Archive => &[FolderSpecialUse::Archive, FolderSpecialUse::All],
+            SystemFolderRole::Inbox => &[],
+        };
+        let special = special_use_order.iter().find_map(|special_use| {
+            available.iter().find(|folder| {
+                folder.special_uses.contains(special_use) && special_use.role() == role
+            })
+        });
+        let fallback = preferred_folder_defaults(provider)
             .iter()
-            .any(|folder| folder.eq_ignore_ascii_case(&name))
-            && folders.len() < MAX_DISCOVERED_FOLDERS
-        {
-            folders.push(name);
+            .filter(|(candidate_role, _)| *candidate_role == role)
+            .find_map(|(_, candidate)| {
+                available
+                    .iter()
+                    .find(|folder| folder.name.eq_ignore_ascii_case(candidate))
+            });
+        if let Some(folder) = special.or(fallback) {
+            push_discovered_folder(&mut discovery.folders, &folder.name);
+            discovery
+                .roles
+                .insert(role.as_str().to_string(), folder.name.clone());
         }
     }
-    folders
+
+    for folder in available {
+        push_discovered_folder(&mut discovery.folders, &folder.name);
+        if discovery.folders.len() == MAX_DISCOVERED_FOLDERS {
+            break;
+        }
+    }
+    discovery
+}
+
+fn push_discovered_folder(folders: &mut Vec<String>, name: &str) {
+    if folders.len() < MAX_DISCOVERED_FOLDERS
+        && !folders
+            .iter()
+            .any(|folder| folder.eq_ignore_ascii_case(name))
+    {
+        folders.push(name.to_string());
+    }
 }
 
 fn reset_mailbox_sync_window(mailbox: &mut CachedMailbox) {
@@ -4974,44 +5165,15 @@ fn folder_display_labels(folders: &[String]) -> HashMap<String, String> {
 }
 
 fn is_safe_discovered_folder(name: &str) -> bool {
-    name.trim().len() <= 512 && !name.trim().is_empty() && !name.chars().any(char::is_control)
+    name.len() <= 512 && !name.trim().is_empty() && !name.chars().any(char::is_control)
 }
 
+#[cfg(test)]
 fn folders_for(provider: crate::providers::ProviderKind) -> Vec<&'static str> {
-    match provider {
-        crate::providers::ProviderKind::Google => vec![
-            "INBOX",
-            "[Gmail]/Sent Mail",
-            "[Gmail]/Drafts",
-            "[Gmail]/Spam",
-            "[Gmail]/Trash",
-            "[Gmail]/All Mail",
-        ],
-        crate::providers::ProviderKind::Qq => {
-            vec!["INBOX", "Sent Messages", "Drafts", "Spam", "Trash"]
-        }
-        crate::providers::ProviderKind::Outlook => {
-            vec![
-                "INBOX",
-                "Sent Items",
-                "Drafts",
-                "Junk Email",
-                "Deleted Items",
-                "Archive",
-            ]
-        }
-        crate::providers::ProviderKind::Other => {
-            vec![
-                "INBOX",
-                "Sent",
-                "Sent Items",
-                "Drafts",
-                "Spam",
-                "Trash",
-                "Archive",
-            ]
-        }
-    }
+    preferred_folder_defaults(provider)
+        .iter()
+        .map(|(_, folder)| *folder)
+        .collect()
 }
 
 #[cfg(test)]
@@ -6113,7 +6275,172 @@ mod tests {
         assert!(is_safe_discovered_folder("团队收件箱"));
         assert!(!is_safe_discovered_folder("Contacts\r\nUID FETCH 1 ALL"));
         assert!(!is_safe_discovered_folder("Drafts\0shadow"));
+        assert!(!is_safe_discovered_folder(&format!("{}x", " ".repeat(512))));
         assert!(!is_safe_discovered_folder(""));
+    }
+
+    fn listed_folder(
+        name: &str,
+        selectable: bool,
+        special_uses: &[FolderSpecialUse],
+    ) -> ListedFolder {
+        ListedFolder {
+            name: name.to_string(),
+            selectable,
+            special_uses: special_uses.to_vec(),
+        }
+    }
+
+    #[test]
+    fn special_use_discovery_maps_localized_selectable_folders_without_probes() {
+        let listed = vec![
+            listed_folder("收件备份", true, &[]),
+            listed_folder("INBOX", true, &[]),
+            listed_folder("已发送", true, &[FolderSpecialUse::Sent]),
+            listed_folder("草稿", true, &[FolderSpecialUse::Drafts]),
+            listed_folder("垃圾邮件", true, &[FolderSpecialUse::Junk]),
+            listed_folder("已删除", true, &[FolderSpecialUse::Trash]),
+            listed_folder("所有邮件", true, &[FolderSpecialUse::All]),
+            listed_folder("不可选择的父目录", false, &[FolderSpecialUse::Archive]),
+        ];
+        let discovery = build_folder_discovery(ProviderKind::Other, &listed);
+
+        assert_eq!(
+            discovery.folders,
+            vec![
+                "INBOX",
+                "已发送",
+                "草稿",
+                "垃圾邮件",
+                "已删除",
+                "所有邮件",
+                "收件备份"
+            ]
+        );
+        assert_eq!(
+            discovery.roles.get("inbox").map(String::as_str),
+            Some("INBOX")
+        );
+        assert_eq!(
+            discovery.roles.get("sent").map(String::as_str),
+            Some("已发送")
+        );
+        assert_eq!(
+            discovery.roles.get("drafts").map(String::as_str),
+            Some("草稿")
+        );
+        assert_eq!(
+            discovery.roles.get("spam").map(String::as_str),
+            Some("垃圾邮件")
+        );
+        assert_eq!(
+            discovery.roles.get("trash").map(String::as_str),
+            Some("已删除")
+        );
+        assert_eq!(
+            discovery.roles.get("archive").map(String::as_str),
+            Some("所有邮件")
+        );
+        assert!(!discovery
+            .folders
+            .iter()
+            .any(|folder| folder == "不可选择的父目录"));
+    }
+
+    #[test]
+    fn imap_list_protocol_attributes_drive_special_use_discovery() {
+        let (mut session, server) = fixture_imap_session(|reader, stream| {
+            let mut command = String::new();
+            reader
+                .read_line(&mut command)
+                .expect("read IMAP fixture LIST");
+            assert!(command.to_ascii_uppercase().contains(" LIST "));
+            let tag = command.split_ascii_whitespace().next().expect("LIST tag");
+            write!(
+                stream,
+                "* LIST (\\HasNoChildren) \"/\" INBOX\r\n* LIST (\\HasNoChildren \\Sent) \"/\" Envoyes\r\n* LIST (\\HasNoChildren \\All) \"/\" Tous\r\n* LIST (\\NoSelect \\Archive) \"/\" Container\r\n{tag} OK LIST completed\r\n"
+            )
+            .expect("write IMAP fixture LIST response");
+            stream.flush().expect("flush IMAP fixture LIST response");
+        });
+
+        let discovery = discover_folders(&mut session, ProviderKind::Other);
+        drop(session);
+        server.join().expect("join IMAP LIST fixture");
+
+        assert_eq!(discovery.folders, vec!["INBOX", "Envoyes", "Tous"]);
+        assert_eq!(
+            discovery.roles.get("sent").map(String::as_str),
+            Some("Envoyes")
+        );
+        assert_eq!(
+            discovery.roles.get("archive").map(String::as_str),
+            Some("Tous")
+        );
+        assert!(!discovery.folders.iter().any(|folder| folder == "Container"));
+    }
+
+    #[test]
+    fn discovery_falls_back_only_to_folders_the_server_actually_listed() {
+        let listed = vec![
+            listed_folder("Sent Items", true, &[]),
+            listed_folder("Projects/2026", true, &[]),
+        ];
+        let discovery = build_folder_discovery(ProviderKind::Other, &listed);
+
+        assert_eq!(
+            discovery.folders,
+            vec!["INBOX", "Sent Items", "Projects/2026"]
+        );
+        assert_eq!(discovery.roles.len(), 2);
+        assert_eq!(
+            discovery.roles.get("sent").map(String::as_str),
+            Some("Sent Items")
+        );
+        assert!(!discovery.folders.iter().any(|folder| folder == "Drafts"));
+        assert!(!discovery.folders.iter().any(|folder| folder == "Trash"));
+    }
+
+    #[test]
+    fn discovery_prefers_provider_appropriate_archive_special_use() {
+        let listed = vec![
+            listed_folder("INBOX", true, &[]),
+            listed_folder("Archive", true, &[FolderSpecialUse::Archive]),
+            listed_folder("All Mail", true, &[FolderSpecialUse::All]),
+        ];
+        let google = build_folder_discovery(ProviderKind::Google, &listed);
+        let outlook = build_folder_discovery(ProviderKind::Outlook, &listed);
+
+        assert_eq!(
+            google.roles.get("archive").map(String::as_str),
+            Some("All Mail")
+        );
+        assert_eq!(
+            outlook.roles.get("archive").map(String::as_str),
+            Some("Archive")
+        );
+    }
+
+    #[test]
+    fn empty_or_oversized_discovery_is_bounded_to_a_safe_inbox_fallback() {
+        let empty = build_folder_discovery(ProviderKind::Other, &[]);
+        assert_eq!(empty.folders, vec!["INBOX"]);
+        assert_eq!(empty.roles.get("inbox").map(String::as_str), Some("INBOX"));
+
+        let listed = (0..MAX_DISCOVERED_FOLDERS + 20)
+            .map(|index| listed_folder(&format!("Folder {index}"), true, &[]))
+            .chain(std::iter::once(listed_folder("folder 0", true, &[])))
+            .collect::<Vec<_>>();
+        let bounded = build_folder_discovery(ProviderKind::Other, &listed);
+        assert_eq!(bounded.folders.len(), MAX_DISCOVERED_FOLDERS);
+        assert_eq!(
+            bounded
+                .folders
+                .iter()
+                .filter(|folder| folder.eq_ignore_ascii_case("folder 0"))
+                .count(),
+            1
+        );
     }
 
     #[test]

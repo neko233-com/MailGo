@@ -13,7 +13,7 @@ import { sanitizeCustomCss } from './customCss'
 import { folderLabels, providerDefinitions } from './data'
 import { mapWithConcurrency } from './lib/asyncPool'
 import { invoke, readNativeState } from './lib/ipc'
-import { inspectExternalLink, type ExternalLinkInspection } from './linkSafety'
+import type { ExternalLinkInspection } from './linkSafety'
 import { applyMailRules, domainFromSender } from './mailRules'
 import { revealFirstMailboxWhileSyncing, shouldSelectFirstRevealedMessage } from './mailboxBootstrap'
 import { buildMailboxCountIndex, isSameNativeFolder, nativeFolderCountKey, nativeFolderName } from './mailboxCounts'
@@ -23,7 +23,7 @@ import { formatScheduledAt } from './scheduleSend'
 import { formatSnoozeTime } from './snooze'
 import { buildMailThreads, type MailThread } from './threading'
 import { sanitizeHtml } from './htmlSafety'
-import type { FolderId, MailAccount, MailAttachment, MailMessage, MailRuleKind, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeConnectionDiagnostic, NativeDeviceStartResponse, NativeDraft, NativeLocalSearchResponse, NativeMailboxResponse, NativeMailRule, NativeMailRuleSnapshot, NativeMessageResponse, NativeOutboxActionResponse, NativeOutboxItem, NativeOutboxRecallResponse, NativeOutboxSnapshot, NativeQueueStatus, NativeSearchResponse, NativeSendResponse, NativeSnoozeSnapshot, NativeSyncItem, NativeSyncResponse, NativeUndoSendResponse, Provider, SmartCategory, ThemeMode } from './types'
+import type { FolderId, MailAccount, MailAttachment, MailMessage, MailRuleKind, NativeAttachmentChunkResponse, NativeAttachmentStartResponse, NativeAuthStartResponse, NativeCacheStats, NativeCacheStatsResponse, NativeCachedMessage, NativeConnectionDiagnostic, NativeDeviceStartResponse, NativeDraft, NativeFolderRole, NativeFolderRoles, NativeLocalSearchResponse, NativeMailboxResponse, NativeMailRule, NativeMailRuleSnapshot, NativeMessageResponse, NativeOutboxActionResponse, NativeOutboxItem, NativeOutboxRecallResponse, NativeOutboxSnapshot, NativeQueueStatus, NativeSearchResponse, NativeSendResponse, NativeSnoozeSnapshot, NativeSyncItem, NativeSyncResponse, NativeUndoSendResponse, Provider, SmartCategory, ThemeMode } from './types'
 
 const ConfirmDialog = lazy(async () => ({ default: (await import('./components/ConfirmDialog')).ConfirmDialog }))
 const ExternalLinkDialog = lazy(async () => ({ default: (await import('./components/ExternalLinkDialog')).ExternalLinkDialog }))
@@ -68,6 +68,7 @@ const COMFORTABLE_MAIL_GROUP_HEIGHT = 22
 const COMFORTABLE_MAIL_ROW_HEIGHT = 48
 const MOBILE_MAIL_GROUP_HEIGHT = 18
 const MOBILE_MAIL_ROW_HEIGHT = 44
+const NATIVE_FOLDER_ROLE_IDS: readonly NativeFolderRole[] = ['inbox', 'sent', 'drafts', 'spam', 'trash', 'archive']
 const SNOOZE_TIMER_RECHECK_MS = 5 * 60 * 1_000
 const DANGEROUS_ATTACHMENT_EXTENSIONS = new Set([
   'ade', 'adp', 'app', 'application', 'appinstaller', 'appref-ms', 'appx', 'appxbundle', 'bat',
@@ -144,7 +145,11 @@ function nativeCategory(category: NativeCachedMessage['category']): SmartCategor
   return category === 'inbox' ? undefined : category
 }
 
-function uiFolderForNative(folder: string): FolderId {
+function uiFolderForNative(folder: string, roles?: NativeFolderRoles): FolderId {
+  for (const role of NATIVE_FOLDER_ROLE_IDS) {
+    const nativeFolder = roles?.[role]
+    if (nativeFolder && isSameNativeFolder(nativeFolder, folder)) return role
+  }
   const normalized = folder.toLowerCase()
   if (normalized === 'inbox') return 'inbox'
   if (normalized.includes('sent')) return 'sent'
@@ -152,6 +157,12 @@ function uiFolderForNative(folder: string): FolderId {
   if (normalized.includes('spam') || normalized.includes('junk')) return 'spam'
   if (normalized.includes('trash') || normalized.includes('deleted')) return 'trash'
   return 'archive'
+}
+
+function attachNativeFolderRoles(accounts: MailAccount[], roles?: Record<string, NativeFolderRoles>) {
+  return accounts.map((account) => roles?.[account.id]
+    ? { ...account, folderRoles: roles[account.id] }
+    : account)
 }
 
 function nativeFolderLabel(folder: string, displayName?: string) {
@@ -308,7 +319,7 @@ function nativeMessageToUi(message: NativeCachedMessage, account: MailAccount): 
     references: message.references,
     threadId: message.threadId,
     accountId: message.accountId,
-    folder: uiFolderForNative(message.folder),
+    folder: uiFolderForNative(message.folder, account.folderRoles),
     category: nativeCategory(message.category),
     from: message.senderEmail || 'unknown@example.com',
     senderName,
@@ -738,12 +749,13 @@ function App() {
     if (!opened) throw new Error('当前环境阻止了外部浏览器跳转')
   }
 
-  const handleRenderedLinkClick = (event: React.MouseEvent<HTMLDivElement>) => {
+  const handleRenderedLinkClick = async (event: React.MouseEvent<HTMLDivElement>) => {
     const anchor = event.target instanceof Element ? event.target.closest('a') : null
     const href = anchor?.getAttribute('href')?.trim()
     if (!anchor || !href || href.startsWith('#')) return
     event.preventDefault()
     try {
+      const { inspectExternalLink } = await import('./linkSafety')
       setPendingExternalLink(inspectExternalLink(href, anchor.textContent ?? undefined))
     } catch (error) {
       pushToast(error instanceof Error ? error.message : '已阻止不安全的邮件链接', 'error')
@@ -1160,8 +1172,9 @@ function App() {
         setMailboxHydrating(false)
         return
       }
+      const nativeAccounts = attachNativeFolderRoles(nativeState.accounts, nativeState.folderRoles)
       setNativeStateError(null)
-      if (isNativeRuntime) setAccounts(nativeState.accounts)
+      if (isNativeRuntime) setAccounts(nativeAccounts)
       if (isNativeRuntime) setNativeFolders(nativeState.folders ?? {})
       if (isNativeRuntime) setNativeFolderLabels(nativeState.folderLabels ?? {})
       if (isNativeRuntime) {
@@ -1177,15 +1190,15 @@ function App() {
       setHideAds(nativeState.hideAds ?? false)
       setUndoSendSeconds(asUndoSendSeconds(nativeState.undoSendSeconds))
       setNativeStateReady(true)
-      void refreshPendingOperations(nativeState.accounts)
-      void refreshOutbox(nativeState.accounts)
-      void refreshSnoozed(nativeState.accounts)
-      void refreshNativeDrafts(nativeState.accounts)
+      void refreshPendingOperations(nativeAccounts)
+      void refreshOutbox(nativeAccounts)
+      void refreshSnoozed(nativeAccounts)
+      void refreshNativeDrafts(nativeAccounts)
       void refreshMailRules()
       if (!isNativeRuntime) return
       let firstMailboxSettled = false
-      if (!nativeState.accounts.length) setMailboxHydrating(false)
-      await mapWithConcurrency(nativeState.accounts, ACCOUNT_IPC_CONCURRENCY, async (account) => {
+      if (!nativeAccounts.length) setMailboxHydrating(false)
+      await mapWithConcurrency(nativeAccounts, ACCOUNT_IPC_CONCURRENCY, async (account) => {
         try {
           const result = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, limit: INITIAL_MAILBOX_PAGE_SIZE })
           const converted = (result.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, account))
@@ -1223,15 +1236,19 @@ function App() {
         const nativeState = await readNativeState()
         if (cancelled || !nativeState) return
         setNativeStateError(null)
-        const refreshedAccounts = new Map(nativeState.accounts.map((account) => [account.id, account]))
+        const nativeAccounts = attachNativeFolderRoles(nativeState.accounts, nativeState.folderRoles)
+        const refreshedAccounts = new Map(nativeAccounts.map((account) => [account.id, account]))
         setAccounts((current) => {
           let changed = false
           const next = current.map((account) => {
             const refreshed = refreshedAccounts.get(account.id)
             if (!refreshed
-              || (account.unread === refreshed.unread && account.status === refreshed.status && account.lastSync === refreshed.lastSync)) return account
+              || (account.unread === refreshed.unread
+                && account.status === refreshed.status
+                && account.lastSync === refreshed.lastSync
+                && NATIVE_FOLDER_ROLE_IDS.every((role) => account.folderRoles?.[role] === refreshed.folderRoles?.[role]))) return account
             changed = true
-            return { ...account, unread: refreshed.unread, status: refreshed.status, lastSync: refreshed.lastSync }
+            return { ...account, unread: refreshed.unread, status: refreshed.status, lastSync: refreshed.lastSync, folderRoles: refreshed.folderRoles }
           })
           return changed ? next : current
         })
@@ -1239,8 +1256,8 @@ function App() {
         const refreshedFolderLabels = nativeState.folderLabels ?? {}
         setNativeFolders((current) => sameStringArrayRecord(current, refreshedFolders) ? current : refreshedFolders)
         setNativeFolderLabels((current) => sameNestedStringRecord(current, refreshedFolderLabels) ? current : refreshedFolderLabels)
-        void refreshSnoozed(nativeState.accounts)
-        await mapWithConcurrency(nativeState.accounts, ACCOUNT_IPC_CONCURRENCY, async (account) => {
+        void refreshSnoozed(nativeAccounts)
+        await mapWithConcurrency(nativeAccounts, ACCOUNT_IPC_CONCURRENCY, async (account) => {
           try {
             const folder = nativeFolderName(account, 'inbox')
             const knownRevision = mailboxMetaRef.current[nativeMailboxKey(account.id, folder)]?.revision
@@ -2036,7 +2053,7 @@ function App() {
     })
     await refreshPendingOperations()
     mapMailSources((item) => item.id === mail.id
-      ? { ...item, folder: uiFolderForNative(targetFolder), nativeFolder: targetFolder }
+      ? { ...item, folder: uiFolderForNative(targetFolder, account.folderRoles), nativeFolder: targetFolder }
       : item)
     if (mail.unread && mail.folder === 'inbox' && !isSameNativeFolder(targetFolder, nativeFolderName(account, 'inbox'))) {
       setAccounts((current) => current.map((item) => item.id === mail.accountId
@@ -2363,21 +2380,24 @@ function App() {
         }
         return next
       })
-      setAccounts((current) => current.map((account) => {
-        const synced = result.synced?.find((item) => item.accountId === account.id)
-        const failed = result.failed?.find((item) => item.accountId === account.id)
-        if (synced) return { ...account, unread: synced.unread, status: 'synced' as const, lastSync: '刚刚同步' }
+      const syncedByAccount = new Map((result.synced ?? []).map((item) => [item.accountId, item]))
+      const failedByAccount = new Map((result.failed ?? []).map((item) => [item.accountId, item]))
+      const synchronizedAccounts = accounts.map((account) => {
+        const synced = syncedByAccount.get(account.id)
+        const failed = failedByAccount.get(account.id)
+        if (synced) return { ...account, unread: synced.unread, status: 'synced' as const, lastSync: '刚刚同步', folderRoles: synced.folderRoles ?? account.folderRoles }
         if (failed && /already in progress/i.test(failed.message)) return { ...account, status: 'syncing' as const, lastSync: '后台同步中…' }
         if (failed) {
           const needsAuth = /auth|credential|login|password|authorization/i.test(failed.message)
           return { ...account, status: needsAuth ? 'needs-auth' as const : 'offline' as const, lastSync: needsAuth ? '等待重新授权' : '同步失败，可重试' }
         }
         return account
-      }))
+      })
+      setAccounts(synchronizedAccounts)
       if (result.failed?.length) pushToast(`${result.synced?.length ?? 0} 个账户已同步，${result.failed.length} 个需要处理`, 'info')
       else pushToast('所有账户已完成同步', 'success')
       if (isNativeRuntime) {
-        await mapWithConcurrency(accounts, ACCOUNT_IPC_CONCURRENCY, async (account) => {
+        await mapWithConcurrency(synchronizedAccounts, ACCOUNT_IPC_CONCURRENCY, async (account) => {
           try {
             const mailbox = await invoke<NativeMailboxResponse>('mail.list', { accountId: account.id, limit: INITIAL_MAILBOX_PAGE_SIZE })
             const converted = (mailbox.mailbox?.messages ?? []).map((message) => nativeMessageToUi(message, account))
@@ -2389,8 +2409,8 @@ function App() {
             // Preserve the previous offline copy if one account has a transient cache error.
           }
         })
-        await refreshPendingOperations(accounts)
-        await refreshOutbox(accounts)
+        await refreshPendingOperations(synchronizedAccounts)
+        await refreshOutbox(synchronizedAccounts)
       }
     } catch {
       if (!isNativeRuntime) {
@@ -2447,13 +2467,14 @@ function App() {
     try {
       const result = await syncRequest
       await firstMailbox
+      const synchronizedAccount = result.folderRoles ? { ...account, folderRoles: result.folderRoles } : account
       if (result.folders?.length) setNativeFolders((current) => ({ ...current, [account.id]: result.folders! }))
       if (result.folderLabels) setNativeFolderLabels((current) => ({ ...current, [account.id]: result.folderLabels! }))
       setAccounts((current) => current.map((item) => item.id === account.id
-        ? { ...item, unread: result.unread ?? 0, status: 'synced', lastSync: '刚刚同步' }
+        ? { ...item, unread: result.unread ?? 0, status: 'synced', lastSync: '刚刚同步', folderRoles: result.folderRoles ?? item.folderRoles }
         : item))
       try {
-        await refreshAccountMailbox(account)
+        await refreshAccountMailbox(synchronizedAccount)
       } catch {
         // A cache read failure must not downgrade a successful remote sync.
       }
@@ -3003,7 +3024,9 @@ function App() {
         const result = await invoke<{ imported: number }>('accounts.import', { accounts: imported })
         if (result.imported === 0) throw new Error('没有账户通过本地校验，配置未导入')
         const nativeState = await readNativeState()
-        const nextAccounts = nativeState?.accounts ?? accounts.filter((account) => !importedIds.has(account.id)).concat(imported)
+        const nextAccounts = nativeState
+          ? attachNativeFolderRoles(nativeState.accounts, nativeState.folderRoles)
+          : accounts.filter((account) => !importedIds.has(account.id)).concat(imported)
         setAccounts(nextAccounts)
         setNativeFolders(nativeState?.folders ?? {})
         setNativeFolderLabels(nativeState?.folderLabels ?? {})

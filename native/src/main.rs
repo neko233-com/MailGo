@@ -41,7 +41,7 @@ mod tray;
 
 const APP_SERVICE: &str = "MailGo";
 const CREDENTIAL_ENVELOPE_PREFIX: &str = "mailgo-credential-v1:";
-const STATE_SCHEMA_VERSION: u32 = 3;
+const STATE_SCHEMA_VERSION: u32 = 4;
 const ACCOUNT_EXPORT_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_UNDO_SEND_SECONDS: u64 = 10;
 const ALLOWED_UNDO_SEND_SECONDS: [u64; 5] = [0, 5, 10, 20, 30];
@@ -104,6 +104,7 @@ const ATTACHMENT_UPLOAD_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_IMPORTED_ACCOUNTS: usize = 64;
 const MAX_AUTH_SESSIONS: usize = 16;
 const MAX_FOLDERS_PER_ACCOUNT: usize = 64;
+const SYSTEM_FOLDER_ROLES: [&str; 6] = ["inbox", "sent", "drafts", "spam", "trash", "archive"];
 const MAX_ACCOUNT_ID_LENGTH: usize = 128;
 const MAX_ACCOUNT_LABEL_LENGTH: usize = 128;
 const MAX_ACCOUNT_SIGNATURE_BYTES: usize = 8 * 1024;
@@ -147,6 +148,8 @@ struct PersistedState {
     accounts: Vec<PersistedAccount>,
     #[serde(default)]
     folder_names: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    folder_roles: HashMap<String, HashMap<String, String>>,
     theme: String,
     minimize_to_tray: bool,
     offline_mode: bool,
@@ -168,6 +171,8 @@ struct PersistedStateDisk {
     accounts: Vec<PersistedAccount>,
     #[serde(default, alias = "folderNames")]
     folder_names: HashMap<String, Vec<String>>,
+    #[serde(default, alias = "folderRoles")]
+    folder_roles: HashMap<String, HashMap<String, String>>,
     #[serde(default = "default_theme")]
     theme: String,
     #[serde(default = "default_minimize_to_tray", alias = "minimizeToTray")]
@@ -229,9 +234,12 @@ fn decode_persisted_state(contents: &str) -> Result<PersistedState> {
         ));
     }
     let accounts = sanitize_persisted_accounts(disk.accounts);
+    let folder_names = sanitize_persisted_folder_names(disk.folder_names, &accounts);
+    let folder_roles = sanitize_persisted_folder_roles(disk.folder_roles, &accounts, &folder_names);
     Ok(PersistedState {
         schema_version: STATE_SCHEMA_VERSION,
-        folder_names: sanitize_persisted_folder_names(disk.folder_names, &accounts),
+        folder_names,
+        folder_roles,
         accounts,
         theme: if disk.theme == "light" {
             "light".to_string()
@@ -285,6 +293,45 @@ fn sanitize_persisted_folder_names(
         .collect()
 }
 
+fn sanitize_folder_roles(
+    folder_roles: &HashMap<String, String>,
+    folder_names: &[String],
+) -> HashMap<String, String> {
+    folder_roles
+        .iter()
+        .filter_map(|(role, folder)| {
+            let role = role.trim().to_ascii_lowercase();
+            if !SYSTEM_FOLDER_ROLES.contains(&role.as_str()) {
+                return None;
+            }
+            folder_names
+                .iter()
+                .find(|known| known.eq_ignore_ascii_case(folder))
+                .map(|known| (role, known.clone()))
+        })
+        .collect()
+}
+
+fn sanitize_persisted_folder_roles(
+    folder_roles: HashMap<String, HashMap<String, String>>,
+    accounts: &[PersistedAccount],
+    folder_names: &HashMap<String, Vec<String>>,
+) -> HashMap<String, HashMap<String, String>> {
+    let known_accounts = accounts
+        .iter()
+        .map(|account| account.id.as_str())
+        .collect::<HashSet<_>>();
+    folder_roles
+        .into_iter()
+        .filter_map(|(account_id, roles)| {
+            let folders = folder_names.get(&account_id)?;
+            let roles = sanitize_folder_roles(&roles, folders);
+            (known_accounts.contains(account_id.as_str()) && !roles.is_empty())
+                .then_some((account_id, roles))
+        })
+        .collect()
+}
+
 fn normalize_account_signature(value: &str) -> Result<String> {
     if value.len() > MAX_ACCOUNT_SIGNATURE_BYTES {
         return Err(anyhow!("account signature is too large"));
@@ -332,6 +379,7 @@ impl Default for PersistedState {
             schema_version: STATE_SCHEMA_VERSION,
             accounts: Vec::new(),
             folder_names: HashMap::new(),
+            folder_roles: HashMap::new(),
             theme: "dark".to_string(),
             minimize_to_tray: true,
             offline_mode: false,
@@ -460,6 +508,7 @@ impl MailGoState {
             "accounts": self.state.accounts,
             "folders": self.state.folder_names,
             "folderLabels": folder_labels,
+            "folderRoles": self.state.folder_roles,
             "theme": self.state.theme,
             "minimizeToTray": self.state.minimize_to_tray,
             "offlineMode": self.state.offline_mode,
@@ -819,6 +868,26 @@ fn record_account_sync_success_with_mode(
     } else if let Some(existing) = app.state.folder_names.get_mut(&result.account_id) {
         existing.extend(discovered);
         *existing = sanitize_folder_names(existing);
+    }
+    let folders = app
+        .state
+        .folder_names
+        .get(&result.account_id)
+        .cloned()
+        .unwrap_or_default();
+    let discovered_roles = sanitize_folder_roles(&result.folder_roles, &folders);
+    if replace_folders || !app.state.folder_roles.contains_key(&result.account_id) {
+        app.state
+            .folder_roles
+            .insert(result.account_id.clone(), discovered_roles);
+    } else if !discovered_roles.is_empty() {
+        let existing = app
+            .state
+            .folder_roles
+            .entry(result.account_id.clone())
+            .or_default();
+        existing.extend(discovered_roles);
+        *existing = sanitize_folder_roles(existing, &folders);
     }
 }
 
@@ -1826,17 +1895,20 @@ fn handle_ipc(
                 }
                 let previous_accounts = app.state.accounts.clone();
                 let previous_folders = app.state.folder_names.clone();
+                let previous_folder_roles = app.state.folder_roles.clone();
                 let mut previous_credentials = vec![(id.clone(), snapshot_credential(&id)?)];
                 let commit_result = (|| -> Result<()> {
                     store_credential(&new_account, credential.as_str())?;
                     app.state.accounts.retain(|account| account.id != id);
                     app.state.accounts.push(new_account);
                     app.state.folder_names.remove(&id);
+                    app.state.folder_roles.remove(&id);
                     app.save()
                 })();
                 if let Err(error) = commit_result {
                     app.state.accounts = previous_accounts;
                     app.state.folder_names = previous_folders;
+                    app.state.folder_roles = previous_folder_roles;
                     restore_credentials(&mut previous_credentials);
                     return Err(error);
                 }
@@ -2000,16 +2072,19 @@ fn handle_ipc(
 
                 let previous_accounts = app.state.accounts.clone();
                 let previous_folders = app.state.folder_names.clone();
+                let previous_folder_roles = app.state.folder_roles.clone();
                 for imported_account in &imported_accounts {
                     app.state
                         .accounts
                         .retain(|account| account.id != imported_account.id);
                     app.state.accounts.push(imported_account.clone());
                     app.state.folder_names.remove(&imported_account.id);
+                    app.state.folder_roles.remove(&imported_account.id);
                 }
                 if let Err(error) = app.save() {
                     app.state.accounts = previous_accounts;
                     app.state.folder_names = previous_folders;
+                    app.state.folder_roles = previous_folder_roles;
                     restore_credentials(&mut previous_credentials);
                     return Err(error);
                 }
@@ -2032,6 +2107,7 @@ fn handle_ipc(
                 }
                 let previous_accounts = app.state.accounts.clone();
                 let previous_folders = app.state.folder_names.clone();
+                let previous_folder_roles = app.state.folder_roles.clone();
                 let mut previous_credentials = vec![(id.clone(), snapshot_credential(&id)?)];
                 let cleanup_result = (|| -> Result<()> {
                     outbox::remove_account(&cache_dir(), &id)?;
@@ -2048,9 +2124,11 @@ fn handle_ipc(
                 }
                 app.state.accounts.retain(|account| account.id != id);
                 app.state.folder_names.remove(&id);
+                app.state.folder_roles.remove(&id);
                 if let Err(error) = app.save() {
                     app.state.accounts = previous_accounts;
                     app.state.folder_names = previous_folders;
+                    app.state.folder_roles = previous_folder_roles;
                     restore_credentials(&mut previous_credentials);
                     return Err(error);
                 }
@@ -3717,6 +3795,7 @@ mod tests {
         assert!(!state.remote_images_enabled);
         assert!(!state.hide_ads);
         assert_eq!(state.undo_send_seconds, DEFAULT_UNDO_SEND_SECONDS);
+        assert!(state.folder_roles.is_empty());
     }
 
     #[test]
@@ -3795,6 +3874,15 @@ mod tests {
                 "folder_names": {
                     "safe": ["Projects", "projects", "Team / 2026", "bad\r\nfolder", ""] ,
                     "missing": ["Should not survive"]
+                },
+                "folder_roles": {
+                    "safe": {
+                        "SENT": "projects",
+                        "archive": "Team / 2026",
+                        "trash": "Not Listed",
+                        "unknown": "Projects"
+                    },
+                    "missing": {"sent": "Should not survive"}
                 }
             }"##,
         )
@@ -3804,6 +3892,14 @@ mod tests {
             &["Projects".to_string(), "Team / 2026".to_string()]
         );
         assert!(!state.folder_names.contains_key("missing"));
+        assert_eq!(
+            state.folder_roles.get("safe").unwrap(),
+            &HashMap::from([
+                ("sent".to_string(), "Projects".to_string()),
+                ("archive".to_string(), "Team / 2026".to_string()),
+            ])
+        );
+        assert!(!state.folder_roles.contains_key("missing"));
     }
 
     #[test]

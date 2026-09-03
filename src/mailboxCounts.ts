@@ -1,4 +1,4 @@
-import type { FolderId, MailAccount, MailMessage } from './types'
+import type { FolderId, MailAccount, MailMessage, NativeFolderRoles } from './types'
 
 const FIXED_UNREAD_FOLDERS = ['inbox', 'sent', 'archive', 'spam', 'trash'] as const satisfies readonly FolderId[]
 const FIXED_UNREAD_FOLDER_SET = new Set<FolderId>(FIXED_UNREAD_FOLDERS)
@@ -6,6 +6,8 @@ const FIXED_UNREAD_FOLDER_SET = new Set<FolderId>(FIXED_UNREAD_FOLDERS)
 export function nativeFolderName(account: MailAccount, folder: FolderId): string {
   if (folder === 'outbox') return '__MAILGO_LOCAL_OUTBOX__'
   if (folder === 'snoozed') return '__MAILGO_LOCAL_SNOOZED__'
+  const discovered = account.folderRoles?.[folder as keyof NativeFolderRoles]
+  if (discovered) return discovered
   if (folder === 'inbox') return 'INBOX'
   if (folder === 'sent') return account.provider === 'google' ? '[Gmail]/Sent Mail' : account.provider === 'outlook' ? 'Sent Items' : 'Sent Messages'
   if (folder === 'drafts') return account.provider === 'google' ? '[Gmail]/Drafts' : 'Drafts'
@@ -28,7 +30,10 @@ export function nativeFolderCountKey(accountId: string, folder: string) {
   return `${accountId.length}:${accountId}${folder.toLocaleLowerCase()}`
 }
 
-export function buildMailboxCountIndex(mails: readonly MailMessage[], accounts: readonly MailAccount[]): MailboxCountIndex {
+export function buildMailboxCountIndex(
+  mails: readonly MailMessage[],
+  accounts: readonly MailAccount[],
+): MailboxCountIndex {
   const fixedUnread = new Map<FolderId, number>()
   const nativeUnread = new Map<string, number>()
   const hiddenUnreadByAccount = new Map<string, number>()

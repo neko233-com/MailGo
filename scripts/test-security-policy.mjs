@@ -41,6 +41,7 @@ assert(compose.includes('appendAccountSignature(body, accountSignature)'), 'rend
 assert(compose.includes('textBody: outgoingBody'), 'plain-text sends must use the signature-appended body')
 assert(compose.includes('appendSignatureToComposeHtml(textBlock, signature)'), 'HTML signatures must be inserted through the sanitized rich-body boundary')
 assert(compose.includes('composeHtmlBody(body, currentInlineImages, htmlMode ? richBody : undefined, accountSignature)'), 'HTML sends must sanitize rich content and add the selected signature once')
+assert(app.includes("const { inspectExternalLink } = await import('./linkSafety')"), 'link inspection should stay outside the startup bundle')
 assert(app.includes('setPendingExternalLink(inspectExternalLink(href, anchor.textContent ?? undefined))'), 'mail HTML links must stop at the inspection boundary')
 assert(!app.includes('void openExternalUrl(href)'), 'mail HTML links must not launch an external handler immediately')
 assert(externalLinkDialog.includes('await onOpen(inspection.url)'), 'external navigation must require explicit dialog confirmation')

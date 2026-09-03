@@ -4,6 +4,10 @@ export type ThemeMode = 'dark' | 'light'
 
 export type FolderId = 'inbox' | 'starred' | 'snoozed' | 'outbox' | 'sent' | 'drafts' | 'archive' | 'spam' | 'trash'
 
+export type NativeFolderRole = Extract<FolderId, 'inbox' | 'sent' | 'drafts' | 'archive' | 'spam' | 'trash'>
+
+export type NativeFolderRoles = Partial<Record<NativeFolderRole, string>>
+
 export type SmartCategory = 'apple-connect' | 'apple-ads' | 'social' | 'ads' | 'finance'
 
 export type MailRuleKind = 'sender' | 'domain'
@@ -84,6 +88,7 @@ export interface MailAccount {
   smtpSecurity?: string
   authentication?: string
   signature: string
+  folderRoles?: NativeFolderRoles
 }
 
 export interface ProviderDefinition {
@@ -111,6 +116,7 @@ export interface NativeState {
   accounts: MailAccount[]
   folders?: Record<string, string[]>
   folderLabels?: Record<string, Record<string, string>>
+  folderRoles?: Record<string, NativeFolderRoles>
   theme: ThemeMode
   minimizeToTray: boolean
   offlineMode: boolean
@@ -150,6 +156,7 @@ export interface NativeSyncItem {
   syncedAt: string
   folders?: string[]
   folderLabels?: Record<string, string>
+  folderRoles?: NativeFolderRoles
 }
 
 export interface NativeSyncResponse {

@@ -69,6 +69,29 @@ assert.equal(countIndex.hiddenUnreadByAccount.get('qq'), 2)
 assert.equal(nativeFolderName(accounts[0], 'sent'), '[Gmail]/Sent Mail')
 assert.equal(nativeFolderName(accounts[1], 'sent'), 'Sent Messages')
 assert.equal(nativeFolderName(accounts[2], 'trash'), 'Deleted Items')
+const localizedAccount = {
+  ...account('localized', 'other'),
+  folderRoles: {
+    inbox: '收件箱',
+    sent: '已发送',
+    drafts: '草稿',
+    spam: '垃圾邮件',
+    trash: '已删除',
+    archive: '所有邮件',
+  },
+}
+const localizedCounts = buildMailboxCountIndex([
+  mail('localized-inbox', 'localized', '收件箱'),
+  mail('localized-sent', 'localized', '已发送'),
+  mail('localized-spam', 'localized', '垃圾邮件'),
+], [localizedAccount]).fixedUnread
+assert.equal(nativeFolderName(localizedAccount, 'sent'), '已发送')
+assert.equal(nativeFolderName(localizedAccount, 'trash'), '已删除')
+assert.equal(localizedCounts.get('inbox'), 1)
+assert.equal(localizedCounts.get('sent'), 1)
+assert.equal(localizedCounts.get('spam'), 1)
+assert.match(appSource, /attachNativeFolderRoles\(nativeState\.accounts, nativeState\.folderRoles\)/)
+assert.match(appSource, /folderRoles: synced\.folderRoles \?\? account\.folderRoles/)
 assert.match(appSource, /const mailboxCountIndex = useMemo\(\(\) => buildMailboxCountIndex\(allMails, accounts\)/)
 assert.doesNotMatch(appSource, /const unreadNativeFolderCounts = useMemo/)
 assert.match(appSource, /const visibleMailsById = useMemo\(\(\) => new Map/)

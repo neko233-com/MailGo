@@ -1933,6 +1933,7 @@ dependencies = [
  "hmac",
  "image",
  "imap",
+ "imap-proto",
  "keyring",
  "lettre",
  "mail-parser",
