@@ -2190,13 +2190,8 @@ fn sync_account_once(
         "mailbox cache persistence completed"
     );
     crate::cache_db::spawn_search_indexer(cache_root.to_path_buf());
-    if let Err(error) = crate::cache_db::refresh_backup(cache_root) {
-        tracing::warn!(
-            error = %error,
-            "could not refresh the indexed mail cache recovery copy"
-        );
-    }
     session.logout().ok();
+    crate::cache_db::spawn_backup_refresh(cache_root.to_path_buf());
     Ok(SyncResult {
         account_id: account_id.to_string(),
         folder: "INBOX".to_string(),
@@ -3130,6 +3125,7 @@ fn error_chain_text(error: &anyhow::Error) -> String {
 /// Download and parse one full message when the reader or its bounded adjacent read-ahead asks for
 /// it. The raw message can be retained by a caller in an account cache, but the returned
 /// representation is sanitized.
+#[allow(clippy::too_many_arguments)]
 pub fn fetch_message(
     account_id: &str,
     profile: ProviderProfile,
@@ -3154,6 +3150,7 @@ pub fn fetch_message(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fetch_message_once(
     account_id: &str,
     profile: ProviderProfile,

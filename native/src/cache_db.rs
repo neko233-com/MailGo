@@ -57,6 +57,7 @@ static SEARCH_INDEX_REQUESTED: AtomicBool = AtomicBool::new(false);
 static LIST_INDEX_RUNNING: AtomicBool = AtomicBool::new(false);
 static LIST_INDEX_REQUESTED: AtomicBool = AtomicBool::new(false);
 static ENCRYPTION_MIGRATION_RUNNING: AtomicBool = AtomicBool::new(false);
+static BACKUP_REFRESH_RUNNING: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static CONNECTION_OPEN_COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
@@ -89,6 +90,16 @@ struct EncryptionMigrationRun;
 impl Drop for EncryptionMigrationRun {
     fn drop(&mut self) {
         ENCRYPTION_MIGRATION_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+struct BackupRefreshRun<'a> {
+    running: &'a AtomicBool,
+}
+
+impl Drop for BackupRefreshRun<'_> {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
     }
 }
 
@@ -875,6 +886,41 @@ pub fn refresh_backup(cache_root: &Path) -> Result<()> {
         refresh_backup_with_connection(connection, cache_root, false)
             .map_err(backup_maintenance_error)
     })
+}
+
+fn try_begin_backup_refresh(running: &AtomicBool) -> Option<BackupRefreshRun<'_>> {
+    running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| BackupRefreshRun { running })
+}
+
+/// Recovery copies are maintenance work: synchronization results and the first usable mailbox
+/// page must not wait for an online SQLite backup or its final disk flush. The one-minute due
+/// check and process-wide single-flight gate coalesce multi-account completions without creating
+/// one backup thread per account.
+pub fn spawn_backup_refresh(cache_root: PathBuf) {
+    if !backup_is_due(&cache_root) {
+        return;
+    }
+    let Some(run) = try_begin_backup_refresh(&BACKUP_REFRESH_RUNNING) else {
+        return;
+    };
+    let spawn_result = thread::Builder::new()
+        .name("mailgo-cache-backup".to_string())
+        .spawn(move || {
+            let _run = run;
+            if let Err(error) = refresh_backup(&cache_root) {
+                tracing::warn!(
+                    error = %error,
+                    "could not refresh the indexed mail cache recovery copy"
+                );
+            }
+        });
+    if let Err(error) = spawn_result {
+        BACKUP_REFRESH_RUNNING.store(false, Ordering::Release);
+        tracing::warn!(error = %error, "could not start indexed mail cache backup maintenance");
+    }
 }
 
 fn initialize(connection: &mut Connection) -> Result<()> {
@@ -3648,6 +3694,18 @@ mod tests {
             .lock()
             .unwrap()
             .remove(&path);
+    }
+
+    #[test]
+    fn background_backup_gate_is_single_flight_and_releases_on_drop() {
+        let running = AtomicBool::new(false);
+        let first = try_begin_backup_refresh(&running).expect("first backup maintenance run");
+        assert!(running.load(Ordering::Acquire));
+        assert!(try_begin_backup_refresh(&running).is_none());
+
+        drop(first);
+        assert!(!running.load(Ordering::Acquire));
+        assert!(try_begin_backup_refresh(&running).is_some());
     }
 
     #[test]

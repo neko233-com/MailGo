@@ -12,6 +12,13 @@ const sync = read('native/src/sync.rs')
 const release = read('scripts/release-windows.ps1')
 
 assert.match(cache, /pub fn mailbox_revision\(/)
+assert.match(cache, /static BACKUP_REFRESH_RUNNING: AtomicBool/)
+assert.match(cache, /pub fn spawn_backup_refresh\(cache_root: PathBuf\)/)
+assert.match(cache, /compare_exchange\(false, true, Ordering::AcqRel, Ordering::Acquire\)/)
+assert.match(cache, /\.name\("mailgo-cache-backup"\.to_string\(\)\)/)
+assert.match(cache, /if !backup_is_due\(&cache_root\)/)
+assert.match(sync, /session\.logout\(\)\.ok\(\);\s*crate::cache_db::spawn_backup_refresh\(cache_root\.to_path_buf\(\)\);/)
+assert.doesNotMatch(sync, /cache_db::refresh_backup\(cache_root\)/)
 assert.match(cache, /validate_identity\(&metadata, account_id, folder\)\?/)
 assert.match(sync, /pub fn mailbox_revision\([\s\S]*?validate_mailbox_name\(folder\)\?/)
 assert.match(main, /message\.payload\.get\("knownRevision"\)/)
@@ -34,4 +41,4 @@ for (const command of ['test:undo-send', 'test:outbox', 'test:conditional-refres
   assert.match(release, new RegExp(`npm run ${command.replace(':', '\\:')}`))
 }
 
-console.log('Revision-gated mailbox polling and release-gate coverage checks passed.')
+console.log('Revision-gated mailbox polling, asynchronous backup maintenance, and release-gate coverage checks passed.')
