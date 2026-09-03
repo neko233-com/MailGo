@@ -918,7 +918,6 @@ pub fn spawn_backup_refresh(cache_root: PathBuf) {
             }
         });
     if let Err(error) = spawn_result {
-        BACKUP_REFRESH_RUNNING.store(false, Ordering::Release);
         tracing::warn!(error = %error, "could not start indexed mail cache backup maintenance");
     }
 }

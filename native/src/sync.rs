@@ -66,6 +66,7 @@ const BACKGROUND_SYNC_INTERVAL: Duration = Duration::from_secs(300);
 const OUTBOX_SCHEDULER_IDLE: Duration = Duration::from_secs(300);
 const OUTBOX_SCHEDULER_BUSY_RETRY: Duration = Duration::from_secs(2);
 pub(crate) const ACCOUNT_SYNC_CONCURRENCY: usize = 3;
+const BACKGROUND_LOGOUT_CONCURRENCY: usize = 1;
 const IDLE_STATE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const IDLE_PAUSED_RECHECK: Duration = Duration::from_secs(5);
 const IDLE_UNSUPPORTED_RECHECK: Duration = Duration::from_secs(30 * 60);
@@ -97,6 +98,17 @@ type BodySessionRegistry = HashMap<String, BodySessionEntry>;
 
 static BODY_SESSIONS: OnceLock<Mutex<BodySessionRegistry>> = OnceLock::new();
 static READ_AHEAD_BODY_SESSION: OnceLock<Mutex<ReadAheadBodySession>> = OnceLock::new();
+static BACKGROUND_LOGOUTS: AtomicUsize = AtomicUsize::new(0);
+
+struct BackgroundLogoutRun<'a> {
+    active: &'a AtomicUsize,
+}
+
+impl Drop for BackgroundLogoutRun<'_> {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct AttachmentCacheUsage {
@@ -135,6 +147,34 @@ where
         .expect("bounded worker result lock poisoned");
     results.sort_unstable_by_key(|(index, _)| *index);
     results.into_iter().map(|(_, result)| result).collect()
+}
+
+fn try_begin_background_logout(active: &AtomicUsize) -> Option<BackgroundLogoutRun<'_>> {
+    active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < BACKGROUND_LOGOUT_CONCURRENCY).then_some(active + 1)
+        })
+        .ok()
+        .map(|_| BackgroundLogoutRun { active })
+}
+
+/// A completed one-shot IMAP command already has its tagged server response. Waiting for a
+/// best-effort LOGOUT round trip after that point can keep a renderer request open for the full
+/// socket timeout. Keep at most one graceful close in the background; additional completions drop
+/// their TLS stream immediately so a stalled provider cannot accumulate sockets or worker threads.
+fn finish_imap_session(mut session: imap::Session<imap::Connection>) {
+    let Some(run) = try_begin_background_logout(&BACKGROUND_LOGOUTS) else {
+        return;
+    };
+    let spawn_result = thread::Builder::new()
+        .name("mailgo-imap-logout".to_string())
+        .spawn(move || {
+            let _run = run;
+            session.logout().ok();
+        });
+    if let Err(error) = spawn_result {
+        tracing::debug!(error = %error, "could not start graceful IMAP session cleanup");
+    }
 }
 
 struct PooledBodySession {
@@ -708,7 +748,7 @@ pub fn test_connection(profile: &ProviderProfile, email: &str, credential: &str)
     }
     let mut session = authenticate(profile, email, credential)?;
     let result = session.noop().context("test IMAP connection");
-    session.logout().ok();
+    finish_imap_session(session);
     result
 }
 
@@ -2014,7 +2054,7 @@ fn search_account_once(
         messages.extend(folder_messages);
     }
     crate::cache_db::spawn_search_indexer(cache_root.to_path_buf());
-    session.logout().ok();
+    finish_imap_session(session);
     messages.sort_by(|left, right| right.received_at.cmp(&left.received_at));
     Ok(SearchResult {
         messages,
@@ -2190,7 +2230,7 @@ fn sync_account_once(
         "mailbox cache persistence completed"
     );
     crate::cache_db::spawn_search_indexer(cache_root.to_path_buf());
-    session.logout().ok();
+    finish_imap_session(session);
     crate::cache_db::spawn_backup_refresh(cache_root.to_path_buf());
     Ok(SyncResult {
         account_id: account_id.to_string(),
@@ -2746,7 +2786,7 @@ fn sync_folder_page_once(
                     })
                     .unwrap_or_default()
             };
-            session.logout().ok();
+            finish_imap_session(session);
             return Ok(SyncResult {
                 account_id: account_id.to_string(),
                 folder: folder.to_string(),
@@ -2778,7 +2818,7 @@ fn sync_folder_page_once(
         cached.synced_at = now_stamp();
         cached.has_more = false;
         save_mailbox(cache_root, account_id, &cached)?;
-        session.logout().ok();
+        finish_imap_session(session);
         return Ok(SyncResult {
             account_id: account_id.to_string(),
             folder: folder.to_string(),
@@ -2867,7 +2907,7 @@ fn sync_folder_page_once(
             })
             .unwrap_or_default()
     };
-    session.logout().ok();
+    finish_imap_session(session);
     Ok(SyncResult {
         account_id: account_id.to_string(),
         folder: folder.to_string(),
@@ -4147,7 +4187,7 @@ pub fn move_message(
     let mut session = authenticate(&profile, email, credential)?;
     session.select(folder)?;
     let result = move_uid(&mut session, uid, target_folder);
-    session.logout().ok();
+    finish_imap_session(session);
     result
 }
 
@@ -4164,7 +4204,7 @@ pub fn archive_message(
     let mut session = authenticate(&profile, email, credential)?;
     session.select(folder)?;
     let result = archive_uid(&mut session, profile.provider, folder, uid, target_folder);
-    session.logout().ok();
+    finish_imap_session(session);
     result
 }
 
@@ -4190,7 +4230,7 @@ pub fn delete_message(
     } else {
         move_uid(&mut session, uid, trash_folder)
     };
-    session.logout().ok();
+    finish_imap_session(session);
     result
 }
 
@@ -4411,7 +4451,7 @@ pub fn set_flag(
         "-FLAGS.SILENT"
     };
     session.uid_store(uid.to_string(), format!("{operation} ({flag})"))?;
-    session.logout().ok();
+    finish_imap_session(session);
     Ok(())
 }
 
@@ -5253,6 +5293,18 @@ mod tests {
         assert!(peak.load(Ordering::SeqCst) > 1);
     }
 
+    #[test]
+    fn background_logout_gate_is_bounded_and_releases_on_drop() {
+        let active = AtomicUsize::new(0);
+        let first = try_begin_background_logout(&active).expect("first graceful logout slot");
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        assert!(try_begin_background_logout(&active).is_none());
+
+        drop(first);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert!(try_begin_background_logout(&active).is_some());
+    }
+
     fn fixture_imap_session<F>(
         scenario: F,
     ) -> (imap::Session<imap::Connection>, thread::JoinHandle<()>)
@@ -5300,6 +5352,49 @@ mod tests {
             .map_err(|(error, _)| error)
             .expect("login to IMAP fixture");
         (session, server)
+    }
+
+    #[test]
+    fn one_shot_imap_finish_returns_before_logout_response() {
+        let (release_response, wait_for_release) = mpsc::sync_channel(1);
+        let (session, server) = fixture_imap_session(move |reader, stream| {
+            let mut command = String::new();
+            reader
+                .read_line(&mut command)
+                .expect("read IMAP fixture LOGOUT");
+            assert!(command.to_ascii_uppercase().contains(" LOGOUT"));
+            let tag = command.split_ascii_whitespace().next().expect("LOGOUT tag");
+            wait_for_release
+                .recv_timeout(Duration::from_secs(2))
+                .expect("renderer request did not return before the LOGOUT response");
+            write!(
+                stream,
+                "* BYE closing fixture\r\n{tag} OK LOGOUT completed\r\n"
+            )
+            .expect("write IMAP fixture LOGOUT response");
+            stream.flush().expect("flush IMAP fixture LOGOUT response");
+        });
+
+        let started = Instant::now();
+        finish_imap_session(session);
+        let elapsed = started.elapsed();
+        let response_released = release_response.send(()).is_ok();
+        let server_completed = server.join().is_ok();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "renderer-facing completion waited for the delayed LOGOUT response"
+        );
+        assert!(
+            response_released && server_completed,
+            "IMAP LOGOUT fixture failed"
+        );
+        for _ in 0..100 {
+            if BACKGROUND_LOGOUTS.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("background IMAP logout slot did not release");
     }
 
     fn respond_to_select(

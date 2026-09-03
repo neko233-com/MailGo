@@ -17,7 +17,11 @@ assert.match(cache, /pub fn spawn_backup_refresh\(cache_root: PathBuf\)/)
 assert.match(cache, /compare_exchange\(false, true, Ordering::AcqRel, Ordering::Acquire\)/)
 assert.match(cache, /\.name\("mailgo-cache-backup"\.to_string\(\)\)/)
 assert.match(cache, /if !backup_is_due\(&cache_root\)/)
-assert.match(sync, /session\.logout\(\)\.ok\(\);\s*crate::cache_db::spawn_backup_refresh\(cache_root\.to_path_buf\(\)\);/)
+assert.match(sync, /const BACKGROUND_LOGOUT_CONCURRENCY: usize = 1/)
+assert.match(sync, /fn finish_imap_session\(mut session: imap::Session<imap::Connection>\)/)
+assert.match(sync, /\.name\("mailgo-imap-logout"\.to_string\(\)\)/)
+assert.match(sync, /finish_imap_session\(session\);\s*crate::cache_db::spawn_backup_refresh\(cache_root\.to_path_buf\(\)\);/)
+assert.doesNotMatch(sync, /crate::cache_db::spawn_search_indexer\(cache_root\.to_path_buf\(\)\);\s*session\.logout\(\)\.ok\(\);/)
 assert.doesNotMatch(sync, /cache_db::refresh_backup\(cache_root\)/)
 assert.match(cache, /validate_identity\(&metadata, account_id, folder\)\?/)
 assert.match(sync, /pub fn mailbox_revision\([\s\S]*?validate_mailbox_name\(folder\)\?/)
@@ -41,4 +45,4 @@ for (const command of ['test:undo-send', 'test:outbox', 'test:conditional-refres
   assert.match(release, new RegExp(`npm run ${command.replace(':', '\\:')}`))
 }
 
-console.log('Revision-gated mailbox polling, asynchronous backup maintenance, and release-gate coverage checks passed.')
+console.log('Revision-gated polling, asynchronous backup maintenance, bounded IMAP cleanup, and release-gate checks passed.')
