@@ -11,7 +11,7 @@ The current foundation includes:
 - Tree-shakeable `reicon-react` icon components.
 - Multiple accounts, including multiple QQ accounts, account switching, and import/export with redacted credentials.
 - Account migration is metadata-only: exports are redacted and every imported mailbox requires provider reauthorization on the destination computer.
-- Local-first UI state with offline cache indicators and a Rust IPC boundary for durable state.
+- Local-first UI state with offline cache indicators and a Rust IPC boundary for durable state. Its per-process capability is accepted only from the packaged local origin, scrubbed from the launch URL, retained only in the current WebView session for safe F5 recovery, and rotated on every native process start.
 - Native startup enters the mailbox as soon as local state is available; cache hydration, per-account synchronization, and queue telemetry continue independently in the background with local loading/error states instead of a full-window blocking spinner.
 - Browser-only demo data and low-frequency compose, account authorization/diagnostics, help, settings, and dialog modules are excluded from the native startup entry. Opening those surfaces fetches small local chunks behind pane- or modal-scoped loading feedback, while the mailbox shell remains interactive; the release gate caps both raw and compressed entry size and verifies the demo corpus never enters it.
 - Foreground account-status polling is mailbox-revision aware: an unchanged account reads one encrypted metadata record and returns no message summaries, avoiding periodic summary decryption, IPC payloads, conversation rebuilding, and virtual-list measurement. A renderer lease also prevents one slow refresh cycle from overlapping the next.

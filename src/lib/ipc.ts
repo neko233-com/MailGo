@@ -23,16 +23,33 @@ declare global {
 
 const pending = new Map<string, PendingRequest>()
 const IPC_CAPABILITY_HASH = /^#ipc=([A-Za-z0-9]{48})$/
+const IPC_CAPABILITY_SESSION_KEY = 'mailgo.native.ipc-capability'
 
 type NativeLocation = Pick<Location, 'protocol' | 'host' | 'hash' | 'pathname' | 'search'>
 type NativeHistory = Pick<History, 'replaceState'>
+type NativeSessionStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
 
-export function readNativeCapability(location: NativeLocation, history: NativeHistory) {
+export function readNativeCapability(
+  location: NativeLocation,
+  history: NativeHistory,
+  sessionStorage?: NativeSessionStorage,
+) {
   const protocol = location.protocol.toLowerCase()
   const host = location.host.toLowerCase()
   const trustedOrigin = (protocol === 'rdesktop:' && host === 'localhost')
     || (protocol === 'http:' && host === 'rdesktop.localhost')
   if (!trustedOrigin) return undefined
+
+  if (!location.hash) {
+    try {
+      const stored = sessionStorage?.getItem(IPC_CAPABILITY_SESSION_KEY)
+      if (stored && IPC_CAPABILITY_HASH.test(`#ipc=${stored}`)) return stored
+      if (stored) sessionStorage?.removeItem(IPC_CAPABILITY_SESSION_KEY)
+    } catch {
+      // A restricted WebView storage policy may disable reload recovery without weakening IPC.
+    }
+    return undefined
+  }
 
   const capability = IPC_CAPABILITY_HASH.exec(location.hash)?.[1]
   if (!capability) return undefined
@@ -42,12 +59,25 @@ export function readNativeCapability(location: NativeLocation, history: NativeHi
   } catch {
     return undefined
   }
+  try {
+    sessionStorage?.setItem(IPC_CAPABILITY_SESSION_KEY, capability)
+  } catch {
+    // The current document can still use its in-memory capability until it is reloaded.
+  }
   return capability
+}
+
+function nativeSessionStorage() {
+  try {
+    return window.sessionStorage
+  } catch {
+    return undefined
+  }
 }
 
 const nativeCapability = typeof window === 'undefined'
   ? undefined
-  : readNativeCapability(window.location, window.history)
+  : readNativeCapability(window.location, window.history, nativeSessionStorage())
 
 if (typeof window !== 'undefined') {
   window.__RDESKTOP_IPC__ = (incoming) => {
