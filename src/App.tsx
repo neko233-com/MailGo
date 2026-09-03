@@ -60,6 +60,8 @@ const DEFAULT_MAIL_CONTENT_SCALE: MailContentScale = 80
 const MOBILE_LAYOUT_QUERY = '(max-width: 720px)'
 const COMPACT_DENSITY_QUERY = '(max-height: 820px), (max-width: 1366px)'
 const AUTO_COLLAPSE_SIDEBAR_QUERY = '(max-width: 1366px) and (min-width: 721px)'
+const DENSE_MAIL_GROUP_HEIGHT = 12
+const DENSE_MAIL_ROW_HEIGHT = 28
 const COMPACT_MAIL_GROUP_HEIGHT = 14
 const COMPACT_MAIL_ROW_HEIGHT = 32
 const COMFORTABLE_MAIL_GROUP_HEIGHT = 22
@@ -476,7 +478,8 @@ function loadTheme(): ThemeMode {
 }
 
 function loadDisplayDensity(): DisplayDensity {
-  return readLocalStorageValue('mailgo-display-density-v3') === 'comfortable' ? 'comfortable' : 'compact'
+  const stored = readLocalStorageValue('mailgo-display-density-v4')
+  return stored === 'comfortable' || stored === 'compact' || stored === 'dense' ? stored : 'dense'
 }
 
 function loadMailContentScale(): MailContentScale {
@@ -597,7 +600,8 @@ function App() {
   const [isMobileLayout, setMobileLayout] = useState(() => window.matchMedia(MOBILE_LAYOUT_QUERY).matches)
   const [displayDensity, setDisplayDensity] = useState<DisplayDensity>(loadDisplayDensity)
   const [viewportRequiresCompactDensity, setViewportRequiresCompactDensity] = useState(() => window.matchMedia(COMPACT_DENSITY_QUERY).matches)
-  const isCompactDensity = displayDensity === 'compact' || viewportRequiresCompactDensity
+  const isCompactDensity = displayDensity !== 'comfortable' || viewportRequiresCompactDensity
+  const isDenseDensity = displayDensity === 'dense' && !isMobileLayout
   const [mailContentScale, setMailContentScale] = useState<MailContentScale>(loadMailContentScale)
   const [isMobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [isSidebarCollapsed, setSidebarCollapsed] = useState(() => window.matchMedia(AUTO_COLLAPSE_SIDEBAR_QUERY).matches)
@@ -1128,7 +1132,7 @@ function App() {
   }, [isNativeRuntime, nativeStateReady, theme])
 
   useEffect(() => {
-    writeLocalStorageValue('mailgo-display-density-v3', displayDensity)
+    writeLocalStorageValue('mailgo-display-density-v4', displayDensity)
   }, [displayDensity])
 
   useEffect(() => {
@@ -1644,8 +1648,8 @@ function App() {
     count: virtualMailItems.length,
     getScrollElement: () => mailListRef.current,
     estimateSize: (index) => virtualMailItems[index]?.type === 'group'
-      ? (isMobileLayout ? MOBILE_MAIL_GROUP_HEIGHT : isCompactDensity ? COMPACT_MAIL_GROUP_HEIGHT : COMFORTABLE_MAIL_GROUP_HEIGHT)
-      : (isMobileLayout ? MOBILE_MAIL_ROW_HEIGHT : isCompactDensity ? COMPACT_MAIL_ROW_HEIGHT : COMFORTABLE_MAIL_ROW_HEIGHT),
+      ? (isMobileLayout ? MOBILE_MAIL_GROUP_HEIGHT : isDenseDensity ? DENSE_MAIL_GROUP_HEIGHT : isCompactDensity ? COMPACT_MAIL_GROUP_HEIGHT : COMFORTABLE_MAIL_GROUP_HEIGHT)
+      : (isMobileLayout ? MOBILE_MAIL_ROW_HEIGHT : isDenseDensity ? DENSE_MAIL_ROW_HEIGHT : isCompactDensity ? COMPACT_MAIL_ROW_HEIGHT : COMFORTABLE_MAIL_ROW_HEIGHT),
     getItemKey: getVirtualMailKey,
     overscan: 8,
     useFlushSync: false,
@@ -1653,7 +1657,7 @@ function App() {
 
   useEffect(() => {
     mailListVirtualizer.measure()
-  }, [isCompactDensity, isMobileLayout, mailListVirtualizer])
+  }, [isCompactDensity, isDenseDensity, isMobileLayout, mailListVirtualizer])
 
   const selectedMailIdSet = useMemo(() => new Set(selectedMailIds), [selectedMailIds])
   const selectedVisibleMails = useMemo(
@@ -3132,7 +3136,7 @@ function App() {
       : '正在从本地索引加载当前页，其他区域仍可操作'
 
   return (
-    <div className={`app-shell ${isCompactDensity ? 'is-compact-density' : ''}`}>
+    <div className={`app-shell ${isCompactDensity ? 'is-compact-density' : ''} ${isDenseDensity ? 'is-dense-density' : ''}`}>
       <style>{`.reicon { width: 1em; height: 1em; }`}</style>
       <header className="titlebar" data-rdesktop-drag="true" onDoubleClick={() => window.__RDESKTOP_WINDOW__?.maximize()}>
         <div className="titlebar-brand" data-no-drag="true">
@@ -3338,7 +3342,7 @@ function App() {
             <ConversationStack thread={selectedThread} selectedId={selectedMail.id} loadingId={loadingMessageId} onSelect={(mail) => { void selectMail(mail) }} />
             <div className="sender-row"><Avatar message={selectedMail} size="lg" /><div className="sender-copy"><div><strong>{selectedMail.senderName}</strong> <span>&lt;{selectedMail.from}&gt;</span></div><div className="recipient">收件人： {selectedMailAccount?.label ?? '当前账户'} &lt;{selectedMailAccount?.email ?? '—'}&gt;</div></div><time>{selectedMail.timestamp}<br /><span>今天</span></time><TooltipButton label="发件人更多信息"><Icon name="more" size={19} /></TooltipButton></div>
             {loadingMessageId === selectedMail.id && <div className="reading-loading-strip" role="status"><span className="loading-spinner" aria-hidden="true" /><span><strong>正在补全邮件正文</strong>列表和已缓存摘要仍可继续浏览</span></div>}
-            <div className="message-content" style={{ '--mail-content-font-size': `${((isCompactDensity ? 11.5 : 13) * mailContentScale / 100).toFixed(2)}px` } as React.CSSProperties}>
+            <div className="message-content" style={{ '--mail-content-scale': `${mailContentScale}%` } as React.CSSProperties}>
               {selectedMail.hasHtml && <div className="content-mode-row"><span>此邮件包含富文本内容{(!remoteImagesEnabled || offlineMode) && ` · ${offlineMode ? '仅离线模式，远程图片已屏蔽' : '远程图片已屏蔽'}`}</span><button type="button" className="text-action" onClick={() => setHtmlMode((value) => !value)}>{isHtmlMode ? '查看纯文本' : '渲染 HTML'} <Icon name="grid" size={14} /></button></div>}
               {isHtmlMode && selectedMail.hasHtml ? <div className="html-rendered" onClick={handleRenderedLinkClick} dangerouslySetInnerHTML={{ __html: sanitizeHtml(selectedMail.htmlBody ?? initialHtml, remoteImagesEnabled && !offlineMode) }} /> : selectedMail.body.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
             </div>
@@ -3372,7 +3376,7 @@ function App() {
           importInputRef={importInputRef}
           onClose={() => setSettingsOpen(false)}
           onToggleTheme={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}
-          onToggleDensity={() => setDisplayDensity((value) => value === 'compact' ? 'comfortable' : 'compact')}
+          onDensityChange={setDisplayDensity}
           onUndoSendSecondsChange={handleUndoSendSecondsChange}
           onCustomCssChange={setCustomCss}
           onSaveSignature={saveAccountSignature}

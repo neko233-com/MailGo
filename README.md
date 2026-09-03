@@ -5,7 +5,7 @@ MailGo is a Windows-first local-first email workspace for multiple Google, QQ, O
 The current foundation includes:
 
 - React + Vite desktop UI with three-pane unified inbox.
-- Gmail/Foxmail-style desktop density is compact by default and user-switchable. The compact profile uses a 32px title bar, 32px virtualized message rows, a 44px collapsed navigation rail, a 288–320px list column, bounded HTML-message typography, and an 1180×720 native opening window that remains fully three-pane down to 920×600. A versioned density preference resets stale oversized defaults after upgrade.
+- Gmail/Foxmail-style desktop density is user-switchable across extra-dense, compact, and comfortable profiles. Extra-dense is the default after upgrade and uses a 30px title bar, 28px virtualized message rows, a 40px collapsed navigation rail, and a 266–288px list column; the independent 70–100% body control and bounded HTML typography remain intact. The 1180×720 native opening window stays fully three-pane down to 920×600.
 - Resizable Windows windows stay usable below the desktop four-pane breakpoint: mail list and reading view become a single-column flow, with drawer navigation, authorization help, and a title-bar compose entry.
 - `motion` transitions with `prefers-reduced-motion` support.
 - Tree-shakeable `reicon-react` icon components.

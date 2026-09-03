@@ -304,7 +304,7 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .mail-content-scale button:hover:not(:disabled) { color: var(--text); background: var(--surface-hover); }
 .mail-content-scale button:disabled { cursor: default; opacity: .38; }
 .mail-content-scale output { min-width: 36px; color: var(--muted); font-size: 9px; text-align: center; font-variant-numeric: tabular-nums; }
-.reading-scroll { flex: 1; overscroll-behavior: contain; padding: 17px clamp(16px, 2vw, 28px) 22px; }
+.reading-scroll { flex: 1; overscroll-behavior: contain; padding: 17px clamp(16px, 2vw, 28px) 22px; font-size: 13px; }
 .reading-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .reading-heading h1 { margin: 0; color: var(--text); font-family: var(--font-display); font-size: clamp(17px, 1.25vw, 20px); font-weight: 600; letter-spacing: -0.02em; line-height: 1.25; }
 .message-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
@@ -337,7 +337,7 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .recipient { overflow: hidden; margin-top: 5px; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .sender-row > time { flex: 0 0 auto; color: var(--muted-strong); font-size: 11px; line-height: 1.45; text-align: right; }
 .sender-row > time span { color: var(--muted); font-size: 10px; }
-.message-content { min-width: 0; padding: 15px 0 14px; color: var(--text); font-size: var(--mail-content-font-size, 13px); line-height: 1.5; }
+.message-content { min-width: 0; padding: 15px 0 14px; color: var(--text); font-size: var(--mail-content-scale, 80%); line-height: 1.5; }
 .message-content p { margin: 0 0 12px; white-space: pre-line; }
 .content-mode-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: -6px 0 17px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: var(--surface); font-size: 11px; }
 .text-action { display: inline-flex; align-items: center; gap: 5px; color: #aab4ff; background: transparent; font-size: 11px; }
@@ -876,7 +876,7 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .app-shell.is-compact-density .mail-content-scale { height: 22px; }
 .app-shell.is-compact-density .mail-content-scale button { width: 22px; font-size: 8.5px; }
 .app-shell.is-compact-density .mail-content-scale output { min-width: 31px; font-size: 8px; }
-.app-shell.is-compact-density .reading-scroll { padding: 6px clamp(8px, .9vw, 12px) 9px; }
+.app-shell.is-compact-density .reading-scroll { padding: 6px clamp(8px, .9vw, 12px) 9px; font-size: 11.5px; }
 .app-shell.is-compact-density .outbox-summary { gap: 8px; margin-top: 8px; padding: 8px 10px; }
 .app-shell.is-compact-density .outbox-state-mark { width: 28px; height: 28px; }
 .app-shell.is-compact-density .outbox-recipient-card,
@@ -892,7 +892,7 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 .app-shell.is-compact-density .sender-row .avatar-lg { width: 26px; height: 26px; flex-basis: 26px; font-size: 10px; }
 .app-shell.is-compact-density .sender-copy strong { font-size: 10.5px; }
 .app-shell.is-compact-density .recipient { margin-top: 2px; font-size: 9.5px; }
-.app-shell.is-compact-density .message-content { padding-block: 6px 5px; font-size: var(--mail-content-font-size, 10.35px); line-height: 1.4; }
+.app-shell.is-compact-density .message-content { padding-block: 6px 5px; line-height: 1.4; }
 .app-shell.is-compact-density .message-content p { margin-bottom: 6px; }
 .app-shell.is-compact-density .content-mode-row { margin-bottom: 11px; padding: 7px 9px; font-size: 10px; }
 .app-shell.is-compact-density .html-rendered { padding: 7px; font-size: inherit; line-height: 1.4; }
@@ -975,6 +975,122 @@ kbd { padding: 3px 5px; border: 1px solid var(--line-strong); border-radius: 4px
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; transition-duration: .001ms !important; }
 }
+
+.app-shell.is-dense-density { font-size: 10px; }
+.app-shell.is-dense-density .titlebar { height: 30px; gap: 3px; padding-inline: 4px; }
+.app-shell.is-dense-density .titlebar-brand { width: 146px; flex-basis: 146px; gap: 5px; font-size: 12px; }
+.app-shell.is-dense-density .brand-mark { width: 17px; height: 17px; flex-basis: 17px; }
+.app-shell.is-dense-density .titlebar-menu { width: 22px; height: 22px; flex-basis: 22px; }
+.app-shell.is-dense-density .titlebar-search { min-width: 190px; }
+.app-shell.is-dense-density .titlebar-search .search-wrap { height: 23px; padding-inline: 7px; }
+.app-shell.is-dense-density .titlebar-search .search-wrap input { font-size: 10px; }
+.app-shell.is-dense-density .titlebar-utilities .icon-button { width: 21px; height: 21px; }
+.app-shell.is-dense-density .sync-summary { height: 21px; padding-inline: 4px; font-size: 8px; }
+.app-shell.is-dense-density .window-controls .icon-button { width: 23px; height: 20px; }
+.app-shell.is-dense-density .workspace { height: calc(100% - 30px); grid-template-columns: 160px minmax(266px, 288px) minmax(0, 1fr); }
+.app-shell.is-dense-density .workspace.is-sidebar-collapsed { grid-template-columns: 40px minmax(266px, 288px) minmax(0, 1fr); }
+.app-shell.is-dense-density .sidebar { padding: 3px 4px 2px; }
+.app-shell.is-dense-density .compose-button { min-height: 25px; margin-bottom: 2px; border-radius: 6px; font-size: 10px; }
+.app-shell.is-dense-density .nav-row { height: 21px; gap: 7px; padding-inline: 6px; font-size: 10px; }
+.app-shell.is-dense-density .server-folders { margin-top: 4px; padding-top: 4px; }
+.app-shell.is-dense-density .server-folders-heading { padding-bottom: 3px; }
+.app-shell.is-dense-density .server-folders-list { max-height: min(84px, 14vh); }
+.app-shell.is-dense-density .server-folder-row { height: 19px; }
+.app-shell.is-dense-density .sidebar-section { margin-top: 4px; padding-top: 4px; }
+.app-shell.is-dense-density .section-label-row { padding: 0 6px 3px; font-size: 9px; }
+.app-shell.is-dense-density .smart-row { height: 19px; gap: 6px; padding-inline: 6px; font-size: 9.5px; }
+.app-shell.is-dense-density .smart-dot { width: 15px; height: 15px; }
+.app-shell.is-dense-density .account-row { min-height: 25px; padding: 1px 5px; gap: 5px; }
+.app-shell.is-dense-density .account-row .provider-mark { width: 17px; height: 17px; flex-basis: 17px; font-size: 8px; }
+.app-shell.is-dense-density .account-copy strong { font-size: 10px; }
+.app-shell.is-dense-density .account-copy small { font-size: 8.5px; }
+.app-shell.is-dense-density .storage-bar { padding-block: 4px 2px; }
+.app-shell.is-dense-density .storage-track { height: 5px; margin-block: 4px; }
+.app-shell.is-dense-density .storage-foot { gap: 2px; font-size: 8.5px; }
+.app-shell.is-dense-density .sidebar-footer { height: 21px; }
+.app-shell.is-dense-density .workspace.is-sidebar-collapsed .compose-button,
+.app-shell.is-dense-density .workspace.is-sidebar-collapsed .nav-row,
+.app-shell.is-dense-density .workspace.is-sidebar-collapsed .smart-row,
+.app-shell.is-dense-density .workspace.is-sidebar-collapsed .account-row { width: 30px; }
+.app-shell.is-dense-density .workspace.is-sidebar-collapsed .compose-button { min-height: 27px; border-radius: 7px; }
+.app-shell.is-dense-density .workspace.is-sidebar-collapsed .sidebar-section { margin-top: 5px; padding-top: 5px; }
+.app-shell.is-dense-density .workspace.is-sidebar-collapsed .sidebar-footer .icon-button { width: 22px; height: 22px; }
+.app-shell.is-dense-density .panel-toolbar { height: 24px; padding: 0 6px 0 8px; }
+.app-shell.is-dense-density .mailbox-heading strong { font-size: 11px; }
+.app-shell.is-dense-density .mailbox-heading span { font-size: 8px; }
+.app-shell.is-dense-density .filter-button { height: 21px; padding-inline: 6px; font-size: 8.5px; }
+.app-shell.is-dense-density .inbox-tabs { height: 21px; }
+.app-shell.is-dense-density .inbox-tabs button { gap: 4px; padding-inline: 4px; font-size: 8.5px; }
+.app-shell.is-dense-density .inbox-tabs button.is-selected::after { right: 10px; left: 10px; height: 2px; }
+.app-shell.is-dense-density .list-toolbar { height: 20px; padding-inline: 7px; }
+.app-shell.is-dense-density .list-toolbar .checkbox-wrap { transform: scale(.82); }
+.app-shell.is-dense-density .toolbar-action { height: 19px; padding-inline: 5px; font-size: 8px; }
+.app-shell.is-dense-density .mail-group-label { padding-inline: 12px; font-size: 8px; }
+.app-shell.is-dense-density .mail-row { min-height: 28px; padding: 0 5px 0 7px; }
+.app-shell.is-dense-density .mail-row .checkbox-wrap { width: 18px; height: 18px; transform: scale(.8); }
+.app-shell.is-dense-density .mail-row-top { gap: 5px; }
+.app-shell.is-dense-density .mail-row-top strong { font-size: 10px; }
+.app-shell.is-dense-density .mail-row-top time { font-size: 8px; }
+.app-shell.is-dense-density .mail-row-summary { gap: 4px; margin-top: 0; }
+.app-shell.is-dense-density .mail-row-subject { font-size: 9px; }
+.app-shell.is-dense-density .mail-row-copy p { font-size: 7.5px; line-height: 1; }
+.app-shell.is-dense-density .star-button { width: 18px; height: 18px; flex-basis: 18px; }
+.app-shell.is-dense-density .outbox-row-state { width: 17px; height: 17px; flex-basis: 17px; }
+.app-shell.is-dense-density .list-loading-strip { min-height: 20px; padding-inline: 8px; font-size: 9px; }
+.app-shell.is-dense-density .list-footer { height: 20px; padding-inline: 8px; font-size: 8.5px; }
+.app-shell.is-dense-density .list-footer .icon-button { width: 19px; height: 19px; }
+.app-shell.is-dense-density .reading-toolbar { height: 24px; padding-inline: 7px; }
+.app-shell.is-dense-density .reading-actions { gap: 2px; }
+.app-shell.is-dense-density .reading-actions .icon-button { width: 20px; height: 20px; }
+.app-shell.is-dense-density .mail-content-scale { height: 20px; }
+.app-shell.is-dense-density .mail-content-scale button { width: 20px; font-size: 8px; }
+.app-shell.is-dense-density .mail-content-scale output { min-width: 28px; font-size: 7.5px; }
+.app-shell.is-dense-density .reading-scroll { padding: 5px 8px 8px; font-size: 10.5px; }
+.app-shell.is-dense-density .reading-heading { gap: 10px; }
+.app-shell.is-dense-density .reading-heading h1 { font-size: clamp(12px, .82vw, 14px); }
+.app-shell.is-dense-density .reading-star { width: 23px; height: 23px; flex-basis: 23px; }
+.app-shell.is-dense-density .message-tags { gap: 3px; margin-top: 4px; }
+.app-shell.is-dense-density .tag { min-height: 18px; padding-inline: 5px; font-size: 8px; }
+.app-shell.is-dense-density .conversation-stack { margin-top: 6px; }
+.app-shell.is-dense-density .conversation-stack-heading { min-height: 27px; }
+.app-shell.is-dense-density .conversation-message { min-height: 33px; padding-block: 3px; }
+.app-shell.is-dense-density .sender-row { gap: 6px; margin-top: 4px; padding-bottom: 4px; }
+.app-shell.is-dense-density .sender-row .avatar-lg { width: 24px; height: 24px; flex-basis: 24px; font-size: 9px; }
+.app-shell.is-dense-density .sender-copy strong { font-size: 10px; }
+.app-shell.is-dense-density .sender-copy > div:first-child span,
+.app-shell.is-dense-density .recipient,
+.app-shell.is-dense-density .sender-row > time { font-size: 8.5px; }
+.app-shell.is-dense-density .message-content { padding-block: 5px 4px; line-height: 1.35; }
+.app-shell.is-dense-density .message-content p { margin-bottom: 5px; }
+.app-shell.is-dense-density .content-mode-row { margin-bottom: 8px; padding: 5px 7px; font-size: 9px; }
+.app-shell.is-dense-density .html-rendered { padding: 6px; line-height: 1.35; }
+.app-shell.is-dense-density .attachments { padding-block: 5px 7px; }
+.app-shell.is-dense-density .attachments-heading { margin-bottom: 6px; font-size: 10px; }
+.app-shell.is-dense-density .attachment-grid { gap: 5px; }
+.app-shell.is-dense-density .attachment-card { height: 34px; padding-block: 2px; }
+.app-shell.is-dense-density .file-glyph { width: 23px; height: 27px; flex-basis: 23px; }
+.app-shell.is-dense-density .reply-composer { gap: 7px; margin-top: 6px; }
+.app-shell.is-dense-density .reply-input { min-height: 44px; padding: 5px 7px 4px; font-size: 9px; }
+.app-shell.is-dense-density .reply-tools { gap: 7px; margin-top: 6px; }
+.app-shell.is-dense-density .reply-tools button { height: 27px; }
+.app-shell.is-dense-density .auth-panel { top: 30px; width: min(288px, calc(100vw - 20px)); padding-inline: 10px; }
+.app-shell.is-dense-density .auth-panel-header { height: 38px; }
+.app-shell.is-dense-density .auth-panel-header strong { font-size: 13px; }
+.app-shell.is-dense-density .auth-tabs { height: 30px; }
+.app-shell.is-dense-density .auth-card { margin-top: 7px; padding: 9px; }
+.app-shell.is-dense-density .auth-illustration { width: 40px; height: 40px; margin-bottom: 5px; }
+.app-shell.is-dense-density .auth-panel-section { margin-top: 8px; }
+.app-shell.is-dense-density .auth-account-row { min-height: 34px; }
+.app-shell.is-dense-density .auth-note { margin-top: 6px; padding: 6px; }
+.app-shell.is-dense-density .auth-panel-foot { padding-block: 7px; }
+.app-shell.is-dense-density .settings-popover { top: 36px; right: 104px; width: 290px; max-height: calc(100vh - 42px); }
+.app-shell.is-dense-density .settings-title { height: 33px; }
+.app-shell.is-dense-density .settings-row { gap: 8px; padding: 7px 9px; }
+.app-shell.is-dense-density .settings-select-row select { min-width: 82px; height: 27px; }
+.app-shell.is-dense-density .compose-modal { width: min(480px, calc(100vw - 28px)); }
+.app-shell.is-dense-density .compose-body { min-height: 138px; padding: 8px 10px; font-size: 10px; }
+.app-shell.is-dense-density .account-modal { width: min(600px, calc(100vw - 24px)); }
+.app-shell.is-dense-density .account-modal-body { grid-template-columns: 150px minmax(0, 1fr); gap: 9px; padding: 9px 10px 10px; }
 
 @media (max-width: 720px) {
   html, body, #root { min-width: 0; }
