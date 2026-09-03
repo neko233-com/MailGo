@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -73,6 +73,7 @@ const IDLE_RETRY_BASE_SECONDS: u64 = 15;
 const IDLE_RETRY_MAX_SECONDS: u64 = 300;
 const IDLE_SYNC_BUSY_RETRIES: usize = 12;
 const BODY_SESSION_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_FOREGROUND_BODY_SESSION_ACCOUNTS: usize = 8;
 const CACHE_FILE: &str = "inbox.bin";
 const MUTATION_FILE: &str = "mutations.bin";
 const MOVE_MUTATION_FILE: &str = "moves.bin";
@@ -87,7 +88,11 @@ static CACHE_ENCRYPTION_KEY: OnceLock<Mutex<Option<[u8; CACHE_ENCRYPTION_KEY_BYT
 static ATTACHMENT_CACHE_USAGE: OnceLock<Mutex<HashMap<PathBuf, AttachmentCacheUsage>>> =
     OnceLock::new();
 type BodySessionSlot = Arc<Mutex<Option<PooledBodySession>>>;
-type BodySessionRegistry = HashMap<String, BodySessionSlot>;
+struct BodySessionEntry {
+    slot: BodySessionSlot,
+    last_claimed: Instant,
+}
+type BodySessionRegistry = HashMap<String, BodySessionEntry>;
 
 static BODY_SESSIONS: OnceLock<Mutex<BodySessionRegistry>> = OnceLock::new();
 static READ_AHEAD_BODY_SESSION: OnceLock<Mutex<ReadAheadBodySession>> = OnceLock::new();
@@ -667,23 +672,110 @@ fn body_session_fingerprint(profile: &ProviderProfile, email: &str, credential: 
     hasher.finalize().into()
 }
 
+fn body_session_expired(last_used: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_used) >= BODY_SESSION_IDLE_TTL
+}
+
+fn body_session_is_reapable(entry: &BodySessionEntry, now: Instant) -> bool {
+    if Arc::strong_count(&entry.slot) != 1 {
+        return false;
+    }
+    match entry.slot.try_lock() {
+        Ok(session) => session
+            .as_ref()
+            .is_none_or(|session| body_session_expired(session.last_used, now)),
+        Err(TryLockError::Poisoned(_)) => true,
+        Err(TryLockError::WouldBlock) => false,
+    }
+}
+
+fn prune_body_session_registry(
+    sessions: &mut BodySessionRegistry,
+    requested_account: Option<&str>,
+    now: Instant,
+) {
+    sessions.retain(|account_id, entry| {
+        requested_account.is_some_and(|requested| requested == account_id)
+            || !body_session_is_reapable(entry, now)
+    });
+}
+
+fn evict_lru_body_session(sessions: &mut BodySessionRegistry, requested_account: &str) -> bool {
+    let candidate = sessions
+        .iter()
+        .filter(|(account_id, entry)| {
+            account_id.as_str() != requested_account && Arc::strong_count(&entry.slot) == 1
+        })
+        .min_by_key(|(_, entry)| entry.last_claimed)
+        .map(|(account_id, _)| account_id.clone());
+    candidate
+        .and_then(|account_id| sessions.remove(&account_id))
+        .is_some()
+}
+
+fn claim_body_session_slot(
+    sessions: &mut BodySessionRegistry,
+    account_id: &str,
+    now: Instant,
+) -> Result<BodySessionSlot> {
+    let account_key = account_id.to_ascii_lowercase();
+    prune_body_session_registry(sessions, Some(&account_key), now);
+    if let Some(entry) = sessions.get_mut(&account_key) {
+        entry.last_claimed = now;
+        return Ok(Arc::clone(&entry.slot));
+    }
+    if sessions.len() >= MAX_FOREGROUND_BODY_SESSION_ACCOUNTS
+        && !evict_lru_body_session(sessions, &account_key)
+    {
+        return Err(anyhow!("IMAP foreground body session pool is busy"));
+    }
+    let slot = Arc::new(Mutex::new(None));
+    sessions.insert(
+        account_key,
+        BodySessionEntry {
+            slot: Arc::clone(&slot),
+            last_claimed: now,
+        },
+    );
+    Ok(slot)
+}
+
 fn body_session_slot(account_id: &str) -> Result<BodySessionSlot> {
     let sessions = BODY_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut sessions = sessions
         .lock()
         .map_err(|_| anyhow!("IMAP body session registry lock poisoned"))?;
-    Ok(Arc::clone(
-        sessions
-            .entry(account_id.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(None))),
-    ))
+    claim_body_session_slot(&mut sessions, account_id, Instant::now())
+}
+
+fn prune_idle_body_sessions() {
+    let now = Instant::now();
+    if let Some(sessions) = BODY_SESSIONS.get() {
+        if let Ok(mut sessions) = sessions.try_lock() {
+            prune_body_session_registry(&mut sessions, None, now);
+        }
+    }
+    if let Some(read_ahead) = READ_AHEAD_BODY_SESSION.get() {
+        if let Ok(mut read_ahead) = read_ahead.try_lock() {
+            let expired = read_ahead
+                .session
+                .as_ref()
+                .is_some_and(|session| body_session_expired(session.last_used, now));
+            if expired {
+                read_ahead.account_id = None;
+                read_ahead.session.take();
+            }
+        }
+    }
 }
 
 fn clear_body_session(account_id: &str) {
+    let account_key = account_id.to_ascii_lowercase();
     let slot = BODY_SESSIONS
         .get()
         .and_then(|sessions| sessions.lock().ok())
-        .and_then(|mut sessions| sessions.remove(account_id));
+        .and_then(|mut sessions| sessions.remove(&account_key))
+        .map(|entry| entry.slot);
     if let Some(slot) = slot {
         if let Ok(mut session) = slot.lock() {
             if let Some(mut session) = session.take() {
@@ -716,9 +808,10 @@ fn fetch_raw_message_in_session(
     uid: u32,
 ) -> Result<(Vec<u8>, bool, bool)> {
     let fingerprint = body_session_fingerprint(profile, email, credential);
+    let now = Instant::now();
     let must_reconnect = pooled.as_ref().is_none_or(|session| {
         session.credential_fingerprint != fingerprint
-            || session.last_used.elapsed() > BODY_SESSION_IDLE_TTL
+            || body_session_expired(session.last_used, now)
     });
     if must_reconnect {
         if let Some(mut stale) = pooled.take() {
@@ -1324,6 +1417,7 @@ pub fn spawn_scheduler(shared: Arc<Mutex<crate::MailGoState>>, cache_root: PathB
                     BACKGROUND_SYNC_INTERVAL
                 });
                 first_run = false;
+                prune_idle_body_sessions();
                 let (accounts, offline_mode) = match shared.lock() {
                     Ok(app) => (app.state.accounts.clone(), app.state.offline_mode),
                     Err(_) => {
@@ -5526,6 +5620,75 @@ mod tests {
         let rotated = body_session_fingerprint(&profile, "person@example.invalid", "secret-two");
         assert_eq!(first, same);
         assert_ne!(first, rotated);
+    }
+
+    fn empty_body_session_entry(last_claimed: Instant) -> BodySessionEntry {
+        BodySessionEntry {
+            slot: Arc::new(Mutex::new(None)),
+            last_claimed,
+        }
+    }
+
+    #[test]
+    fn body_session_expiration_uses_the_shared_idle_boundary() {
+        let now = Instant::now();
+        assert!(!body_session_expired(
+            now - BODY_SESSION_IDLE_TTL + Duration::from_secs(1),
+            now,
+        ));
+        assert!(body_session_expired(now - BODY_SESSION_IDLE_TTL, now));
+    }
+
+    #[test]
+    fn foreground_body_session_registry_is_bounded_and_skips_claimed_slots() {
+        let now = Instant::now();
+        let mut sessions = BodySessionRegistry::new();
+        for index in 0..MAX_FOREGROUND_BODY_SESSION_ACCOUNTS {
+            sessions.insert(
+                format!("account-{index}"),
+                empty_body_session_entry(
+                    now - Duration::from_secs(
+                        (MAX_FOREGROUND_BODY_SESSION_ACCOUNTS - index) as u64,
+                    ),
+                ),
+            );
+        }
+
+        let oldest_claim = Arc::clone(&sessions["account-0"].slot);
+        assert!(evict_lru_body_session(&mut sessions, "new-account"));
+        assert!(sessions.contains_key("account-0"));
+        assert!(!sessions.contains_key("account-1"));
+        assert_eq!(sessions.len(), MAX_FOREGROUND_BODY_SESSION_ACCOUNTS - 1);
+
+        sessions.insert(
+            "account-1".into(),
+            empty_body_session_entry(now - Duration::from_secs(7)),
+        );
+        let claims = sessions
+            .values()
+            .map(|entry| Arc::clone(&entry.slot))
+            .collect::<Vec<_>>();
+        assert!(claim_body_session_slot(&mut sessions, "overflow", now).is_err());
+        assert_eq!(sessions.len(), MAX_FOREGROUND_BODY_SESSION_ACCOUNTS);
+
+        drop(claims);
+        drop(oldest_claim);
+        let replacement = claim_body_session_slot(&mut sessions, "New-Account", now).unwrap();
+        assert!(sessions.contains_key("new-account"));
+        assert_eq!(Arc::strong_count(&replacement), 2);
+        assert!(sessions.len() <= MAX_FOREGROUND_BODY_SESSION_ACCOUNTS);
+    }
+
+    #[test]
+    fn foreground_body_session_registry_prunes_unclaimed_empty_slots() {
+        let now = Instant::now();
+        let mut sessions = BodySessionRegistry::from([
+            ("stale".into(), empty_body_session_entry(now)),
+            ("requested".into(), empty_body_session_entry(now)),
+        ]);
+        prune_body_session_registry(&mut sessions, Some("requested"), now);
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains_key("requested"));
     }
 
     #[test]
